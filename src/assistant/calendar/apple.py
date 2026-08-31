@@ -22,7 +22,7 @@ serializes them, because a DAVClient session is not thread-safe.
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import caldav
@@ -102,7 +102,12 @@ class AppleCalendar:
     async def delete_event(self, uid: str, *, calendar: str | None = None) -> None:
         def remove() -> None:
             target = self._pick(calendar)
-            found = target.event_by_uid(uid)
+            try:
+                found = target.event_by_uid(uid)
+            except Exception:  # noqa: BLE001 — iCloud rejects REPORT-by-UID
+                # with "412 Precondition Failed" (known quirk); fall back to
+                # scanning a wide window and matching the UID client-side.
+                found = _find_by_uid(target, uid)
             found.delete()
 
         await self._call(remove)
@@ -147,6 +152,22 @@ class AppleCalendar:
             f"I don't see a calendar called {name or self._default_calendar!r} — "
             f"there's {', '.join(names)}"
         )
+
+
+def _find_by_uid(target: Any, uid: str) -> Any:
+    """Locate one event by UID without REPORT-by-UID (which iCloud 412s):
+    fetch a month back through ~13 months ahead, unexpanded, and match."""
+    now = datetime.now(tz=local_tz())
+    candidates = target.search(
+        start=now - timedelta(days=31),
+        end=now + timedelta(days=400),
+        event=True,
+        expand=False,
+    )
+    for obj in candidates:
+        if str(obj.icalendar_component.get("uid") or "") == uid:
+            return obj
+    raise CalendarError("I couldn't find that event to delete — it may already be gone")
 
 
 def _holds_events(calendar: Any) -> bool:
