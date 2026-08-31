@@ -85,6 +85,8 @@ closest legitimate thing to "just pair it to Apple Home."
 | --- | --- | --- | --- | --- |
 | Generality upgrade (escape hatch) | **BUILT + live-verified 2026-08-31**: `search_entities` (whole-home discovery, any domain), `get_entity` (full state/attrs), `ha_call_service` (any service, with an infrastructure denylist: no hassio/restart/shell/reload). Selection is description-driven: dedicated tools stay preferred, escape hatch declares itself last-resort. Live probe: "what's the weather?" — no weather tool exists — she searched, found the HAOS weather entity, read it, answered with real conditions. HA **MCP server** evaluation still pending as possible successor | done | $0 | testing |
 
+| Learning Loop | Will's ask 2026-08-31 ("how does it evolve/learn?"). Learning = accumulating context, not training. v1: (a) **lessons** — at session end, distill resolved trial-and-error into procedural memory ("music player is X", "weather lives in Y") injected into future instructions: every mistake becomes permanent competence; (b) **observed preferences, consent-gated** — she notices patterns and *proposes* storing them; (c) **episodic journal** — session summaries + recall tool ("what did we figure out yesterday?"). Far arc: ties into Claude-dispatch (she improves her own repo). Weights never change; memory is the mechanism | strong candidate | pennies | idea |
+
 ## Design notes already locked in
 
 - Audio layer keeps the command audio buffer after STT (voice ID needs it) and
