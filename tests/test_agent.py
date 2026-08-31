@@ -191,12 +191,53 @@ async def test_launch_app_targets_the_tv():
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_media_control_lists_players():
+async def test_playback_verbs_route_to_whats_actually_playing():
+    """The live bug: the model says player='Apple TV' (the TV's friendly name)
+    while music streams on another entity — pause must hit the stream."""
+    from dataclasses import replace as dc_replace
+
     home = FakeHome()
+    home.players = [dc_replace(home.players[0], state="playing"), home.players[1]]
     executor = ToolExecutor(home)
+    text, is_error = await executor.execute(
+        "media_control", {"action": "pause", "player": "Apple TV"}
+    )
+    assert not is_error, text
+    assert home.media_commands == [("media_player.living_room_speakers", "pause")]
+
+    # volume while music plays → the stream too
+    text, is_error = await executor.execute(
+        "media_control", {"action": "volume_set", "volume_pct": 50, "player": "Apple TV"}
+    )
+    assert not is_error
+    assert home.media_commands[-1][0] == "media_player.living_room_speakers"
+
+    # power verbs always mean the TV, whatever else is happening
+    text, is_error = await executor.execute("media_control", {"action": "turn_off"})
+    assert not is_error
+    assert home.media_commands[-1] == ("media_player.living_room_tv", "turn_off")
+
+
+@pytest.mark.asyncio
+async def test_pause_with_nothing_playing_is_honest_not_an_error():
+    executor = ToolExecutor(FakeHome())  # both players idle
     text, is_error = await executor.execute("media_control", {"action": "pause"})
+    assert not is_error
+    assert "nothing is playing" in text
+
+
+@pytest.mark.asyncio
+async def test_failed_play_suggests_real_library_names():
+    class BrokenPlayHome(FakeHome):
+        async def play_music(self, *a, **kw):
+            raise RuntimeError("HA API error 500 on /api/services/music_assistant/play_media")
+
+    executor = ToolExecutor(BrokenPlayHome())
+    text, is_error = await executor.execute(
+        "play_music", {"media_id": "cleveland running mix", "media_type": "playlist"}
+    )
     assert is_error
-    assert "living_room_speakers" in text and "living_room_tv" in text
+    assert "Cleveland 10K" in text and "retry play_music" in text
 
 
 @pytest.mark.asyncio

@@ -275,15 +275,23 @@ class ToolExecutor:
             if name == "play_music":
                 player = await self._resolve_player(tool_input.get("player"), kind="music")
                 woke = await self._wake_tv_if_off()
-                await self._home.play_music(
-                    player.entity_id,
-                    str(tool_input["media_id"]),
-                    str(tool_input.get("media_type", "playlist")),
-                    artist=tool_input.get("artist"),
-                    album=tool_input.get("album"),
-                    enqueue=tool_input.get("enqueue"),
-                    radio_mode=bool(tool_input.get("radio_mode", False)),
-                )
+                media_id = str(tool_input["media_id"])
+                media_type = str(tool_input.get("media_type", "playlist"))
+                try:
+                    await self._home.play_music(
+                        player.entity_id,
+                        media_id,
+                        media_type,
+                        artist=tool_input.get("artist"),
+                        album=tool_input.get("album"),
+                        enqueue=tool_input.get("enqueue"),
+                        radio_mode=bool(tool_input.get("radio_mode", False)),
+                    )
+                except Exception as err:  # noqa: BLE001 — enrich with real names
+                    # A failed play is usually a name the library can't resolve.
+                    # Hand back what actually exists so the retry can succeed.
+                    detail = str(err) or type(err).__name__
+                    return f"play failed: {detail}.{await self._media_hint(media_id, media_type)}", True
                 note = "Woke the TV first. " if woke else ""
                 return (
                     f"{note}Started on {player.name} (audio may take a few seconds to begin).",
@@ -299,13 +307,16 @@ class ToolExecutor:
                     return "the library has nothing matching that", False
                 return json.dumps(items)[:2500], False
             if name == "media_control":
-                player = await self._resolve_player(tool_input.get("player"), kind=None)
+                action = str(tool_input["action"])
+                player = await self._media_target(tool_input.get("player"), action)
+                if player is None:
+                    return "nothing is playing right now — say what to play instead", False
                 await self._home.media_command(
                     player.entity_id,
-                    str(tool_input["action"]),
+                    action,
                     volume_pct=tool_input.get("volume_pct"),
                 )
-                return f"Done ({tool_input['action']} on {player.name}).", False
+                return f"Done ({action} on {player.name}).", False
             if name == "search_entities":
                 found = await self._home.search_entities(str(tool_input["query"]))
                 if not found:
@@ -352,7 +363,8 @@ class ToolExecutor:
             return f"Unknown tool: {name}", True
         except Exception as err:  # noqa: BLE001 — any tool failure must become an
             # is_error tool_result the model can react to, never a crashed loop
-            return f"Tool failed: {err}", True
+            # (str(err) can be empty — httpx timeouts — so include the type)
+            return f"Tool failed: {str(err) or type(err).__name__}", True
 
     async def _set_lights(self, tool_input: dict[str, Any]) -> str:
         lights = await self._home.get_lights()
@@ -444,6 +456,53 @@ class ToolExecutor:
         await self._home.media_command(tvs_off[0].entity_id, "turn_on")
         await asyncio.sleep(3)  # give it a beat to wake before streaming at it
         return True
+
+    _PLAYBACK_ACTIONS = frozenset({"pause", "resume", "next", "previous", "stop"})
+
+    async def _media_target(self, spec, action: str):
+        """State-aware routing: playback verbs act on what is actually playing
+        (preferring the music stream); power verbs act on the TV. Entity names
+        lie here — the friendly name 'Apple TV' belongs to the television while
+        the music stream is a different entity — but live state doesn't lie.
+        Returns None when a playback verb has nothing to act on."""
+        players = await self._home.media_players()
+        if not players:
+            raise ValueError("no media players are set up")
+        if action in ("turn_on", "turn_off"):
+            tvs = [p for p in players if p.kind == "tv"]
+            if tvs:
+                return tvs[0]
+            return await self._resolve_player(spec, kind=None)
+        active = [p for p in players if p.state in ("playing", "paused", "buffering")]
+        music_active = [p for p in active if p.kind == "music"]
+        if music_active:
+            return music_active[0]
+        if active:
+            return active[0]
+        if action == "volume_set":
+            tvs = [p for p in players if p.kind == "tv"]
+            if tvs:
+                return tvs[0]
+        if spec:
+            return await self._resolve_player(spec, kind=None)
+        return None
+
+    async def _media_hint(self, media_id: str, media_type: str) -> str:
+        """Closest real names from the library, for retrying a failed play."""
+        import difflib
+
+        try:
+            items = await self._home.music_library(media_type=media_type, limit=100)
+        except Exception:  # noqa: BLE001 — a hint must never mask the real error
+            return ""
+        names = [i.get("name", "") for i in items if i.get("name")]
+        if not names:
+            return ""
+        close = difflib.get_close_matches(media_id, names, n=5, cutoff=0.3) or names[:8]
+        return (
+            f" The library's actual {media_type}s include: {', '.join(close)} — "
+            "retry play_music with one exact name."
+        )
 
     async def _resolve_player(self, spec, kind: str | None):
         """Pick a media player by name/entity_id fragment; default by kind."""

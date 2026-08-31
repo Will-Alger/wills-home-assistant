@@ -239,17 +239,24 @@ class HomeAssistantClient:
     async def media_command(
         self, entity_id: str, command: str, volume_pct: int | None = None
     ) -> None:
-        if command == "volume_set":
-            await self.call_service(
-                "media_player",
-                "volume_set",
-                {"entity_id": entity_id, "volume_level": max(0, min(100, volume_pct or 0)) / 100},
-            )
-            return
-        service = self._MEDIA_COMMANDS.get(command)
-        if service is None:
-            raise HomeAssistantError(f"unknown media command: {command}")
-        await self.call_service("media_player", service, {"entity_id": entity_id})
+        try:
+            if command == "volume_set":
+                await self.call_service(
+                    "media_player",
+                    "volume_set",
+                    {"entity_id": entity_id, "volume_level": max(0, min(100, volume_pct or 0)) / 100},
+                )
+                return
+            service = self._MEDIA_COMMANDS.get(command)
+            if service is None:
+                raise HomeAssistantError(f"unknown media command: {command}")
+            await self.call_service("media_player", service, {"entity_id": entity_id})
+        except httpx.ReadTimeout as err:
+            # Slow confirmation ≠ failure: the command usually still landed.
+            raise HomeAssistantError(
+                f"the player was slow to confirm '{command}' — it probably still "
+                "worked; check the result before declaring a failure"
+            ) from err
 
     async def launch_app(self, entity_id: str, app: str) -> None:
         await self.call_service(

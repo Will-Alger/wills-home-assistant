@@ -552,13 +552,21 @@ class RealtimeEngine:
                 tool_hook(call_name, result_text, is_error)
             outcome = "ERROR: " if is_error else ""
             stats.transcript.append((f"tool {call_name}", outcome + result_text[:200]))
+            payload: dict[str, Any] = {"error" if is_error else "result": result_text}
+            if call_name in COMMAND_TOOLS and not is_error:
+                # Decision-time nudge beats buried instructions: the engine's
+                # quick-close timer remains the backstop if this is ignored.
+                payload["note"] = (
+                    "if this completes a one-shot request, confirm in a few "
+                    "words and call end_conversation in this same response"
+                )
             outputs.append(
                 {
                     "type": "conversation.item.create",
                     "item": {
                         "type": "function_call_output",
                         "call_id": item.call_id,
-                        "output": json.dumps({"error" if is_error else "result": result_text}),
+                        "output": json.dumps(payload),
                     },
                 }
             )
