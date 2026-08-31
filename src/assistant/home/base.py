@@ -41,6 +41,16 @@ class LightCommand:
     transition: float | None = None
 
 
+def device_table(lights: list[Light]) -> str:
+    """Deterministic, prompt-ready device listing (sorted = cacheable prefix)."""
+    rows = [
+        f"- {light.entity_id} | {light.name} | area: {light.area or 'unassigned'}"
+        f" | modes: {', '.join(light.color_modes) or 'on/off'}"
+        for light in sorted(lights, key=lambda light: light.entity_id)
+    ]
+    return "\n".join(rows) or "- (no lights found yet)"
+
+
 class HomeApi(Protocol):
     async def get_lights(self) -> list[Light]:
         """Registry (name/area/capabilities) merged with live state."""

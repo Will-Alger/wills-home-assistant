@@ -33,10 +33,23 @@ def describe_device(spec: str) -> str:
 
 
 class Microphone:
-    """Continuous capture; frames buffer in an asyncio queue (drops when full)."""
+    """Continuous capture; frames buffer in an asyncio queue (drops when full).
 
-    def __init__(self, device: str = "", queue_frames: int = 50) -> None:
+    Defaults to the wake-word format (16 kHz, 80 ms frames); the realtime
+    engine opens it at 24 kHz instead — pass matching samplerate/frame_samples.
+    """
+
+    def __init__(
+        self,
+        device: str = "",
+        queue_frames: int = 50,
+        *,
+        samplerate: int = SAMPLE_RATE,
+        frame_samples: int = FRAME_SAMPLES,
+    ) -> None:
         self._device = resolve_device(device)
+        self._samplerate = samplerate
+        self._frame_samples = frame_samples
         self._queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=queue_frames)
         self._stream: sd.RawInputStream | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -50,8 +63,8 @@ class Microphone:
             self._loop.call_soon_threadsafe(self._offer, data)
 
         self._stream = sd.RawInputStream(
-            samplerate=SAMPLE_RATE,
-            blocksize=FRAME_SAMPLES,
+            samplerate=self._samplerate,
+            blocksize=self._frame_samples,
             dtype="int16",
             channels=1,
             device=self._device,

@@ -4,6 +4,9 @@
 # Local usage/cost log written by the meter
 .usage.jsonl
 
+# Probe output from scripts/m4_realtime.py --text-probe
+reply.wav
+
 # Python
 .venv/
 __pycache__/

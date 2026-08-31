@@ -59,7 +59,13 @@ class Settings(BaseSettings):
     # thoughtful pauses; it will wait for higher confidence you're done.
     stt_eot_threshold: float = 0.0
 
-    # Milestone 4: TTS
+    # Milestone 4: voice engines
+    # Primary candidate: OpenAI Realtime (speech-native; uses OPENAI_API_KEY).
+    realtime_model: str = "gpt-realtime-2.1"
+    realtime_voice: str = "marin"  # marin/cedar recommended; also alloy, ash, ...
+    realtime_idle_timeout_s: float = 20.0  # silent session auto-closes (it bills/min)
+
+    # Alternate engine: ElevenLabs streaming TTS pipeline (custom voice, parked)
     elevenlabs_api_key: str = ""
     elevenlabs_voice_id: str = ""
 

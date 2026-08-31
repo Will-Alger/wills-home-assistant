@@ -105,17 +105,13 @@ class Agent:
 
     async def start_session(self) -> None:
         """Build the static, cacheable system prompt from the device registry."""
-        lights = await self._home.get_lights()
-        rows = [
-            f"- {light.entity_id} | {light.name} | area: {light.area or 'unassigned'}"
-            f" | modes: {', '.join(light.color_modes) or 'on/off'}"
-            for light in lights  # already sorted: deterministic prefix = cacheable
-        ]
+        from assistant.home.base import device_table
+
         self._system = _SYSTEM_TEMPLATE.format(
             name=self._name,
             owner=self._owner,
             wake_phrase=self._wake_phrase,
-            device_table="\n".join(rows) or "- (no lights found yet)",
+            device_table=device_table(await self._home.get_lights()),
             preferences="(none stored yet)",  # M6 memory feature fills this in
         )
         self._messages = []

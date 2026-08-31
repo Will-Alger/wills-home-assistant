@@ -66,7 +66,7 @@ none of the pipeline.
 | 1 | **Lights, no voice** — HAOS in a Hyper-V VM, bulbs controlled from Python via REST | ⏳ testing |
 | 2 | **Brain, no audio** — text REPL → LLM with tools → HA ("get the room ready for a party", typed) | ⏳ testing |
 | 3 | **Ears** — mic layer, openWakeWord, streaming STT; wake → transcript | ⏳ testing |
-| 4 | **Mouth** — voice-engine bake-off: GPT-Live/Realtime engine (primary candidate) behind our wake word + tools; ElevenLabs streaming pipeline as alternate engine | |
+| 4 | **Mouth** — voice-engine bake-off: OpenAI Realtime engine behind our wake word + tools (live-verified); ElevenLabs streaming pipeline as alternate engine | ⏳ testing |
 | 5 | **Music & media** — Spotify / Apple TV tools (likely via Music Assistant + AirPlay); stretch: YouTube search → play on Apple TV | |
 | 6 | **Tool belt** — web search (Anthropic server-side tool), Apple Calendar events (iCloud CalDAV), long-term memory (local store behind remember/recall tools) | |
 | 7 | **Voice ID** — local speaker embeddings (enroll Will's voiceprint); gates personal memories. Personalization, not security | |
@@ -179,6 +179,36 @@ later the real one), and the meter numbers look sane to you.
 
 **Done when** the wake word fires reliably for you and rarely for the TV, and
 "hey jarvis, make the living room cozy" round-trips end to end.
+
+## Milestone 4 runbook: it talks (OpenAI Realtime engine)
+
+Speech-native engine: the model hears you directly and speaks back —
+turn-taking, prosody, and interruptions come from OpenAI; wake gating, tools,
+and conversation-close rules stay ours. Needs `OPENAI_API_KEY` in `.env`.
+
+```powershell
+# no-mic sanity check first (saves the spoken reply as reply.wav):
+uv run scripts/m4_realtime.py --fake --text-probe "turn off the hallway light"
+
+# the real thing:
+uv run scripts/m4_realtime.py --fake     # fake apartment
+uv run scripts/m4_realtime.py            # real HA, after milestone 1
+```
+
+Say "hey jarvis" → rising beep → just talk. It converses (semantic
+turn-detection: pauses are respected), runs lighting commands mid-chat, and
+closes when you wrap up ("that's all") — or after `REALTIME_IDLE_TIMEOUT_S`
+of silence, since an open session bills by the minute (~$0.06–0.11/min;
+idle-at-wake costs nothing). **Barge-in**: say the wake phrase while it's
+talking to cut it off. Half-duplex by design — it doesn't listen while
+speaking (no echo loop on open speakers); true talk-over needs headphones/AEC
+and is a later upgrade. Swap voices anytime via `REALTIME_VOICE` in `.env`
+(marin/cedar recommended). Costs land in `.usage.jsonl` like everything else.
+
+**Done when** you've had one genuine conversation that included a lighting
+command mid-chat, a wrap-up close, and a barge-in — and the voice quality
+makes you grin. Then judge: does the pipeline (M4b, ElevenLabs mouth) still
+need building, or is this the engine?
 
 ## Layout
 
