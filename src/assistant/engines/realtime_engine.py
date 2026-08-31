@@ -386,6 +386,7 @@ class RealtimeEngine:
         wake_phrase: str = "hey jarvis",
         idle_timeout_s: float = 20.0,
         command_close_s: float = 8.0,
+        info_close_s: float = 15.0,
         talk_over: bool = False,
         eagerness: str = "high",
         extra_instructions: str = "",
@@ -405,6 +406,7 @@ class RealtimeEngine:
         self._wake_phrase = wake_phrase
         self._idle_timeout_s = idle_timeout_s
         self._command_close_s = command_close_s
+        self._info_close_s = info_close_s
         self.last_response_tools: list[str] = []  # set by _handle_response_done
         self._talk_over = talk_over  # headphones only: mic streams during playback
         self._eagerness = eagerness  # semantic VAD: how fast it decides you're done
@@ -784,17 +786,21 @@ class RealtimeEngine:
                 else:
                     ui.listening()
 
-            # One-shot quick close: a single user utterance that only ran
-            # command tools gets its confirmation, then the ENGINE closes the
-            # session after a short silence — no "that's all" needed. Any
-            # further speech disarms it and the session becomes a conversation.
+            # One-shot quick close: a single user utterance gets its answer,
+            # then the ENGINE closes the session after a short silence — no
+            # "that's all" needed. Commands close fast (8s); questions get a
+            # longer grace window for follow-ups (15s). Any further speech
+            # disarms it and the session becomes a conversation (45s idle).
             speech_segments = 0
             command_pending = False
             quick_close_armed = False
+            quick_close_window = self._command_close_s
+            quick_close_reason = "command complete"
 
             async def receive() -> None:
                 nonlocal speaking, response_active, closing, last_activity
                 nonlocal speech_segments, command_pending, quick_close_armed
+                nonlocal quick_close_window, quick_close_reason
                 heard = ""  # live accumulation of the user's words
                 while True:
                     event = await connection.recv()
@@ -845,9 +851,17 @@ class RealtimeEngine:
                         ran = self.last_response_tools
                         if any(t in COMMAND_TOOLS for t in ran):
                             command_pending = True
-                        elif not ran and command_pending and speech_segments <= 1:
-                            # the spoken confirmation after a one-shot command
+                        elif not ran and speech_segments <= 1:
+                            # the final spoken answer of a single-utterance
+                            # session: command confirmations close fast,
+                            # question answers get a longer follow-up window
                             quick_close_armed = True
+                            if command_pending:
+                                quick_close_window = self._command_close_s
+                                quick_close_reason = "command complete"
+                            else:
+                                quick_close_window = self._info_close_s
+                                quick_close_reason = "question answered"
                         pending.append(asyncio.create_task(finish_playback(closing)))
                     elif kind == "error":
                         ui.error(str(getattr(event, "error", event)))
@@ -857,8 +871,8 @@ class RealtimeEngine:
                     await asyncio.sleep(0.5)
                     quiet = time.monotonic() - last_activity
                     if not speaking and not response_active:
-                        if quick_close_armed and quiet > self._command_close_s:
-                            stats.ended_by = "command complete"
+                        if quick_close_armed and quiet > quick_close_window:
+                            stats.ended_by = quick_close_reason
                             ended.set()
                             return
                         if quiet > self._idle_timeout_s:

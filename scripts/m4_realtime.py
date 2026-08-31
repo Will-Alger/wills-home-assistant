@@ -122,6 +122,7 @@ def build_engine(fake: bool):
         wake_phrase=settings.wake_phrase,
         idle_timeout_s=settings.realtime_idle_timeout_s,
         command_close_s=settings.realtime_command_close_s,
+        info_close_s=settings.realtime_info_close_s,
         talk_over=settings.realtime_talk_over,
         eagerness=settings.realtime_eagerness,
         extra_instructions=settings.assistant_extra_instructions,
@@ -223,14 +224,19 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
         stats = await engine.run_conversation(
             mic24, speaker, session_wake, ConsoleUi(settings.assistant_name)
         )
+        # Goodbye chime through the SESSION speaker: a fresh sd.play stream
+        # right after this one closes silently loses the race on Windows.
+        with contextlib.suppress(Exception):
+            speaker.enqueue(tones.pcm("close", REALTIME_RATE))
+            await asyncio.wait_for(speaker.wait_idle(), timeout=3.0)
     total_cost += stats.cost_usd
     if engine.voice_note:
         console.print(f"[yellow]{engine.voice_note}[/yellow]")
         engine.voice_note = None
-    tones.play("close")
     reason = {
         "idle timeout": "quiet too long — closed to stop the meter; say the wake word anytime",
         "end_conversation": "she wrapped up",
+        "question answered": "question answered — closed after quiet",
     }.get(stats.ended_by, stats.ended_by)
     console.print(
         f"[bold]conversation closed[/bold] ({reason}) · {stats.responses} replies · "

@@ -16,6 +16,15 @@ def test_all_earcons_are_well_formed() -> None:
         assert np.max(np.abs(sound)) > 0.05  # actually audible
 
 
+def test_pcm_renders_at_arbitrary_rates() -> None:
+    from assistant.audio.tones import pcm
+
+    data = pcm("close", 24_000)
+    assert len(data) % 2 == 0 and len(data) > 20_000  # int16 mono, audibly long
+    as_int = np.frombuffer(data, dtype=np.int16)
+    assert np.max(np.abs(as_int)) <= int(0.85 * 32767) + 1  # same headroom rule
+
+
 def test_wake_rises_and_close_falls() -> None:
     # crude spectral check: the loudest early moment vs late moment frequency
     def dominant_hz(chunk: np.ndarray) -> float:

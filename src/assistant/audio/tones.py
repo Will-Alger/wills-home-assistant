@@ -19,10 +19,10 @@ import sounddevice as sd
 _RATE = 22_050
 
 
-def _note(freq: float, ms: int, amp: float, decay: float) -> np.ndarray:
+def _note(freq: float, ms: int, amp: float, decay: float, rate: int = _RATE) -> np.ndarray:
     """One bell-like note: fundamental + soft octave + a whisper of the 12th,
     fast attack, exponential ring-out."""
-    t = np.linspace(0, ms / 1000, int(_RATE * ms / 1000), endpoint=False)
+    t = np.linspace(0, ms / 1000, int(rate * ms / 1000), endpoint=False)
     wave = (
         1.00 * np.sin(2 * np.pi * freq * t)
         + 0.35 * np.sin(2 * np.pi * freq * 2 * t)
@@ -34,14 +34,14 @@ def _note(freq: float, ms: int, amp: float, decay: float) -> np.ndarray:
 
 def _chime(
     notes: list[float], *, ms_each: int = 340, stagger_ms: int = 95,
-    amp: float = 0.34, decay: float = 7.0,
+    amp: float = 0.34, decay: float = 7.0, rate: int = _RATE,
 ) -> np.ndarray:
     """Overlap-add the notes so each starts while the previous still rings."""
-    step = int(_RATE * stagger_ms / 1000)
-    length = step * (len(notes) - 1) + int(_RATE * ms_each / 1000)
+    step = int(rate * stagger_ms / 1000)
+    length = step * (len(notes) - 1) + int(rate * ms_each / 1000)
     out = np.zeros(length, dtype=np.float64)
     for i, freq in enumerate(notes):
-        rendered = _note(freq, ms_each, amp, decay)
+        rendered = _note(freq, ms_each, amp, decay, rate=rate)
         out[i * step : i * step + len(rendered)] += rendered
     peak = np.max(np.abs(out)) or 1.0
     if peak > 0.85:
@@ -49,14 +49,24 @@ def _chime(
     return out.astype(np.float32)
 
 
-_SOUNDS = {
-    # rising fourth, bright: I'm listening
-    "wake": _chime([659.3, 880.0]),
-    # falling, softer and longer ring: going back to sleep
-    "close": _chime([880.0, 659.3, 523.3], amp=0.26, decay=5.0, ms_each=420),
-    # low, brief, minor-ish: something went wrong
-    "error": _chime([220.0, 185.0], amp=0.24, decay=9.0, ms_each=260),
+_RECIPES: dict[str, dict] = {
+    "wake": {"notes": [659.3, 880.0]},
+    "close": {"notes": [880.0, 659.3, 523.3], "amp": 0.26, "decay": 5.0, "ms_each": 420},
+    "error": {"notes": [220.0, 185.0], "amp": 0.24, "decay": 9.0, "ms_each": 260},
 }
+
+
+def pcm(kind: str, rate: int) -> bytes:
+    """The chime as mono int16 PCM at the given rate — for playing through an
+    already-open output stream (e.g. the session Speaker) instead of racing
+    to open a new one, which Windows loses right after a stream closes."""
+    rendered = _chime(**{**_RECIPES[kind], "rate": rate})
+    return (rendered * 32767).astype(np.int16).tobytes()
+
+
+# wake: rising fourth, bright — I'm listening. close: falling, softer, longer
+# ring — going back to sleep. error: low, brief, minor-ish.
+_SOUNDS = {kind: _chime(**recipe) for kind, recipe in _RECIPES.items()}
 
 
 def play(kind: str) -> None:

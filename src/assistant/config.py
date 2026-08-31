@@ -90,6 +90,9 @@ class Settings(BaseSettings):
     # session this many seconds after the spoken confirmation if the speaker
     # stays silent — no "that's all" needed. Speaking again cancels it.
     realtime_command_close_s: float = 8.0
+    # Same idea for a single answered question ("what's the weather?"):
+    # longer window so follow-ups feel natural, still far snappier than idle.
+    realtime_info_close_s: float = 15.0
     # How fast semantic VAD decides you're done talking: low|medium|high|auto.
     # high = snappy replies; drop toward auto/low if it cuts off your pauses.
     realtime_eagerness: str = "high"
