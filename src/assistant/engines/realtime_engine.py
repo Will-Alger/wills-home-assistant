@@ -363,6 +363,8 @@ class RealtimeEngine:
                         }
                     )
 
+            pending: list[asyncio.Task] = []
+
             async def finish_playback(close_after: bool) -> None:
                 nonlocal speaking
                 await speaker.wait_idle()
@@ -405,7 +407,7 @@ class RealtimeEngine:
                     elif kind == "response.done":
                         response_active = False
                         closing = await self._handle_response_done(connection, event, stats)
-                        asyncio.create_task(finish_playback(closing))
+                        pending.append(asyncio.create_task(finish_playback(closing)))
                     elif kind == "error":
                         ui.error(str(getattr(event, "error", event)))
 
@@ -428,9 +430,13 @@ class RealtimeEngine:
                 if stats.ended_by == "unknown":
                     stats.ended_by = "end_conversation"
             finally:
-                for task in tasks:
+                for task in [*tasks, *pending]:
                     task.cancel()
-                for task in tasks:
-                    with contextlib.suppress(Exception):
+                for task in [*tasks, *pending]:
+                    # CancelledError is a BaseException, not Exception — it must
+                    # be suppressed explicitly or teardown masquerades as Ctrl+C
+                    # and kills the whole app (the "closed when I said that's
+                    # all" bug).
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
                         await task
         return stats
