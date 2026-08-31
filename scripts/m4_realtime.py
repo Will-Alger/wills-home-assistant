@@ -97,7 +97,11 @@ def build_engine(fake: bool):
         settings.require("ha_url", "ha_token")
     memory = MemoryStore(Path(__file__).resolve().parents[1] / "data" / "memory.json")
     reflector = None
-    if settings.anthropic_api_key:
+    if settings.use_claude_subscription:
+        from assistant.llm.claude_cli import ClaudeCli
+
+        reflector = Reflector(ClaudeCli(), memory)  # billed to Max, not API
+    elif settings.anthropic_api_key:
         reflector = Reflector(
             AnthropicProvider(
                 model=settings.llm_model,

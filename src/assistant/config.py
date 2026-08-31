@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     ha_url: str = "http://localhost:8123"
     ha_token: str = ""
 
+    # Background Claude jobs (reflection, later dispatch) run through the
+    # Claude Code CLI = billed to the Max SUBSCRIPTION, not API tokens.
+    # Set false to fall back to the API key below.
+    use_claude_subscription: bool = True
+
     # Milestone 2: LLM
     anthropic_api_key: str = ""
     # Required for identity-linked/multi-workspace keys (wrkspc_... id from
