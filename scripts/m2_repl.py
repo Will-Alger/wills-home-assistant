@@ -56,6 +56,7 @@ async def run(fake: bool) -> int:
         model=settings.llm_model,
         effort=settings.llm_effort,
         api_key=settings.anthropic_api_key or None,
+        workspace_id=settings.anthropic_workspace_id or None,
     )
     meter = Meter(log_path=Path(__file__).resolve().parents[1] / ".usage.jsonl")
     agent = Agent(home, llm, meter)
@@ -87,6 +88,16 @@ async def run(fake: bool) -> int:
                 "in .env (console.anthropic.com → API keys)."
             )
             return 1
+        except anthropic.BadRequestError as err:
+            if "workspace" in str(err).lower():
+                console.print(
+                    "[red]Your API key is identity-linked and needs a workspace id.[/red] "
+                    "Console → Settings → Workspaces → copy the wrkspc_... id into .env "
+                    "as ANTHROPIC_WORKSPACE_ID, then restart."
+                )
+                return 1
+            console.print(f"[red]API rejected the request:[/red] {err.message}")
+            continue
         except anthropic.APIConnectionError:
             console.print("[red]Network error talking to the Anthropic API.[/red]")
             continue

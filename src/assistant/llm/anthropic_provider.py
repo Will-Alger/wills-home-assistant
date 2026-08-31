@@ -23,12 +23,23 @@ from assistant.llm.base import ToolCall, TurnResult, Usage
 
 
 class AnthropicProvider:
-    def __init__(self, model: str, effort: str, api_key: str | None = None) -> None:
+    def __init__(
+        self,
+        model: str,
+        effort: str,
+        api_key: str | None = None,
+        workspace_id: str | None = None,
+    ) -> None:
         # Zero-arg client resolves ANTHROPIC_API_KEY / an `ant auth login`
         # profile; an explicit key (from .env) wins when provided.
-        self._client = (
-            anthropic.AsyncAnthropic(api_key=api_key) if api_key else anthropic.AsyncAnthropic()
-        )
+        # Identity-linked keys require the workspace header on every request;
+        # SDK 1.2 has no first-class option, so it rides as a default header.
+        kwargs: dict[str, Any] = {}
+        if api_key:
+            kwargs["api_key"] = api_key
+        if workspace_id:
+            kwargs["default_headers"] = {"anthropic-workspace-id": workspace_id}
+        self._client = anthropic.AsyncAnthropic(**kwargs)
         self._model = model
         self._effort = effort
 

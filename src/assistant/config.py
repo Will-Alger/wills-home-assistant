@@ -34,6 +34,9 @@ class Settings(BaseSettings):
 
     # Milestone 2: LLM
     anthropic_api_key: str = ""
+    # Required for identity-linked/multi-workspace keys (wrkspc_... id from
+    # the Console); harmless to leave empty for single-workspace keys.
+    anthropic_workspace_id: str = ""
     openai_api_key: str = ""
     llm_provider: str = "anthropic"
     llm_model: str = "claude-opus-5"

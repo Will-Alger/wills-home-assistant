@@ -37,6 +37,7 @@ async def run_command(text: str) -> tuple[FakeHome, object]:
         model=settings.llm_model,
         effort=settings.llm_effort,
         api_key=settings.anthropic_api_key or None,
+        workspace_id=settings.anthropic_workspace_id or None,
     )
     agent = Agent(home, llm, Meter())
     reply = await agent.handle(text)
