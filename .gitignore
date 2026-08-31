@@ -1,0 +1,14 @@
+# Secrets — never commit. Copy .env.example to .env and fill it in.
+.env
+
+# Home Assistant's runtime config (bind-mounted into the container).
+# It contains auth tokens, device registrations, and history — keep it out of git.
+ha-config/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+dist/

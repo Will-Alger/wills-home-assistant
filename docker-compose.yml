@@ -1,0 +1,24 @@
+# Home Assistant (Container flavor) for local development on Windows.
+#
+# Heads-up, verified 2026-08: Docker Desktop on Windows cannot deliver
+# multicast/broadcast (mDNS, SSDP, UDP discovery) into containers — even its
+# "host networking" option is only a TCP/UDP port proxy. That means:
+#   * WiZ bulbs: work, but must be added by IP (manual setup), not auto-discovery.
+#   * Matter bulbs (Linkind/AiDot), HomeKit pairing, AirPlay targets: NOT
+#     reachable from this container on Windows. Those need HAOS in a VM with a
+#     bridged NIC (Hyper-V/VirtualBox) or the eventual Raspberry Pi.
+#
+# On Linux/Raspberry Pi, switch to `network_mode: host` (and remove `ports:`)
+# per https://www.home-assistant.io/installation/linux — discovery then works.
+services:
+  homeassistant:
+    container_name: homeassistant
+    image: ghcr.io/home-assistant/home-assistant:stable
+    volumes:
+      - ./ha-config:/config # gitignored: contains tokens & device registry
+    environment:
+      TZ: ${TZ:-America/New_York} # set TZ in .env (IANA name)
+    ports:
+      - "8123:8123"
+    restart: unless-stopped
+    stop_grace_period: 60s

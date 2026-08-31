@@ -1,0 +1,28 @@
+[project]
+name = "wills-home-assistant"
+version = "0.1.0"
+description = "Wake-word voice assistant: local wake word -> cloud streaming STT -> LLM with tools -> ElevenLabs TTS, controlling the house through Home Assistant"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28",
+    "pydantic-settings>=2.6",
+    "rich>=13.9",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.8",
+]
+
+[tool.uv.build-backend]
+module-name = "assistant"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[build-system]
+requires = ["uv_build>=0.12,<0.13"]
+build-backend = "uv_build"
