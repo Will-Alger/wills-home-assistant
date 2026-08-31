@@ -85,7 +85,10 @@ async def run(fake: bool) -> int:
 
     console.print("Loading wake model (first run downloads it)...")
     wake = WakeDetector(settings.wake_model, threshold=settings.wake_threshold)
-    stt = DeepgramFlux(settings.deepgram_api_key)
+    stt = DeepgramFlux(
+        settings.deepgram_api_key,
+        eot_threshold=settings.stt_eot_threshold or None,
+    )
 
     from assistant.audio.mic import describe_device
 

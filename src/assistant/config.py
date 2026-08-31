@@ -55,6 +55,9 @@ class Settings(BaseSettings):
     audio_input_device: str = ""  # "" = default mic; index or name substring
     stt_provider: str = "deepgram"
     deepgram_api_key: str = ""
+    # 0 = provider default. Raise toward ~0.85 if it ends your turn at
+    # thoughtful pauses; it will wait for higher confidence you're done.
+    stt_eot_threshold: float = 0.0
 
     # Milestone 4: TTS
     elevenlabs_api_key: str = ""

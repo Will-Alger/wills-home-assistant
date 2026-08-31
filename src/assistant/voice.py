@@ -45,15 +45,21 @@ class VoiceLoop:
         ui: VoiceUi,
         *,
         max_listen_s: float = 15.0,
-        follow_up_s: float = 8.0,
+        follow_up_s: float = 10.0,
+        max_turn_s: float = 60.0,
     ) -> None:
         self._source = source
         self._wake = wake
         self._stt = stt
         self._agent = agent
         self._ui = ui
+        # The listen timeouts only cover WAITING for speech to start; once
+        # words arrive, the STT's end-of-turn detection decides when you're
+        # done, with max_turn_s as a failsafe ceiling. (Earlier design cut
+        # speakers off mid-sentence when the window elapsed — Will vetoed.)
         self._max_listen_s = max_listen_s
         self._follow_up_s = follow_up_s
+        self._max_turn_s = max_turn_s
         self.last_command_audio = b""  # retained for the voice-ID milestone
 
     async def run(self) -> None:
@@ -99,7 +105,7 @@ class VoiceLoop:
         final: str | None = None
         pump_task: asyncio.Task | None = None
         try:
-            async with asyncio.timeout(timeout_s):
+            async with asyncio.timeout(timeout_s) as deadline:
                 async with self._stt.stream() as stream:
 
                     async def pump() -> None:
@@ -109,8 +115,16 @@ class VoiceLoop:
                             await stream.send_audio(frame)
 
                     pump_task = asyncio.create_task(pump())
+                    speaking = False
                     try:
                         async for event in stream.events():
+                            if not speaking:
+                                # Speech started: stop the clock; end-of-turn
+                                # detection takes over (failsafe cap only).
+                                speaking = True
+                                deadline.reschedule(
+                                    asyncio.get_running_loop().time() + self._max_turn_s
+                                )
                             if event.kind == "partial":
                                 self._ui.partial(event.transcript)
                             else:

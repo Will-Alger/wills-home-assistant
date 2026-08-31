@@ -185,6 +185,34 @@ async def test_agent_failure_reports_error_and_recovers_to_idle() -> None:
     assert ui.kinds()[-1] == "idle"
 
 
+async def test_speech_started_before_window_expiry_is_never_cut_off() -> None:
+    """The listen window only covers waiting for speech; once words arrive,
+    end-of-turn detection governs — even past the original window."""
+    source = FakeSource([WAKE, NOISE, NOISE, NOISE])
+
+    class SlowTalker(FakeStt):
+        @asynccontextmanager
+        async def stream(self):
+            stream = _FakeSttStream([])
+
+            async def events():
+                await asyncio.sleep(0.02)  # speech starts inside the window
+                yield SttEvent("partial", "so I was")
+                await asyncio.sleep(0.15)  # ...but finishes well past it
+                yield SttEvent("final", "so I was thinking about dinner")
+
+            stream.events = events  # type: ignore[method-assign]
+            yield stream
+
+    agent = FakeAgent([make_reply("close")])
+    ui = RecordingUi()
+    loop = VoiceLoop(source, FakeWake(), SlowTalker([]), agent, ui, max_listen_s=0.05)
+
+    await run_until_idle(loop, source, ui)
+
+    assert agent.transcripts == ["so I was thinking about dinner"]
+
+
 async def test_command_audio_retained_for_voice_id() -> None:
     source = FakeSource([WAKE, b"aa", b"bb", b"cc", b"dd", b"ee", b"ff"])
 
