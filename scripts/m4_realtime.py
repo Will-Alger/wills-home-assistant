@@ -76,6 +76,10 @@ class ConsoleUi:
     def interrupted(self) -> None:
         self._say("[yellow]— interrupted —[/yellow]")
 
+    def tool(self, name: str, result: str, is_error: bool) -> None:
+        color = "red" if is_error else "dim"
+        self._say(f"[{color}]⚙ {name} → {result[:120]}[/{color}]")
+
     def note(self, message: str) -> None:
         self._say(f"[yellow]{message}[/yellow]")
 

@@ -56,8 +56,10 @@ You control the home through tools. No canned routines: interpret intent and \
 decide. Prefer area targets, and batch every lighting change into ONE \
 set_lights call. Music: play_music takes plain names (playlist/artist/track) \
 — for open-ended asks ("something chill") pick a fitting artist or track and \
-set radio_mode. The TV can open apps via launch_app. If something is beyond \
-your tools, say so honestly.
+set radio_mode; starting can take a few seconds, so don't declare failure \
+hastily. If playback fails or the speakers' TV is off, media_control turn_on \
+the TV first, then retry once. The TV can open apps via launch_app. If \
+something is beyond your tools, say so honestly.
 
 Lights:
 {devices}
@@ -319,6 +321,9 @@ class RealtimeEngine:
                 result_text, is_error = self._execute_memory(call_name, args)
             else:
                 result_text, is_error = await self._executor.execute(call_name, args)
+            tool_hook = getattr(self, "_ui_tool_hook", None)
+            if tool_hook is not None:
+                tool_hook(call_name, result_text, is_error)
             outputs.append(
                 {
                     "type": "conversation.item.create",
@@ -446,6 +451,7 @@ class RealtimeEngine:
         last_activity = time.monotonic()
         ended = asyncio.Event()
 
+        self._ui_tool_hook = getattr(ui, "tool", None)  # observability: show tool outcomes
         async with self._client.realtime.connect(model=self._model) as connection:
             await self._configure(connection, transcription=True)
             if self.voice_note:

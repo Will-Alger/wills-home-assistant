@@ -156,7 +156,7 @@ class ToolExecutor:
                     enqueue=tool_input.get("enqueue"),
                     radio_mode=bool(tool_input.get("radio_mode", False)),
                 )
-                return f"Playing on {player.name}.", False
+                return f"Started on {player.name} (audio may take a few seconds to begin).", False
             if name == "media_control":
                 player = await self._resolve_player(tool_input.get("player"), kind=None)
                 await self._home.media_command(

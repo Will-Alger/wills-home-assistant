@@ -179,7 +179,12 @@ class HomeAssistantClient:
             data["enqueue"] = enqueue
         if radio_mode:
             data["radio_mode"] = True
-        await self.call_service("music_assistant", "play_media", data)
+        try:
+            # MA search + AirPlay spin-up is slow; and if we time out anyway,
+            # the service keeps executing server-side — that's not a failure.
+            await self.call_service("music_assistant", "play_media", data, timeout=30.0)
+        except httpx.ReadTimeout:
+            pass
 
     _MEDIA_COMMANDS: typing.ClassVar[dict[str, str]] = {
         "pause": "media_pause",
@@ -211,8 +216,14 @@ class HomeAssistantClient:
             "media_player", "select_source", {"entity_id": entity_id, "source": app}
         )
 
-    async def call_service(self, domain: str, service: str, data: dict[str, Any]) -> Any:
-        resp = await self._http.post(f"/api/services/{domain}/{service}", json=data)
+    async def call_service(
+        self, domain: str, service: str, data: dict[str, Any], *, timeout: float | None = None
+    ) -> Any:
+        resp = await self._http.post(
+            f"/api/services/{domain}/{service}",
+            json=data,
+            timeout=timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT,
+        )
         self._check(resp)
         return resp.json()
 
