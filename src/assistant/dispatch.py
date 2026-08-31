@@ -164,13 +164,18 @@ class Dispatcher:
         """Other repositories with a dispatch routine configured."""
         return sorted(self._extra_routines)
 
-    async def start(self, request: str, title: str, repo: str = "") -> Job:
+    async def start(self, request: str, title: str, repo: str = "", mode: str = "") -> Job:
         if repo and not _is_own_repo(repo):
             entry = self._resolve_repo(repo)
             return await self._start_cloud(
                 request, title, entry["routine_id"], entry["token"], repo=repo
             )
-        if self.cloud_enabled:
+        # Own repo: LOCAL by default — the full loop (voice merge, restart,
+        # self-test) only works on a local worktree. Cloud on request, for
+        # sessions Will wants to watch live or continue from his phone.
+        if mode == "cloud":
+            if not self.cloud_enabled:
+                raise DispatchError("cloud dispatch is not configured (routine id/token missing)")
             return await self._start_cloud(request, title, self._routine_id, self._routine_token)
         return await self._start_local(request, title)
 
@@ -359,38 +364,64 @@ class Dispatcher:
             return 1, "timed out"
         return proc.returncode or 0, out.decode(errors="replace")
 
-    async def merge(self, job_id: str) -> str:
-        """Voice-approved merge with gates: done local job, clean main,
-        independent lint+tests on the branch. Pushes on success."""
+    async def merge(self, job_id: str, branch: str = "") -> str:
+        """Voice-approved merge with gates: done job, clean main, independent
+        lint+tests on the branch. Local jobs merge their worktree branch; a
+        DONE cloud job merges the remote branch its session pushed (fetched
+        and gated here first). Pushes on success."""
         job = self._jobs.get(job_id)
         if job is None:
             return f"no job {job_id!r} — see check_work for ids"
-        if job.mode == "cloud":
-            return "cloud jobs land as GitHub pull requests — merge those from the PR page for now"
         if job.status == "merged":
             return f"{job.id} is already merged"
         if job.status != "done":
-            return f"{job.id} is {job.status} — only finished jobs can be merged"
+            hint = " — refresh its live status first (check_work refresh=true)" if job.mode == "cloud" else ""
+            return f"{job.id} is {job.status} — only finished jobs can be merged{hint}"
+
+        merge_worktree: Path | None = None
+        if job.mode == "cloud":
+            if not branch:
+                return (
+                    "a cloud job merges by its remote branch — ask its status for "
+                    "where the work landed, then merge_work with branch=<exact name>"
+                )
+            code, out = await self._cmd(["git", "fetch", "origin", branch], self._root)
+            if code != 0:
+                return f"could not fetch branch {branch!r} from origin: {out[-300:]}"
+            merge_ref = f"origin/{branch}"
+            merge_worktree = self._root / ".worktrees" / f"merge-{job.id}"
+            code, out = await self._cmd(
+                ["git", "worktree", "add", "--detach", str(merge_worktree), merge_ref],
+                self._root,
+            )
+            if code != 0:
+                return f"could not check out {merge_ref} for verification: {out[-300:]}"
+            gates_dir = merge_worktree
+        else:
+            merge_ref = job.branch
+            gates_dir = Path(job.worktree)
 
         code, out = await self._cmd(
             ["git", "status", "--porcelain", "--untracked-files=no"], self._root
         )
         if out.strip():
+            await self._drop_worktree(merge_worktree)
             return "the main checkout has uncommitted changes — merge blocked until it's clean"
 
-        worktree = Path(job.worktree)
-        if (worktree / "pyproject.toml").exists():
+        if (gates_dir / "pyproject.toml").exists():
             for label, check in (
                 ("lint", "uv run ruff check src scripts tests"),
                 ("tests", "uv run pytest -q"),
             ):
-                code, out = await self._cmd(check, worktree, timeout=600.0)
+                code, out = await self._cmd(check, gates_dir, timeout=600.0)
                 if code != 0:
-                    return f"merge blocked: {label} failed on {job.branch}:\n{out[-500:]}"
+                    await self._drop_worktree(merge_worktree)
+                    return f"merge blocked: {label} failed on {merge_ref}:\n{out[-500:]}"
+        await self._drop_worktree(merge_worktree)
 
         code, out = await self._cmd(
-            ["git", "merge", "--no-ff", job.branch, "-m",
-             f"Merge {job.branch}: {job.title} (voice-approved by owner)"],
+            ["git", "merge", "--no-ff", merge_ref, "-m",
+             f"Merge {merge_ref}: {job.title} (voice-approved by owner)"],
             self._root,
         )
         if code != 0:
@@ -403,9 +434,13 @@ class Dispatcher:
         self._save()
         push_note = "" if push_code == 0 else f" (push failed: {push_out[-120:]})"
         return (
-            f"merged {job.branch} into main and pushed{push_note} — checks passed. "
+            f"merged {merge_ref} into main and pushed{push_note} — checks passed. "
             "Offer to restart yourself so the change takes effect."
         )
+
+    async def _drop_worktree(self, path: Path | None) -> None:
+        if path is not None:
+            await self._cmd(["git", "worktree", "remove", "--force", str(path)], self._root)
 
     def close(self, job_id: str) -> str:
         """The owner considers this job dealt with — archive it."""

@@ -114,9 +114,12 @@ your recent code changes; read_roadmap returns your feature backlog. {owner} \
 may discuss your development with you — engage substantively, with opinions \
 about priorities. You can now COMMISSION changes to your own code: when \
 {owner} asks for a new capability or fix, restate the exact task aloud, get \
-an explicit yes, then call develop_feature with confirmed=true. The work \
-runs in the background on a sandboxed branch (or a cloud session {owner} can \
-watch live). Answer progress questions with check_work — and when a job has \
+an explicit yes, then call develop_feature with confirmed=true. Own-repo \
+work runs LOCAL by default: a sandboxed branch you can voice-merge and then \
+restart into — the full loop. If {owner} wants to watch it live or continue \
+it from his phone, pass mode=cloud; cloud jobs land as a GitHub branch, and \
+merging one needs its exact branch name from its refreshed DONE status. \
+Answer progress questions with check_work — and when a job has \
 a live URL, offer to show_me it on the desktop screen. Jobs persist across \
 days and restarts: {owner} may commission something, leave, and ask hours \
 later. Open jobs right now: {jobs}. If one finished since you last spoke, \
@@ -227,6 +230,16 @@ DISPATCH_TOOLS: list[dict[str, Any]] = [
                         "only repos listed in your instructions are valid"
                     ),
                 },
+                "mode": {
+                    "type": "string",
+                    "enum": ["local", "cloud"],
+                    "description": (
+                        "own repo only: 'local' (default) = sandboxed branch "
+                        "here, voice-mergeable then restart; 'cloud' = live "
+                        "claude.ai/code session the owner can watch/continue "
+                        "anywhere, lands as a GitHub branch"
+                    ),
+                },
                 "confirmed": {
                     "type": "boolean",
                     "description": "true ONLY after the owner verbally approved this exact task",
@@ -273,9 +286,11 @@ DISPATCH_TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "name": "merge_work",
         "description": (
-            "Merge a FINISHED job's branch into main — ONLY after restating "
-            "which job aloud and getting the owner's explicit yes for this "
-            "specific merge. Gates enforce clean main + passing lint/tests. "
+            "Merge a FINISHED job into main — ONLY after restating which job "
+            "aloud and getting the owner's explicit yes for this specific "
+            "merge. Gates enforce clean main + passing lint/tests. Local jobs "
+            "merge their sandbox branch; a DONE cloud job needs branch=<the "
+            "exact branch its session pushed> (from its refreshed status). "
             "After a successful merge, offer restart_self so it takes effect, "
             "then try out the new capability."
         ),
@@ -283,6 +298,10 @@ DISPATCH_TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "job_id": {"type": "string"},
+                "branch": {
+                    "type": "string",
+                    "description": "cloud jobs only: exact remote branch name the session pushed",
+                },
                 "confirmed": {
                     "type": "boolean",
                     "description": "true ONLY after the owner verbally approved merging this job",
@@ -604,6 +623,7 @@ class RealtimeEngine:
                     str(args.get("request", "")),
                     str(args.get("title", "task")),
                     repo=str(args.get("repo", "") or ""),
+                    mode=str(args.get("mode", "") or ""),
                 )
                 where = f" in {job.repo}" if job.repo else ""
                 via = (
@@ -637,7 +657,9 @@ class RealtimeEngine:
                         "not merged: name the job to the owner and get an explicit "
                         "yes for this merge first, then retry with confirmed=true"
                     ), True
-                return await self._dispatcher.merge(str(args.get("job_id", ""))), False
+                return await self._dispatcher.merge(
+                    str(args.get("job_id", "")), branch=str(args.get("branch", "") or "")
+                ), False
             return f"unknown dispatch tool {name}", True
         except Exception as err:  # noqa: BLE001 — surfaced to the model, never crashes
             return f"dispatch failed: {err}", True

@@ -1,4 +1,4 @@
-"""Dispatcher tests: a throwaway git repo + a fake claude CLI. No Max usage."""
+﻿"""Dispatcher tests: a throwaway git repo + a fake claude CLI. No Max usage."""
 
 from __future__ import annotations
 
@@ -105,7 +105,7 @@ class FakeCloudDispatcher(Dispatcher):
         self.fired.append((routine_id, token))
         job = Job(
             id=f"cloud-{_u.uuid4().hex[:6]}", title=title, request=request,
-            status="running", branch="(cloud session — lands as a GitHub branch/PR)",
+            status="running", branch="(cloud session â€” lands as a GitHub branch/PR)",
             worktree="", started=_t.time(), mode="cloud",
             session_id="session_01TEST", session_url="https://claude.ai/code/session_01TEST",
             summary="running in the cloud", repo=repo,
@@ -120,14 +120,14 @@ async def test_cloud_dispatch_records_session_url(tmp_path) -> None:
 
     dispatcher = FakeCloudDispatcher(repo, routine_id="trig_x", routine_token="tok_x")
     assert dispatcher.cloud_enabled
-    job = await dispatcher.start("build the thing", "the thing")
+    job = await dispatcher.start("build the thing", "the thing", mode="cloud")
     assert job.mode == "cloud" and "claude.ai/code" in job.session_url
     assert dispatcher.fired == [("trig_x", "tok_x")]  # own routine, own creds
 
     report = json.loads(dispatcher.report())
     assert report[0]["open_live"] == "https://claude.ai/code/session_01TEST"
 
-    # restart must NOT mark cloud jobs interrupted — they run server-side
+    # restart must NOT mark cloud jobs interrupted â€” they run server-side
     again = Dispatcher(repo, claude_cmd="unused")
     assert again.jobs()[0].status == "running"
 
@@ -147,7 +147,7 @@ async def test_multi_repo_dispatch_routes_to_that_repos_routine(tmp_path) -> Non
     assert dispatcher.fired == [("trig_side", "tok_side")]  # that repo's creds, not hers
 
     # own-repo aliases still use her own routine
-    await dispatcher.start("tweak", "tweak", repo="self")
+    await dispatcher.start("tweak", "tweak", repo="self", mode="cloud")
     assert dispatcher.fired[-1] == ("trig_self", "tok_self")
 
     report = json.loads(dispatcher.report())
@@ -226,12 +226,12 @@ async def test_open_vs_closed_lifecycle(tmp_path) -> None:
 
     repo = make_repo(tmp_path)
     dispatcher = FakeCloudDispatcher(repo, routine_id="t", routine_token="k")
-    job = await dispatcher.start("build the thing", "the thing")
+    job = await dispatcher.start("build the thing", "the thing", mode="cloud")
 
     # while running it shows up in the wake-time status line
     assert "the thing" in dispatcher.status_line() and "running" in dispatcher.status_line()
 
-    # finished (say, while Will was at work) — still open, flagged with age
+    # finished (say, while Will was at work) â€” still open, flagged with age
     job.status = "done"
     job.finished = _t.time() - 2 * 3600
     job.summary = "opened PR #9"
@@ -260,7 +260,7 @@ async def test_cloud_refresh_updates_the_job_from_the_live_session(tmp_path) -> 
     dispatcher = FakeCloudDispatcher(
         repo, routine_id="t", routine_token="k", cloud_status_cmd=fake_status
     )
-    job = await dispatcher.start("build", "build it")
+    job = await dispatcher.start("build", "build it", mode="cloud")
     assert json.loads(dispatcher.report())[0]["note"].startswith("cloud progress")
 
     pinged = dispatcher.refresh_running_cloud()
@@ -280,6 +280,58 @@ def test_stop_command_matching() -> None:
         assert is_stop_command(phrase), phrase
     for phrase in ("stop the music", "don't stop believing", "stop at the store tomorrow"):
         assert not is_stop_command(phrase), phrase
+
+
+async def test_own_repo_defaults_local_even_with_cloud_configured(tmp_path) -> None:
+    """The full loop (voice merge + restart) needs a local worktree — cloud
+    must be opt-in for her own repo."""
+    repo = make_repo(tmp_path)
+    dispatcher = Dispatcher(
+        repo,
+        claude_cmd=f'"{sys.executable}" "{FAKE_CLAUDE}"',
+        timeout_s=20.0,
+        routine_id="trig_x",
+        routine_token="tok_x",
+    )
+    job = await dispatcher.start("greeting", "greeting")
+    assert job.mode == "local" and job.branch.startswith("alexa/")
+    await wait_done(dispatcher, job.id)
+
+
+def _push_cloud_branch_to_origin(repo: Path, tmp_path: Path) -> None:
+    """Simulate a cloud session: a bare origin holding a pushed feature branch."""
+    origin = tmp_path / "origin.git"
+    run = lambda *a, **kw: subprocess.run(["git", *a], check=True, capture_output=True, **kw)
+    run("init", "--bare", str(origin))
+    run("remote", "add", "origin", str(origin), cwd=repo)
+    run("push", "origin", "main", cwd=repo)
+    run("checkout", "-b", "alexa/cloud-feature", cwd=repo)
+    (repo / "CLOUD.md").write_text("from the cloud", encoding="utf-8")
+    run("add", "-A", cwd=repo)
+    run("commit", "-m", "cloud work", cwd=repo)
+    run("push", "origin", "alexa/cloud-feature", cwd=repo)
+    run("checkout", "main", cwd=repo)
+    run("branch", "-D", "alexa/cloud-feature", cwd=repo)  # only the remote has it now
+
+
+async def test_cloud_job_merges_by_remote_branch_with_gates(tmp_path) -> None:
+    repo = make_repo(tmp_path)
+    _push_cloud_branch_to_origin(repo, tmp_path)
+
+    dispatcher = FakeCloudDispatcher(repo, routine_id="t", routine_token="k")
+    job = await dispatcher.start("cloud feature", "cloud feature", mode="cloud")
+
+    # gates: not done yet, and done-but-no-branch both refuse with guidance
+    assert "only finished jobs" in await dispatcher.merge(job.id, branch="alexa/cloud-feature")
+    job.status = "done"
+    dispatcher._save()
+    assert "remote branch" in await dispatcher.merge(job.id)
+
+    result = await dispatcher.merge(job.id, branch="alexa/cloud-feature")
+    assert "merged origin/alexa/cloud-feature" in result, result
+    assert (repo / "CLOUD.md").exists()  # landed on main
+    assert dispatcher.jobs()[0].status == "merged" and dispatcher.jobs()[0].closed
+    assert not (repo / ".worktrees" / f"merge-{job.id}").exists()  # cleaned up
 
 
 async def test_failed_agent_is_reported(tmp_path) -> None:
