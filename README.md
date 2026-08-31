@@ -1,10 +1,17 @@
 # wills-home-assistant
 
-A wake-word voice assistant with a frontier cloud LLM for a brain. The point —
-and the difference from Alexa/Google — is that there are no canned routines:
-the model gets the live device list and a set of tools, and *reasons* about
-what to do. "Get the room ready for a party" should warm and dim the lights
-and start music because the model decided that, not because anyone scripted it.
+A wake-word voice assistant with a frontier cloud LLM for a brain. Two things
+separate it from Alexa/Google, and they're equal partners:
+
+1. **No canned routines.** The model gets the live device list and a set of
+   tools, and *reasons* about what to do. "Get the room ready for a party"
+   warms and dims the lights (and starts music) because the model decided
+   that, not because anyone scripted it.
+2. **It's actually conversational.** Commands and open conversation are one
+   session with one brain: you can chat, think out loud, ask questions, and
+   drop a lighting command mid-thought — the mic stays open while the
+   conversation flows, and only you end it. Alexa pattern-matches utterances
+   to skills; this holds a conversation that happens to control your house.
 
 ## Architecture
 

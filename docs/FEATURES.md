@@ -4,6 +4,11 @@ The living list of everything the assistant should eventually do. Edit freely;
 the README milestone table stays the short version. Statuses: `idea` →
 `planned` (has a milestone) → `building` → `testing` → `done`.
 
+**North star (Will, 2026-08-31):** conversational ability is co-equal with
+command execution — "that's where the strength comes into play for a custom
+solution; Alexa isn't conversational at all." Any tradeoff that makes it a
+better command box but a worse conversation partner is the wrong tradeoff.
+
 ## Hardware reality (governs sequencing)
 
 **Now:** a USB microphone + the desktop and/or a laptop. Everything through
