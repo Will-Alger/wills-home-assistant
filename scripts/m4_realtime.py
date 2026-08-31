@@ -186,6 +186,9 @@ async def voice(fake: bool) -> int:
             except Exception as err:  # noqa: BLE001 — the app must never die on its own
                 tones.play("error")
                 console.print(f"[red]recovered from: {err!r} — back to idle[/red]")
+            if engine.restart_requested:
+                console.print("[yellow]self-restart requested — exiting for the watchdog[/yellow]")
+                return 0  # the always-on service relaunches us in seconds
     console.print(f"\n[dim]total: ${total_cost:.4f}[/dim]")
     return 0
 
