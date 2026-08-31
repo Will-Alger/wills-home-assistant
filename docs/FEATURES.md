@@ -23,6 +23,16 @@ rooms, the Pis are just cheaper, smaller copies of a proven thing.
 The brain should eventually live on the desktop (always on, and it's where
 Claude Code dispatch runs anyway); pipeline code stays host-agnostic.
 
+**Device buying rule (Will, 2026-08-31 — staying in the Apple ecosystem):**
+buy HomeKit-compatible devices that are also **Matter-certified**. Matter
+multi-admin means: pair to Apple Home first (normal Apple experience), then
+share to Home Assistant (30 s) — both control it, nothing is given up. Apple
+Home stays the household's face; HA is invisible plumbing that gives our
+assistant its API. Non-Matter oddballs (e.g. WiZ) go the reverse way via
+HA's HomeKit Bridge into Apple Home. Thread devices need a border router —
+an Apple TV 4K / HomePod counts. Apple Home itself has no API; this is the
+closest legitimate thing to "just pair it to Apple Home."
+
 ## Core pipeline
 
 | Feature | Approach | Milestone | Cost | Status |
