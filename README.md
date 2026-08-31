@@ -107,12 +107,17 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_haos_vm.ps1
    (*Settings → Devices & services* shows them as "Discovered"). If not, add
    the WiZ integration manually with each bulb's IP (router DHCP list or the
    WiZ app; give them DHCP reservations either way).
-3. **Matter bulbs (Linkind/AiDot)**: install the Matter Server add-on
-   (*Settings → Add-ons*), then share the bulbs from Apple Home (they stay in
-   Apple Home — Matter multi-admin): *Settings → Devices & services → Add
-   integration → Matter*, choose "the device is already in use", follow the
-   share-code flow from the iPhone. Treat this as a stretch step — WiZ alone
-   completes M1.
+3. **Apple Home bulbs (Linkind/AiDot)** — check the fork first: in the Apple
+   Home app, long-press the bulb → Accessory Settings → look for **"Turn On
+   Pairing Mode"** at the bottom.
+   - *Present → Matter path* (bulbs stay in Apple Home): use the HA
+     **companion app on the iPhone** → *Settings → Devices & services → Add
+     integration → Matter* (auto-installs the Matter Server) → *Add Matter
+     device → "The device is already in use" → Apple Home*.
+   - *Absent → plain HomeKit path*: remove the bulb from Apple Home
+     (**no factory reset**), HA discovers it within a minute (HomeKit
+     Device), pair with the setup code printed on the bulb/box. Siri can be
+     restored later via HA's HomeKit Bridge.
 4. **Name and place everything** (required, not cosmetic): give every light a
    human name and an **area** in the HA UI — the brain reasons in rooms, and
    the API exposes no room data for unassigned entities.
