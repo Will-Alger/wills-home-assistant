@@ -112,7 +112,15 @@ about priorities. You can now COMMISSION changes to your own code: when \
 an explicit yes, then call develop_feature with confirmed=true. The work \
 runs in the background on a sandboxed branch (or a cloud session {owner} can \
 watch live). Answer progress questions with check_work — and when a job has \
-a live URL, offer to show_me it on the desktop screen. When a job is done, \
+a live URL, offer to show_me it on the desktop screen. Jobs persist across \
+days and restarts: {owner} may commission something, leave, and ask hours \
+later. Open jobs right now: {jobs}. If one finished since you last spoke, \
+lead with that when he asks what's new. A running cloud job's progress is \
+not visible from here — check_work with refresh=true asks its live session \
+and the answer lands a minute or two later, so say you're checking and look \
+again when he asks. When {owner} treats a job as dealt with — reviewed, \
+merged elsewhere, or abandoned — call close_work so reports stay about what \
+is actually open. When a job is done, \
 {owner} may review it himself, or approve a voice merge: with his explicit \
 per-merge yes, call merge_work (gates verify lint/tests independently), then \
 offer restart_self, and after coming back, test your new capability in \
@@ -229,10 +237,35 @@ DISPATCH_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "name": "check_work",
-        "description": "Progress/results of commissioned development jobs (all recent, or one by id).",
+        "description": (
+            "Progress/results of commissioned development jobs — open ones by "
+            "default, or one by id. refresh=true additionally messages a "
+            "running cloud job's live session for a real status; that answer "
+            "lands in a minute or two, so say so and check again when asked. "
+            "include_closed=true also lists archived (closed) jobs."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string"},
+                "refresh": {"type": "boolean"},
+                "include_closed": {"type": "boolean"},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "name": "close_work",
+        "description": (
+            "Archive a commissioned job the owner considers dealt with — "
+            "reviewed, abandoned, or no longer interesting. It stops "
+            "appearing in job reports and the open-jobs list. Merging a job "
+            "closes it automatically."
+        ),
         "parameters": {
             "type": "object",
             "properties": {"job_id": {"type": "string"}},
+            "required": ["job_id"],
         },
     },
     {
@@ -405,6 +438,7 @@ class RealtimeEngine:
                 if self._calendar is not None
                 else ""
             ),
+            jobs=self._dispatcher.status_line() if self._dispatcher else "(dispatch not enabled)",
             extra=extra,
         )
         audio_in: dict[str, Any] = {
@@ -567,7 +601,21 @@ class RealtimeEngine:
                     "background — check_work reports progress"
                 ), False
             if name == "check_work":
-                return self._dispatcher.report(args.get("job_id") or None), False
+                report = self._dispatcher.report(
+                    args.get("job_id") or None,
+                    include_closed=bool(args.get("include_closed")),
+                )
+                if args.get("refresh"):
+                    pinged = self._dispatcher.refresh_running_cloud(args.get("job_id") or None)
+                    report += (
+                        f"\n[live status requested from: {', '.join(pinged)} — answers "
+                        "arrive in a minute or two; call check_work again then]"
+                        if pinged
+                        else "\n[nothing to refresh — no running cloud jobs]"
+                    )
+                return report, False
+            if name == "close_work":
+                return self._dispatcher.close(str(args.get("job_id", ""))), False
             if name == "merge_work":
                 if not args.get("confirmed"):
                     return (
