@@ -201,6 +201,7 @@ async def test_voice_merge_with_gates(tmp_path) -> None:
     assert "merged" in result and "restart" in result
     assert (repo / "GREETING.md").exists()  # landed on main
     assert dispatcher.jobs()[0].status == "merged"
+    assert dispatcher.jobs()[0].closed  # merging IS the close
     # double-merge refused
     assert "already merged" in await dispatcher.merge(job.id)
     # unknown job refused
@@ -216,6 +217,60 @@ async def test_merge_blocked_by_dirty_main(tmp_path) -> None:
     await wait_done(dispatcher, job.id)
     (repo / "README.md").write_text("dirty", encoding="utf-8")  # tracked file modified
     assert "uncommitted changes" in await dispatcher.merge(job.id)
+
+
+async def test_open_vs_closed_lifecycle(tmp_path) -> None:
+    """Will's away-scenario: jobs persist, finished ones stay visible until
+    he considers them dealt with, then close_work archives them."""
+    import time as _t
+
+    repo = make_repo(tmp_path)
+    dispatcher = FakeCloudDispatcher(repo, routine_id="t", routine_token="k")
+    job = await dispatcher.start("build the thing", "the thing")
+
+    # while running it shows up in the wake-time status line
+    assert "the thing" in dispatcher.status_line() and "running" in dispatcher.status_line()
+
+    # finished (say, while Will was at work) — still open, flagged with age
+    job.status = "done"
+    job.finished = _t.time() - 2 * 3600
+    job.summary = "opened PR #9"
+    dispatcher._save()
+    line = dispatcher.status_line()
+    assert "done" in line and "not yet closed" in line and "2.0h" in line
+    assert json.loads(dispatcher.report())[0]["hours_ago_finished"] == 2.0
+
+    # "yeah, we're done with that one"
+    assert "closed" in dispatcher.close(job.id)
+    assert dispatcher.status_line() == "none open"
+    assert "no open jobs" in dispatcher.report()
+    assert json.loads(dispatcher.report(include_closed=True))[0]["closed"] is True
+    assert json.loads(dispatcher.report(job.id))[0]["id"] == job.id  # by id still works
+
+    # survives a restart
+    again = Dispatcher(repo, claude_cmd="unused")
+    assert again.jobs()[0].closed is True
+    assert "already closed" in dispatcher.close(job.id)
+    assert "no job" in dispatcher.close("nope")
+
+
+async def test_cloud_refresh_updates_the_job_from_the_live_session(tmp_path) -> None:
+    repo = make_repo(tmp_path)
+    fake_status = f'"{sys.executable}" -c "print(\'DONE: opened PR 7 on the side project\')"'
+    dispatcher = FakeCloudDispatcher(
+        repo, routine_id="t", routine_token="k", cloud_status_cmd=fake_status
+    )
+    job = await dispatcher.start("build", "build it")
+    assert json.loads(dispatcher.report())[0]["note"].startswith("cloud progress")
+
+    pinged = dispatcher.refresh_running_cloud()
+    assert pinged == [job.id]
+    await asyncio.gather(*dispatcher._tasks)
+
+    job = dispatcher.jobs()[0]
+    assert job.status == "done" and job.finished
+    assert "PR 7" in job.summary and "live check at" in job.last_activity
+    assert "no job" in await dispatcher.refresh("missing")
 
 
 def test_stop_command_matching() -> None:

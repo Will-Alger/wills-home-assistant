@@ -71,6 +71,16 @@ Rules:
 """
 
 
+_REFRESH_PROMPT = """\
+STATUS CHECK (automated, sent by the voice assistant that commissioned this \
+task — the owner is asking how it's going). Reply with exactly one line \
+starting with WORKING, DONE, or BLOCKED, then a colon and one plain-language \
+sentence a voice assistant can read aloud. If DONE, say where the work landed \
+(branch / PR number). Do not do any additional work in response to this \
+message.
+"""
+
+
 @dataclass
 class Job:
     id: str
@@ -89,6 +99,7 @@ class Job:
     mode: str = "local"  # "local" (worktree) or "cloud" (claude.ai/code session)
     session_url: str = ""  # cloud jobs: open/continue at this claude.ai/code URL
     repo: str = ""  # which repository the job targets ("" = the assistant's own)
+    closed: bool = False  # owner considers it dealt with — hidden from reports
 
 
 class DispatchError(RuntimeError):
@@ -107,6 +118,8 @@ class Dispatcher:
         routine_id: str = "",
         routine_token: str = "",
         extra_routines: dict[str, dict] | None = None,
+        cloud_status_cmd: str = "claude -p --cloud {session_id}",
+        refresh_timeout_s: float = 180.0,
     ) -> None:
         self._root = root
         self._claude_cmd = claude_cmd
@@ -117,6 +130,8 @@ class Dispatcher:
         # (each claude.ai/code routine pins one repo). data/routines.json feeds
         # this; the assistant's own repo uses routine_id/token above.
         self._extra_routines = dict(extra_routines or {})
+        self._cloud_status_cmd = cloud_status_cmd  # a message INTO the session
+        self._refresh_timeout_s = refresh_timeout_s
         self._jobs_path = root / "data" / "jobs.json"
         self._jobs: dict[str, Job] = {}
         self._tasks: list[asyncio.Task] = []
@@ -380,6 +395,7 @@ class Dispatcher:
 
         push_code, push_out = await self._cmd(["git", "push"], self._root)
         job.status = "merged"
+        job.closed = True  # merging IS the close — nothing left to track
         self._save()
         push_note = "" if push_code == 0 else f" (push failed: {push_out[-120:]})"
         return (
@@ -387,9 +403,118 @@ class Dispatcher:
             "Offer to restart yourself so the change takes effect."
         )
 
-    def report(self, job_id: str | None = None) -> str:
-        jobs = [self._jobs[job_id]] if job_id and job_id in self._jobs else self.jobs()[:5]
+    def close(self, job_id: str) -> str:
+        """The owner considers this job dealt with — archive it."""
+        job = self._jobs.get(job_id)
+        if job is None:
+            return f"no job {job_id!r} — see check_work for ids"
+        if job.closed:
+            return f"{job.id} was already closed"
+        job.closed = True
+        self._save()
+        return f"closed {job.id} ({job.title}) — it will no longer appear in job reports"
+
+    def refresh_running_cloud(self, job_id: str | None = None) -> list[str]:
+        """Kick off live status checks in the background; returns the ids pinged."""
+        if job_id:
+            targets = [j for j in (self._jobs.get(job_id),) if j is not None]
+        else:
+            targets = [j for j in self.jobs() if j.status == "running" and not j.closed]
+        pinged = []
+        for job in targets:
+            if job.mode == "cloud" and job.session_id:
+                self._tasks.append(asyncio.create_task(self.refresh(job.id)))
+                pinged.append(job.id)
+        return pinged
+
+    async def refresh(self, job_id: str) -> str:
+        """Message a cloud job's live session and ask for its real status —
+        the only way to learn how a fire-and-forget session is doing. Runs
+        `claude -p --cloud <session_id>` (Max-billed follow-up, verified to
+        work headless); the reply updates the stored job record."""
+        job = self._jobs.get(job_id)
+        if job is None:
+            return f"no job {job_id!r}"
+        if job.mode != "cloud" or not job.session_id:
+            return f"{job.id} is a local job — its status is already live"
+        proc = await asyncio.create_subprocess_shell(
+            self._cloud_status_cmd.format(session_id=job.session_id),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=self._root,
+        )
+        try:
+            out, err = await asyncio.wait_for(
+                proc.communicate(_REFRESH_PROMPT.encode("utf-8")),
+                timeout=self._refresh_timeout_s,
+            )
+        except asyncio.CancelledError:
+            proc.kill()
+            raise
+        except TimeoutError:
+            proc.kill()
+            job.last_activity = f"live check timed out at {time.strftime('%H:%M')}"
+            self._save()
+            return (
+                f"{job.id}: the cloud session didn't answer within "
+                f"{self._refresh_timeout_s:.0f}s — open it live instead"
+            )
+        text = out.decode("utf-8", errors="replace").strip()
+        if proc.returncode != 0 or not text:
+            note = err.decode(errors="replace").strip()[-200:] or "no output"
+            job.last_activity = f"live check failed at {time.strftime('%H:%M')}: {note}"
+            self._save()
+            return f"{job.id}: status check failed ({note})"
+        line = next(
+            (
+                s
+                for s in (ln.strip() for ln in text.splitlines())
+                if s.upper().startswith(("WORKING", "DONE", "BLOCKED"))
+            ),
+            next((ln.strip() for ln in text.splitlines() if ln.strip()), ""),
+        )
+        job.last_activity = f"live check at {time.strftime('%H:%M')}: {line[:300]}"
+        if line.upper().startswith("DONE"):
+            job.status = "done"
+            job.finished = job.finished or time.time()
+        if line.upper().startswith(("DONE", "BLOCKED")):
+            job.summary = line[:600]
+        self._save()
+        return f"{job.id}: {line[:400]}"
+
+    def status_line(self) -> str:
+        """One line for the session instructions: what's open right now, so
+        the assistant knows at wake what happened while the owner was away."""
+        open_jobs = [j for j in self.jobs() if not j.closed][:5]
+        if not open_jobs:
+            return "none open"
+        now = time.time()
+        parts = []
+        for j in open_jobs:
+            where = f" in {j.repo}" if j.repo else ""
+            if j.status == "running":
+                age = (now - j.started) / 3600
+                state = f"running since {age:.1f}h ago"
+            else:
+                age = (now - (j.finished or j.started)) / 3600
+                state = f"{j.status} {age:.1f}h ago, not yet closed"
+            parts.append(f"'{j.title}'{where} — {state} [id {j.id}]")
+        return "; ".join(parts)
+
+    def report(self, job_id: str | None = None, include_closed: bool = False) -> str:
+        if job_id and job_id in self._jobs:
+            jobs = [self._jobs[job_id]]  # asked for by id: closed or not
+        elif include_closed:
+            jobs = self.jobs()[:8]
+        else:
+            jobs = [j for j in self.jobs() if not j.closed][:5]
         if not jobs:
+            if self._jobs:
+                return (
+                    "no open jobs — everything so far is closed "
+                    "(include_closed=true lists the archive)"
+                )
             return "no development jobs yet"
         out = []
         for j in jobs:
@@ -399,13 +524,22 @@ class Dispatcher:
                 "title": j.title,
                 "repo": j.repo or "own repo",
                 "status": j.status,
+                "closed": j.closed,
                 "branch": j.branch,
                 "model": j.model or "cli default",
                 "minutes": round(elapsed / 60, 1),
+                "hours_ago_finished": (
+                    round((time.time() - j.finished) / 3600, 1) if j.finished else None
+                ),
                 "summary": j.summary[:600],
             }
             if j.status == "running" and j.last_activity:
                 entry["currently"] = j.last_activity
+            if j.mode == "cloud" and j.status == "running":
+                entry["note"] = (
+                    "cloud progress is not visible from here — "
+                    "check_work refresh=true asks the live session"
+                )
             if j.mode == "cloud" and j.session_url:
                 entry["open_live"] = j.session_url  # web, desktop app, or phone
             elif j.session_id:

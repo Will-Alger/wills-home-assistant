@@ -23,6 +23,37 @@ def test_tools_convert_to_realtime_shape() -> None:
         assert "input_schema" not in tool  # anthropic name must not leak
 
 
+async def test_session_config_renders_jobs_and_repos(tmp_path) -> None:
+    """The instructions template must format cleanly with a dispatcher wired
+    in — a stray placeholder here would break every wake."""
+    from assistant.dispatch import Dispatcher
+    from assistant.engines.realtime_engine import RealtimeEngine
+    from assistant.home.fake import FakeHome
+
+    dispatcher = Dispatcher(
+        tmp_path,
+        routine_id="trig_x",
+        routine_token="tok_x",
+        extra_routines={"side-project": {"routine_id": "trig_s", "token": "tok_s"}},
+    )
+    engine = RealtimeEngine(
+        api_key="test-key",
+        model="m",
+        voice="v",
+        home=FakeHome(),
+        owner="Will",
+        name="Alexa",
+        wake_phrase="alexa",
+        dispatcher=dispatcher,
+    )
+    config = await engine._session_config(None)
+    text = config["instructions"]
+    assert "Open jobs right now: none open" in text
+    assert "side-project" in text  # she knows which other repos she can work on
+    tool_names = {t["name"] for t in config["tools"]}
+    assert {"develop_feature", "check_work", "close_work", "merge_work"} <= tool_names
+
+
 def test_downsample_produces_wake_sized_frames() -> None:
     frame_24k = np.zeros(FRAME_SAMPLES_24K, dtype=np.int16).tobytes()
     out = downsample_24k_to_16k(frame_24k)
