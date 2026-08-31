@@ -13,6 +13,9 @@ data/
 # Always-on service logs
 logs/
 
+# Sandboxed worktrees for self-commissioned development jobs
+.worktrees/
+
 # Python
 .venv/
 __pycache__/
