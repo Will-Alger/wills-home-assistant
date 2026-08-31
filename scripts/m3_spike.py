@@ -39,6 +39,9 @@ def list_devices() -> int:
 
 
 async def monitor(minutes: float) -> int:
+    import numpy as np
+
+    from assistant.audio.mic import describe_device
     from assistant.wake.detector import WakeDetector
 
     settings = load_settings()
@@ -47,18 +50,23 @@ async def monitor(minutes: float) -> int:
     detections = 0
     started = time.monotonic()
     second_max = 0.0
+    peak_level = 0.0
     last_tick = started
 
+    console.print(f"[bold]Mic:[/bold] {describe_device(settings.audio_input_device)}")
     console.print(
         f"[green]Monitoring[/green] for {minutes:g} min (threshold "
-        f"{settings.wake_threshold}). Ctrl+C to stop early.\n"
+        f"{settings.wake_threshold}). Talk or snap your fingers — the level "
+        "readout should jump. Ctrl+C to stop early.\n"
     )
-    try:
+    try:  # Ctrl+C arrives as CancelledError inside asyncio.run on Windows
         async with Microphone(settings.audio_input_device) as mic:
             while time.monotonic() - started < minutes * 60:
                 frame = await mic.get_frame()
                 score = detector.score(frame)
                 second_max = max(second_max, score)
+                level = float(np.abs(np.frombuffer(frame, np.int16)).max()) / 32768
+                peak_level = max(peak_level, level)
                 now = time.monotonic()
                 if score >= settings.wake_threshold:
                     detections += 1
@@ -71,11 +79,13 @@ async def monitor(minutes: float) -> int:
                     elapsed = (now - started) / 60
                     console.print(
                         f"[dim]{elapsed:.1f} min · {detections} detection(s) · "
-                        f"loudest score last 30s: {second_max:.2f}[/dim]"
+                        f"top score last 30s: {second_max:.2f} · "
+                        f"peak mic level: {peak_level:.0%}[/dim]"
                     )
                     second_max = 0.0
+                    peak_level = 0.0
                     last_tick = now
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     elapsed_min = (time.monotonic() - started) / 60
     per_hour = detections / elapsed_min * 60 if elapsed_min else 0.0
@@ -114,11 +124,14 @@ def main() -> int:
     group.add_argument("--monitor", type=float, metavar="MINUTES")
     group.add_argument("--record", nargs=2, metavar=("PATH", "SECONDS"))
     args = parser.parse_args()
-    if args.devices:
-        return list_devices()
-    if args.monitor is not None:
-        return asyncio.run(monitor(args.monitor))
-    return asyncio.run(record(args.record[0], float(args.record[1])))
+    try:
+        if args.devices:
+            return list_devices()
+        if args.monitor is not None:
+            return asyncio.run(monitor(args.monitor))
+        return asyncio.run(record(args.record[0], float(args.record[1])))
+    except KeyboardInterrupt:
+        return 130  # quiet exit; stats were already printed by monitor()
 
 
 if __name__ == "__main__":

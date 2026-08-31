@@ -28,6 +28,10 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # Who the assistant primarily serves (used in its instructions). Anyone
+    # can talk to it — this just names the household owner.
+    owner_name: str = "Will"
+
     # Milestone 1: Home Assistant
     ha_url: str = "http://localhost:8123"
     ha_token: str = ""

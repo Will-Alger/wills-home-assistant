@@ -59,7 +59,7 @@ async def run(fake: bool) -> int:
         workspace_id=settings.anthropic_workspace_id or None,
     )
     meter = Meter(log_path=Path(__file__).resolve().parents[1] / ".usage.jsonl")
-    agent = Agent(home, llm, meter)
+    agent = Agent(home, llm, meter, owner=settings.owner_name)
     await agent.start_session()
 
     mode = "fake apartment" if fake else settings.ha_url
@@ -119,7 +119,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fake", action="store_true", help="use the in-memory fake apartment")
     args = parser.parse_args()
-    return asyncio.run(run(fake=args.fake))
+    try:
+        return asyncio.run(run(fake=args.fake))
+    except KeyboardInterrupt:
+        return 130
 
 
 if __name__ == "__main__":

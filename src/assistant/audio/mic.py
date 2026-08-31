@@ -21,6 +21,17 @@ def resolve_device(spec: str) -> int | str | None:
     return spec
 
 
+def describe_device(spec: str) -> str:
+    """Human name of the input device this spec resolves to."""
+    try:
+        resolved = resolve_device(spec)
+        if resolved is None:
+            return str(sd.query_devices(kind="input")["name"])
+        return str(sd.query_devices(resolved)["name"])
+    except Exception:  # noqa: BLE001 — a label, never worth crashing over
+        return spec or "default"
+
+
 class Microphone:
     """Continuous capture; frames buffer in an asyncio queue (drops when full)."""
 

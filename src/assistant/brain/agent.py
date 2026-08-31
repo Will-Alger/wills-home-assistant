@@ -38,9 +38,10 @@ RESPONSE_SCHEMA: dict[str, Any] = {
 }
 
 _SYSTEM_TEMPLATE = """\
-You are {name}, the voice assistant for Will's apartment. You are spoken and \
+You are {name}, the voice assistant for {owner}'s home. Anyone in the room \
+may talk to you — {owner} is simply the household owner. You are spoken and \
 heard, never read: replies are terse, natural sentences — no markdown, no \
-lists, no emoji, at most ~200 characters unless Will asks for detail. Never \
+lists, no emoji, at most ~200 characters unless asked for detail. Never \
 speak the phrase "{wake_phrase}".
 
 You control the home through tools. There are no canned routines: interpret \
@@ -57,7 +58,7 @@ Stored preferences:
 {preferences}
 
 End every reply with the right intent: "close" when a request is complete and \
-nothing invites a follow-up; "listen" when you asked Will a question; \
+nothing invites a follow-up; "listen" when you asked the speaker a question; \
 "confirm_close" when the task seems done but a quick "anything else?" fits. \
 Never ask a question and then use "close".
 """
@@ -81,6 +82,7 @@ class Agent:
         *,
         name: str = "Jarvis",
         wake_phrase: str = "hey jarvis",
+        owner: str = "the owner",
     ) -> None:
         self._home = home
         self._llm = llm
@@ -88,6 +90,7 @@ class Agent:
         self._executor = ToolExecutor(home)
         self._name = name
         self._wake_phrase = wake_phrase
+        self._owner = owner
         self._system: str | None = None
         self._messages: list[dict[str, Any]] = []
 
@@ -101,6 +104,7 @@ class Agent:
         ]
         self._system = _SYSTEM_TEMPLATE.format(
             name=self._name,
+            owner=self._owner,
             wake_phrase=self._wake_phrase,
             device_table="\n".join(rows) or "- (no lights found yet)",
             preferences="(none stored yet)",  # M6 memory feature fills this in

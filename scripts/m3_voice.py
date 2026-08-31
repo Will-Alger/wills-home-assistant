@@ -79,6 +79,7 @@ async def run(fake: bool) -> int:
             workspace_id=settings.anthropic_workspace_id or None,
         ),
         meter,
+        owner=settings.owner_name,
     )
     await agent.start_session()
 
@@ -86,14 +87,17 @@ async def run(fake: bool) -> int:
     wake = WakeDetector(settings.wake_model, threshold=settings.wake_threshold)
     stt = DeepgramFlux(settings.deepgram_api_key)
 
+    from assistant.audio.mic import describe_device
+
     mode = "fake apartment" if fake else settings.ha_url
     console.print(
         f"[bold]Ears online.[/bold] Wake phrase: “{settings.wake_model.replace('_', ' ')}” · "
-        f"home: {mode} · Ctrl+C quits."
+        f"mic: {describe_device(settings.audio_input_device)} · home: {mode} · Ctrl+C quits."
     )
     async with Microphone(settings.audio_input_device) as mic:
         loop = VoiceLoop(mic, wake, stt, agent, ConsoleUi(meter))
-        with contextlib.suppress(KeyboardInterrupt):
+        # Ctrl+C arrives as CancelledError inside asyncio.run on Windows
+        with contextlib.suppress(KeyboardInterrupt, asyncio.CancelledError):
             await loop.run()
     if not fake:
         with contextlib.suppress(Exception):
@@ -108,7 +112,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fake", action="store_true", help="use the in-memory fake apartment")
     args = parser.parse_args()
-    return asyncio.run(run(fake=args.fake))
+    try:
+        return asyncio.run(run(fake=args.fake))
+    except KeyboardInterrupt:
+        return 130
 
 
 if __name__ == "__main__":

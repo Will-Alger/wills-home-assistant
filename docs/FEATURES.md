@@ -115,6 +115,12 @@ Added after the 2026-08-30 adversarial review:
   cue; set retention opt-outs at Deepgram/ElevenLabs; long-term memory stores
   owner-directed facts only (guests' chatter is not data); cloned voice is
   Will's own or has written consent.
+- **Multi-user by default (Will, 2026-08-31)**: anyone in the room can use
+  the assistant — the wake word is speaker-independent and nothing gates on
+  identity. Voice ID (M7) only *personalizes* (whose Spotify/calendar/
+  preferences); unknown voices get default behavior, and per-person
+  preference profiles become possible on top of it. Owner name is config
+  (`OWNER_NAME`), not hardcoded, so the repo works for any household.
 - **"Proved itself" gate for hardware purchases**: the M4 loop used daily for
   a month plus one working media feature. M7+ is speculative until then.
   Once the platform question is settled, stand up HA Assist for an afternoon
