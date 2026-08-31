@@ -7,6 +7,9 @@
 # Probe output from scripts/m4_realtime.py --text-probe
 reply.wav
 
+# Personal long-term memory store (preferences, remembered facts)
+data/
+
 # Python
 .venv/
 __pycache__/

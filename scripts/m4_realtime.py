@@ -32,6 +32,7 @@ from assistant.engines.realtime_engine import (
 )
 from assistant.home import HomeAssistantClient
 from assistant.home.fake import FakeHome
+from assistant.memory import MemoryStore
 from assistant.wake.detector import WakeDetector
 
 console = Console()
@@ -83,6 +84,7 @@ def build_engine(fake: bool):
         talk_over=settings.realtime_talk_over,
         eagerness=settings.realtime_eagerness,
         extra_instructions=settings.assistant_extra_instructions,
+        memory=MemoryStore(Path(__file__).resolve().parents[1] / "data" / "memory.json"),
         usage_log=Path(__file__).resolve().parents[1] / ".usage.jsonl",
     )
     return settings, home, engine

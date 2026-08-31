@@ -31,6 +31,7 @@ from scipy.signal import resample_poly
 
 from assistant.brain.tools import TOOL_DEFINITIONS, ToolExecutor
 from assistant.home.base import HomeApi, device_table
+from assistant.memory import MemoryStore
 
 REALTIME_RATE = 24_000
 FRAME_SAMPLES_24K = 1920  # 80 ms
@@ -59,6 +60,17 @@ yet), say so honestly.
 Devices:
 {devices}
 
+Standing preferences ({owner}'s, apply them automatically, no announcement):
+{preferences}
+
+Memory: when the speaker states a durable preference ("from now on…", \
+"I always want…", "call me…"), store it with remember(kind="preference"). \
+Things they ask you to keep for later go in remember(kind="fact"); answer \
+"what do you remember?" via list_memories, and delete with forget after \
+checking ids. Store only what the speaker deliberately tells you — never \
+ambient chatter. You cannot yet react to events ("when the sun sets…") — \
+only to what is said to you; say so honestly if asked.
+
 Ending: when the interaction is clearly over — the speaker used a wrap-up \
 phrase ("that's all", "thanks, that's it", "never mind"), or a one-shot \
 command finished and invites nothing more — say a brief closing word, then \
@@ -66,6 +78,43 @@ call end_conversation. During a flowing conversation, never call \
 end_conversation: only the speaker ends a live conversation. Never say the \
 phrase "{wake_phrase}".
 {extra}"""
+
+MEMORY_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "remember",
+        "description": (
+            "Store a lasting memory. kind='preference' for standing "
+            "instructions applied automatically in every future conversation; "
+            "kind='fact' for things to recall later on request."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["preference", "fact"]},
+                "text": {"type": "string", "description": "one self-contained sentence"},
+            },
+            "required": ["kind", "text"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "list_memories",
+        "description": "List all stored preferences and facts with their ids.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "forget",
+        "description": "Delete one stored memory by id (see list_memories first).",
+        "parameters": {
+            "type": "object",
+            "properties": {"id": {"type": "integer"}},
+            "required": ["id"],
+        },
+    },
+]
+_MEMORY_TOOL_NAMES = {tool["name"] for tool in MEMORY_TOOLS}
 
 _END_TOOL = {
     "type": "function",
@@ -141,6 +190,7 @@ class RealtimeEngine:
         talk_over: bool = False,
         eagerness: str = "high",
         extra_instructions: str = "",
+        memory: MemoryStore | None = None,
         usage_log: Path | None = None,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
@@ -156,6 +206,9 @@ class RealtimeEngine:
         self._talk_over = talk_over  # headphones only: mic streams during playback
         self._eagerness = eagerness  # semantic VAD: how fast it decides you're done
         self._extra_instructions = extra_instructions
+        self._memory = memory
+        self._instructions_stale = False  # a preference changed mid-session
+        self._transcription_model: str | None = None  # what _configure settled on
         self._usage_log = usage_log
 
     async def _session_config(self, transcription_model: str | None) -> dict[str, Any]:
@@ -165,6 +218,9 @@ class RealtimeEngine:
             owner=self._owner,
             wake_phrase=self._wake_phrase,
             devices=device_table(await self._home.get_lights()),
+            preferences=(
+                self._memory.preferences_text() if self._memory else "(memory not enabled)"
+            ),
             extra=extra,
         )
         audio_in: dict[str, Any] = {
@@ -173,10 +229,11 @@ class RealtimeEngine:
         }
         if transcription_model:
             audio_in["transcription"] = {"model": transcription_model}
+        tools = realtime_tools() + (MEMORY_TOOLS if self._memory else [])
         return {
             "type": "realtime",
             "instructions": instructions,
-            "tools": realtime_tools(),
+            "tools": tools,
             "tool_choice": "auto",
             "output_modalities": ["audio"],
             "audio": {
@@ -208,6 +265,7 @@ class RealtimeEngine:
                 event = await connection.recv()
                 kind = event.type
                 if kind == "session.updated":
+                    self._transcription_model = transcribers[0]
                     return
                 if kind == "error":
                     message = str(getattr(event, "error", event)).lower()
@@ -249,7 +307,10 @@ class RealtimeEngine:
                 args = json.loads(item.arguments or "{}")
             except json.JSONDecodeError:
                 args = {}
-            result_text, is_error = await self._executor.execute(call_name, args)
+            if call_name in _MEMORY_TOOL_NAMES:
+                result_text, is_error = self._execute_memory(call_name, args)
+            else:
+                result_text, is_error = await self._executor.execute(call_name, args)
             outputs.append(
                 {
                     "type": "conversation.item.create",
@@ -262,9 +323,48 @@ class RealtimeEngine:
             )
         for message in outputs:
             await connection.send(message)
+        if self._instructions_stale:
+            # A preference changed: refresh instructions so it applies to the
+            # rest of THIS conversation, not just future ones.
+            self._instructions_stale = False
+            await connection.send(
+                {
+                    "type": "session.update",
+                    "session": await self._session_config(self._transcription_model),
+                }
+            )
         if outputs and not closing:
             await connection.send({"type": "response.create"})
         return closing
+
+    def _execute_memory(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
+        if self._memory is None:
+            return "memory is not enabled", True
+        try:
+            if name == "remember":
+                item = self._memory.add(str(args.get("kind", "")), str(args.get("text", "")))
+                if item.kind == "preference":
+                    self._instructions_stale = True
+                return f"stored (id {item.id})", False
+            if name == "list_memories":
+                items = self._memory.items()
+                if not items:
+                    return "nothing stored yet", False
+                return json.dumps(
+                    [
+                        {"id": i.id, "kind": i.kind, "text": i.text, "since": i.created}
+                        for i in items
+                    ]
+                ), False
+            if name == "forget":
+                item_id = int(args.get("id", -1))
+                if self._memory.forget(item_id):
+                    self._instructions_stale = True
+                    return f"forgot id {item_id}", False
+                return f"no memory with id {item_id}", True
+            return f"unknown memory tool {name}", True
+        except (ValueError, TypeError) as err:
+            return f"memory error: {err}", True
 
     def _log_usage(self, cost: float, usage: Any) -> None:
         if self._usage_log is None:
