@@ -418,8 +418,10 @@ class RealtimeEngine:
             if call_name == "restart_self":
                 self.restart_requested = True
                 result_text, is_error = (
-                    "restart armed — say a brief goodbye and end the conversation; "
-                    "you'll be back in about fifteen seconds",
+                    (
+                        "restart armed — say a brief goodbye and end the conversation; "
+                        "you'll be back in about fifteen seconds"
+                    ),
                     False,
                 )
             elif call_name in _MEMORY_TOOL_NAMES:
