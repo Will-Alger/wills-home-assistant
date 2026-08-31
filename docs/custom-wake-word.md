@@ -1,4 +1,4 @@
-# Training the "Hey Gary" wake word
+# Training a custom wake word ("hey alexa", "hey gary", …)
 
 openWakeWord only ships a few pretrained phrases, so a custom wake word means
 training a tiny model. The project provides an automatic Colab notebook that

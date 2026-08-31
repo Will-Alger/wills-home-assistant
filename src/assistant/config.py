@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     owner_name: str = "Will"
     # The assistant's persona name (what it calls itself).
     assistant_name: str = "Alexa"
+    # Free-text style/preference lines appended to the assistant's
+    # instructions — your personal tuning knob ("Be extremely brief." etc.).
+    assistant_extra_instructions: str = ""
 
     # Milestone 1: Home Assistant
     ha_url: str = "http://localhost:8123"
@@ -68,7 +71,10 @@ class Settings(BaseSettings):
     # "sol" is Will's pick; it's org-gated today, so the engine automatically
     # falls back to marin until OpenAI unlocks it — then this just works.
     realtime_voice: str = "sol"
-    realtime_idle_timeout_s: float = 20.0  # silent session auto-closes (it bills/min)
+    # A silent open session auto-closes after this and returns to wake-word
+    # idle (open sessions bill by the minute). Raise it if conversations feel
+    # cut short during quiet moments.
+    realtime_idle_timeout_s: float = 45.0
     # How fast semantic VAD decides you're done talking: low|medium|high|auto.
     # high = snappy replies; drop toward auto/low if it cuts off your pauses.
     realtime_eagerness: str = "high"

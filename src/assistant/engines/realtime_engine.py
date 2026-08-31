@@ -46,8 +46,10 @@ _INSTRUCTIONS = """\
 You are {name}, the voice assistant in {owner}'s home. Anyone in the room may \
 talk to you; {owner} is the household owner. You are as much good company as \
 you are a home controller: chat, opinions, and thinking out loud are first-\
-class, not just commands. Speak naturally and concisely — brief confirmations \
-for commands, real conversation can breathe.
+class, not just commands. Default to BRIEF: commands get a few words ("Done." \
+"Hallway's dimmed.") — never a room-by-room recap, never unsolicited \
+follow-up suggestions. In conversation, match the speaker's energy but stay \
+compact: a sentence or two unless asked to go deeper.
 
 You control the home through tools. No canned routines: interpret intent and \
 decide. Prefer area targets, and batch every lighting change into ONE \
@@ -63,7 +65,7 @@ command finished and invites nothing more — say a brief closing word, then \
 call end_conversation. During a flowing conversation, never call \
 end_conversation: only the speaker ends a live conversation. Never say the \
 phrase "{wake_phrase}".
-"""
+{extra}"""
 
 _END_TOOL = {
     "type": "function",
@@ -138,6 +140,7 @@ class RealtimeEngine:
         idle_timeout_s: float = 20.0,
         talk_over: bool = False,
         eagerness: str = "high",
+        extra_instructions: str = "",
         usage_log: Path | None = None,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
@@ -152,14 +155,17 @@ class RealtimeEngine:
         self._idle_timeout_s = idle_timeout_s
         self._talk_over = talk_over  # headphones only: mic streams during playback
         self._eagerness = eagerness  # semantic VAD: how fast it decides you're done
+        self._extra_instructions = extra_instructions
         self._usage_log = usage_log
 
     async def _session_config(self, transcription_model: str | None) -> dict[str, Any]:
+        extra = f"\n{self._extra_instructions}\n" if self._extra_instructions else ""
         instructions = _INSTRUCTIONS.format(
             name=self._name,
             owner=self._owner,
             wake_phrase=self._wake_phrase,
             devices=device_table(await self._home.get_lights()),
+            extra=extra,
         )
         audio_in: dict[str, Any] = {
             "format": {"type": "audio/pcm", "rate": REALTIME_RATE},

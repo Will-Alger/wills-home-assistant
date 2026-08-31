@@ -82,6 +82,7 @@ def build_engine(fake: bool):
         idle_timeout_s=settings.realtime_idle_timeout_s,
         talk_over=settings.realtime_talk_over,
         eagerness=settings.realtime_eagerness,
+        extra_instructions=settings.assistant_extra_instructions,
         usage_log=Path(__file__).resolve().parents[1] / ".usage.jsonl",
     )
     return settings, home, engine
@@ -129,44 +130,56 @@ async def voice(fake: bool) -> int:
     )
     with contextlib.suppress(KeyboardInterrupt, asyncio.CancelledError):
         while True:
-            # IDLE: wake-gate on a 16 kHz mic (local, free, private)
-            async with Microphone(settings.audio_input_device) as mic16:
-                console.print("[dim]○ idle — say the wake phrase[/dim]")
-                while True:
-                    if wake.detect(await mic16.get_frame()):
-                        break
-            tones.play("wake")
-            # Session: 24 kHz mic + speaker, wake detector kept for barge-in
-            session_wake.reset()
-            async with (
-                Microphone(
-                    settings.audio_input_device,
-                    samplerate=REALTIME_RATE,
-                    frame_samples=FRAME_SAMPLES_24K,
-                ) as mic24,
-                Speaker(REALTIME_RATE) as speaker,
-            ):
-                console.print("[green]● connected — talk[/green]")
-                try:
-                    stats = await engine.run_conversation(
-                        mic24, speaker, session_wake, ConsoleUi(settings.assistant_name)
-                    )
-                except Exception as err:  # noqa: BLE001 — session dies, loop survives
-                    tones.play("error")
-                    console.print(f"[red]session error: {err}[/red]")
-                    continue
-            total_cost += stats.cost_usd
-            if engine.voice_note:
-                console.print(f"[yellow]{engine.voice_note}[/yellow]")
-                engine.voice_note = None
-            tones.play("close")
-            console.print(
-                f"[dim]conversation over ({stats.ended_by}) · {stats.responses} replies · "
-                f"tools: {stats.tool_calls or 'none'} · ${stats.cost_usd:.4f} "
-                f"(${total_cost:.4f} session)[/dim]"
-            )
+            try:
+                total_cost = await one_cycle(settings, engine, wake, session_wake, total_cost)
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                raise
+            except Exception as err:  # noqa: BLE001 — the app must never die on its own
+                tones.play("error")
+                console.print(f"[red]recovered from: {err!r} — back to idle[/red]")
     console.print(f"\n[dim]total: ${total_cost:.4f}[/dim]")
     return 0
+
+
+async def one_cycle(settings, engine, wake, session_wake, total_cost: float) -> float:
+    """One idle→wake→conversation cycle; returns the updated running cost."""
+    await asyncio.sleep(0.2)  # let PortAudio settle between 24k/16k stream switches
+    # IDLE: wake-gate on a 16 kHz mic (local, free, private)
+    async with Microphone(settings.audio_input_device) as mic16:
+        console.print("[dim]○ idle — say the wake phrase[/dim]")
+        while True:
+            if wake.detect(await mic16.get_frame()):
+                break
+    tones.play("wake")
+    # Session: 24 kHz mic + speaker, wake detector kept for barge-in
+    session_wake.reset()
+    async with (
+        Microphone(
+            settings.audio_input_device,
+            samplerate=REALTIME_RATE,
+            frame_samples=FRAME_SAMPLES_24K,
+        ) as mic24,
+        Speaker(REALTIME_RATE) as speaker,
+    ):
+        console.print("[green]● connected — talk[/green]")
+        stats = await engine.run_conversation(
+            mic24, speaker, session_wake, ConsoleUi(settings.assistant_name)
+        )
+    total_cost += stats.cost_usd
+    if engine.voice_note:
+        console.print(f"[yellow]{engine.voice_note}[/yellow]")
+        engine.voice_note = None
+    tones.play("close")
+    reason = {
+        "idle timeout": "quiet too long — closed to stop the meter; say the wake word anytime",
+        "end_conversation": "she wrapped up",
+    }.get(stats.ended_by, stats.ended_by)
+    console.print(
+        f"[bold]conversation closed[/bold] ({reason}) · {stats.responses} replies · "
+        f"tools: {stats.tool_calls or 'none'} · ${stats.cost_usd:.4f} "
+        f"(${total_cost:.4f} session)"
+    )
+    return total_cost
 
 
 def main() -> int:
