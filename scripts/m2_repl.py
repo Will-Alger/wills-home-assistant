@@ -59,7 +59,14 @@ async def run(fake: bool) -> int:
         workspace_id=settings.anthropic_workspace_id or None,
     )
     meter = Meter(log_path=Path(__file__).resolve().parents[1] / ".usage.jsonl")
-    agent = Agent(home, llm, meter, owner=settings.owner_name)
+    agent = Agent(
+        home,
+        llm,
+        meter,
+        owner=settings.owner_name,
+        name=settings.assistant_name,
+        wake_phrase=settings.wake_phrase,
+    )
     await agent.start_session()
 
     mode = "fake apartment" if fake else settings.ha_url
@@ -102,7 +109,7 @@ async def run(fake: bool) -> int:
             console.print("[red]Network error talking to the Anthropic API.[/red]")
             continue
 
-        console.print(f"[bold cyan]{settings.llm_model.split('-')[1]}>[/bold cyan] {reply.speech}")
+        console.print(f"[bold cyan]{settings.assistant_name.lower()}>[/bold cyan] {reply.speech}")
         console.print(
             f"[dim]intent: {reply.intent} ({INTENT_HINTS.get(reply.intent, '?')}) · "
             f"{meter.command_line()}[/dim]\n"

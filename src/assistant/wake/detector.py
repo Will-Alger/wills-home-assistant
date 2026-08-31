@@ -22,6 +22,14 @@ class WakeDetector:
         import openwakeword
         from openwakeword.model import Model
 
+        if model.endswith((".onnx", ".tflite")):
+            from pathlib import Path
+
+            if not Path(model).exists():
+                raise FileNotFoundError(
+                    f"Custom wake model not found: {model} — train one via "
+                    "docs/custom-wake-word.md and drop it there."
+                )
         try:
             self._model = Model(wakeword_models=[model], inference_framework="onnx")
         except Exception:  # noqa: BLE001 — whatever failed, a fresh model

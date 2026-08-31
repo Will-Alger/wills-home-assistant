@@ -38,6 +38,9 @@ console = Console()
 
 
 class ConsoleUi:
+    def __init__(self, name: str) -> None:
+        self._name = name.lower()
+
     def listening(self) -> None:
         console.print("[green]● listening[/green]")
 
@@ -50,7 +53,7 @@ class ConsoleUi:
 
     def assistant_said(self, transcript: str) -> None:
         if transcript.strip():
-            console.print(f"[bold cyan]jarvis>[/bold cyan] {transcript.strip()}")
+            console.print(f"[bold cyan]{self._name}>[/bold cyan] {transcript.strip()}")
 
     def interrupted(self) -> None:
         console.print("[yellow]— interrupted —[/yellow]")
@@ -71,6 +74,8 @@ def build_engine(fake: bool):
         voice=settings.realtime_voice,
         home=home,
         owner=settings.owner_name,
+        name=settings.assistant_name,
+        wake_phrase=settings.wake_phrase,
         idle_timeout_s=settings.realtime_idle_timeout_s,
         talk_over=settings.realtime_talk_over,
         usage_log=Path(__file__).resolve().parents[1] / ".usage.jsonl",
@@ -83,7 +88,10 @@ async def text_probe(fake: bool, text: str) -> int:
     console.print(f"[dim]probing {settings.realtime_model} · voice {settings.realtime_voice}[/dim]")
     transcript, audio, stats = await engine.text_probe(text)
     console.print(f"[bold]you (typed)>[/bold] {text}")
-    console.print(f"[bold cyan]jarvis>[/bold cyan] {transcript or '(no transcript)'}")
+    console.print(
+        f"[bold cyan]{settings.assistant_name.lower()}>[/bold cyan] "
+        f"{transcript or '(no transcript)'}"
+    )
     console.print(
         f"[dim]tools: {stats.tool_calls or 'none'} · {len(audio) / 2 / REALTIME_RATE:.1f}s "
         f"of speech · ${stats.cost_usd:.4f} · ended by: {stats.ended_by}[/dim]"
@@ -108,8 +116,9 @@ async def voice(fake: bool) -> int:
     session_wake = WakeDetector(settings.wake_model, threshold=settings.wake_threshold)
     total_cost = 0.0
     console.print(
-        f"[bold]Voice online.[/bold] “{settings.wake_model.replace('_', ' ')}” to talk · "
-        f"voice: {settings.realtime_voice} · mic: {describe_device(settings.audio_input_device)} · "
+        f"[bold]Voice online.[/bold] “{settings.wake_phrase}” to talk to "
+        f"{settings.assistant_name} · voice: {settings.realtime_voice} · "
+        f"mic: {describe_device(settings.audio_input_device)} · "
         f"home: {'fake apartment' if fake else settings.ha_url} · Ctrl+C quits."
     )
     with contextlib.suppress(KeyboardInterrupt, asyncio.CancelledError):
@@ -133,7 +142,9 @@ async def voice(fake: bool) -> int:
             ):
                 console.print("[green]● connected — talk[/green]")
                 try:
-                    stats = await engine.run_conversation(mic24, speaker, session_wake, ConsoleUi())
+                    stats = await engine.run_conversation(
+                        mic24, speaker, session_wake, ConsoleUi(settings.assistant_name)
+                    )
                 except Exception as err:  # noqa: BLE001 — session dies, loop survives
                     tones.play("error")
                     console.print(f"[red]session error: {err}[/red]")

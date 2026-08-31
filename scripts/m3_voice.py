@@ -31,8 +31,9 @@ console = Console()
 
 
 class ConsoleUi:
-    def __init__(self, meter: Meter) -> None:
+    def __init__(self, meter: Meter, name: str) -> None:
         self._meter = meter
+        self._name = name.lower()
 
     def wake(self) -> None:
         tones.play("wake")
@@ -45,7 +46,7 @@ class ConsoleUi:
         console.print(f"[bold]you>[/bold] {transcript}")
 
     def reply(self, reply: AgentReply) -> None:
-        console.print(f"[bold cyan]jarvis>[/bold cyan] {reply.speech}")
+        console.print(f"[bold cyan]{self._name}>[/bold cyan] {reply.speech}")
         console.print(f"[dim]intent: {reply.intent} · {self._meter.command_line()}[/dim]")
 
     def follow_up(self, intent: str) -> None:
@@ -80,6 +81,8 @@ async def run(fake: bool) -> int:
         ),
         meter,
         owner=settings.owner_name,
+        name=settings.assistant_name,
+        wake_phrase=settings.wake_phrase,
     )
     await agent.start_session()
 
@@ -94,11 +97,11 @@ async def run(fake: bool) -> int:
 
     mode = "fake apartment" if fake else settings.ha_url
     console.print(
-        f"[bold]Ears online.[/bold] Wake phrase: “{settings.wake_model.replace('_', ' ')}” · "
+        f"[bold]Ears online.[/bold] Wake phrase: “{settings.wake_phrase}” · "
         f"mic: {describe_device(settings.audio_input_device)} · home: {mode} · Ctrl+C quits."
     )
     async with Microphone(settings.audio_input_device) as mic:
-        loop = VoiceLoop(mic, wake, stt, agent, ConsoleUi(meter))
+        loop = VoiceLoop(mic, wake, stt, agent, ConsoleUi(meter, settings.assistant_name))
         # Ctrl+C arrives as CancelledError inside asyncio.run on Windows
         with contextlib.suppress(KeyboardInterrupt, asyncio.CancelledError):
             await loop.run()

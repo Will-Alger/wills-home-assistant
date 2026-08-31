@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     # Who the assistant primarily serves (used in its instructions). Anyone
     # can talk to it — this just names the household owner.
     owner_name: str = "Will"
+    # The assistant's persona name (what it calls itself).
+    assistant_name: str = "Gary"
 
     # Milestone 1: Home Assistant
     ha_url: str = "http://localhost:8123"
@@ -49,7 +51,8 @@ class Settings(BaseSettings):
     llm_effort: str = "low"
 
     # Milestone 3: wake word + STT
-    # openWakeWord pretrained phrase (no API key needed); custom model later.
+    # A pretrained openWakeWord name ("hey_jarvis") OR a path to a custom
+    # trained model, e.g. models/hey_gary.onnx — see docs/custom-wake-word.md
     wake_model: str = "hey_jarvis"
     wake_threshold: float = 0.5  # raise if false wakes, lower if it misses you
     audio_input_device: str = ""  # "" = default mic; index or name substring
@@ -71,6 +74,14 @@ class Settings(BaseSettings):
     # Alternate engine: ElevenLabs streaming TTS pipeline (custom voice, parked)
     elevenlabs_api_key: str = ""
     elevenlabs_voice_id: str = ""
+
+    @property
+    def wake_phrase(self) -> str:
+        """Spoken form of the wake word, derived from the model name/path."""
+        stem = self.wake_model.replace("\\", "/").rsplit("/", 1)[-1]
+        for suffix in (".onnx", ".tflite"):
+            stem = stem.removesuffix(suffix)
+        return stem.replace("_", " ").removesuffix(" v0.1").strip()
 
     def require(self, *field_names: str) -> None:
         """Raise with a setup hint if any of the named settings are unset."""
