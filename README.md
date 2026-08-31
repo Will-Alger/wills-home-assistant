@@ -58,7 +58,7 @@ none of the pipeline.
 | - | ----------- | ------ |
 | 1 | **Lights, no voice** — HAOS in a Hyper-V VM, bulbs controlled from Python via REST | ⏳ testing |
 | 2 | **Brain, no audio** — text REPL → LLM with tools → HA ("get the room ready for a party", typed) | ⏳ testing |
-| 3 | **Ears** — mic layer, openWakeWord, streaming STT; wake → transcript | |
+| 3 | **Ears** — mic layer, openWakeWord, streaming STT; wake → transcript | ⏳ testing |
 | 4 | **Mouth** — ElevenLabs streaming TTS; full voice loop | |
 | 5 | **Music & media** — Spotify / Apple TV tools (likely via Music Assistant + AirPlay); stretch: YouTube search → play on Apple TV | |
 | 6 | **Tool belt** — web search (Anthropic server-side tool), Apple Calendar events (iCloud CalDAV), long-term memory (local store behind remember/recall tools) | |
@@ -144,6 +144,34 @@ the live evals with `$env:RUN_EVALS="1"; uv run pytest tests/test_evals.py`
 
 **Done when** party mode does something sensible to the fake apartment (and
 later the real one), and the meter numbers look sane to you.
+
+## Milestone 3 runbook: the ears
+
+1. **Deepgram key**: sign up at <https://console.deepgram.com> (~$200 free
+   credit, no card) → `DEEPGRAM_API_KEY` in `.env`.
+2. **Audio-reality spike first** (~30 min, the review's must-do):
+
+   ```powershell
+   uv run scripts/m3_spike.py --devices      # Blue Snowball should be default
+   uv run scripts/m3_spike.py --monitor 10   # quiet room: target ~0 detections
+   uv run scripts/m3_spike.py --monitor 10   # again with Spotify/TV playing
+   ```
+
+   Then say "hey jarvis" ~10× from normal talking distance and count misses.
+   Tune `WAKE_THRESHOLD` in `.env`: raise it for false wakes, lower for misses.
+3. **The full loop** (wake → speak → lights → text reply; the voice out is M4):
+
+   ```powershell
+   uv run scripts/m3_voice.py --fake     # fake apartment
+   uv run scripts/m3_voice.py            # real HA, after milestone 1
+   ```
+
+   Say "hey jarvis", wait for the rising beep, then talk. Intents drive the
+   mic: a question re-opens it (beep) without the wake phrase; silence or
+   "that's all" closes the conversation (falling beep).
+
+**Done when** the wake word fires reliably for you and rarely for the TV, and
+"hey jarvis, make the living room cozy" round-trips end to end.
 
 ## Layout
 

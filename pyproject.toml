@@ -6,9 +6,13 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=1.0",
+    "deepgram-sdk>=7",
     "httpx>=0.28",
+    "numpy>=2.5.2",
+    "openwakeword>=0.6",
     "pydantic-settings>=2.6",
     "rich>=13.9",
+    "sounddevice>=0.5.6",
 ]
 
 [dependency-groups]
@@ -20,6 +24,13 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+
+[tool.uv]
+# openwakeword 0.6 hard-depends on tflite-runtime for Linux, which ships no
+# Python 3.12 wheels and blocks resolution. We use its ONNX inference path
+# (the only one on Windows anyway), so exclude tflite everywhere via an
+# impossible marker. Revisit at the Pi milestone.
+override-dependencies = ["tflite-runtime; python_version < '3.0'"]
 
 [tool.uv.build-backend]
 module-name = "assistant"

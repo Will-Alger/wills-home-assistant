@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     # Milestone 3: wake word + STT
     # openWakeWord pretrained phrase (no API key needed); custom model later.
     wake_model: str = "hey_jarvis"
+    wake_threshold: float = 0.5  # raise if false wakes, lower if it misses you
+    audio_input_device: str = ""  # "" = default mic; index or name substring
     stt_provider: str = "deepgram"
     deepgram_api_key: str = ""
 
