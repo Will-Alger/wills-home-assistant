@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 
 from assistant.home.base import HomeApi, Light, LightCommand
+
+REPO_ROOT = Path(__file__).resolve().parents[3]  # the assistant's own codebase
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
@@ -164,6 +167,24 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "project_status",
+        "description": (
+            "Inspect your OWN codebase's recent development: current branch, "
+            "recent commits, uncommitted changes. Use when asked how your "
+            "development is going or what you recently learned to do."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "read_roadmap",
+        "description": (
+            "Read your own feature backlog (docs/FEATURES.md) — every planned, "
+            "in-progress, and shipped capability with status. Use to discuss "
+            "your roadmap, what you can't do yet, or what's coming."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "launch_app",
         "description": (
             "Open an app on the TV (see the TV's app list in your instructions), "
@@ -254,6 +275,11 @@ class ToolExecutor:
                     return f"service {domain}.{service} is not allowed from voice", True
                 await self._home.generic_call(domain, service, dict(tool_input.get("data") or {}))
                 return f"called {domain}.{service}", False
+            if name == "project_status":
+                return await self._project_status(), False
+            if name == "read_roadmap":
+                roadmap = (REPO_ROOT / "docs" / "FEATURES.md").read_text(encoding="utf-8")
+                return roadmap[:10_000], False
             if name == "launch_app":
                 player = await self._resolve_player(tool_input.get("player"), kind="tv")
                 await self._wake_tv_if_off()
@@ -289,6 +315,30 @@ class ToolExecutor:
                 )
         await self._home.apply(commands)
         return f"Done: {len(commands)} light(s) updated."
+
+    async def _project_status(self) -> str:
+        async def git(*args: str) -> str:
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                *args,
+                cwd=REPO_ROOT,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, _ = await proc.communicate()
+            return out.decode(errors="replace").strip()
+
+        return json.dumps(
+            {
+                "branch": await git("rev-parse", "--abbrev-ref", "HEAD"),
+                "recent_commits": (
+                    await git("log", "-10", "--pretty=format:%ad · %s", "--date=relative")
+                ).splitlines(),
+                "uncommitted_files": len(
+                    (await git("status", "--porcelain")).splitlines()
+                ),
+            }
+        )
 
     async def _wake_tv_if_off(self) -> bool:
         """Music rides through the Apple TV — wake it before playing/launching.

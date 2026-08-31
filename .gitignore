@@ -10,6 +10,9 @@ reply.wav
 # Personal long-term memory store (preferences, remembered facts)
 data/
 
+# Always-on service logs
+logs/
+
 # Python
 .venv/
 __pycache__/

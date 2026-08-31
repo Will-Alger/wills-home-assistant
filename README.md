@@ -73,6 +73,18 @@ none of the pipeline.
 | 8 | **Satellites & Pi** — client/server split (thin mic/speaker/wake satellites → central brain), multi-device wake arbitration (closest responds), barge-in, custom wake phrase, custom voice clone | |
 | 9 | **Claude dispatch** — voice-launch Claude Code tasks on the desktop (Agent SDK, headless, own worktree + constrained permissions, voice-ID-gated) and voice status checks on projects/sessions — incl. Will's dream: commissioning work on THIS repo by voice | |
 | 10 | **Learning Loop** — session-end reflection distills lessons (auto-applied), observations (consent-gated), and a journal; she gets smarter from every conversation | ⏳ testing |
+| 11 | **Always On** — starts at Windows logon (headless), watchdog restarts on crash, logs to file; plus endgame Stage 1: she inspects her own repo and discusses her roadmap | ⏳ testing |
+
+## Always-On runbook
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_autostart.ps1
+```
+
+One run, no admin: Alexa now starts invisibly at every logon (and starts
+immediately). Logs: `logs\alexa.log`. Stop: `scripts\alexa-stop.cmd`.
+Remove: `scripts\uninstall_autostart.ps1`. Don't run `alexa.cmd` (foreground
+console) while the service is running — they'd fight over the microphone.
 
 Per-feature detail, hardware plan, and open questions live in the working
 backlog: [docs/FEATURES.md](docs/FEATURES.md).

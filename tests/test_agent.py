@@ -184,6 +184,19 @@ async def test_ambiguous_media_control_lists_players():
 
 
 @pytest.mark.asyncio
+async def test_self_awareness_tools_read_the_real_repo():
+    executor = ToolExecutor(FakeHome())
+    status, is_error = await executor.execute("project_status", {})
+    assert not is_error
+    data = json.loads(status)
+    assert data["branch"]  # a real branch name from this very repo
+    assert data["recent_commits"]
+    roadmap, is_error = await executor.execute("read_roadmap", {})
+    assert not is_error
+    assert "Feature backlog" in roadmap
+
+
+@pytest.mark.asyncio
 async def test_escape_hatch_calls_any_service():
     home = FakeHome()
     executor = ToolExecutor(home)
