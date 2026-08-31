@@ -79,6 +79,12 @@ closest legitimate thing to "just pair it to Apple Home."
 | Voice-dispatch Claude Code | `start_coding_task` tool → headless Claude Code / Agent SDK in a dedicated worktree with constrained permissions. **Review constraints adopted:** dispatch tools never share a context that ingested web content (injection surface); confirmation is a non-voice factor (phone push / button), not voice ID; hard per-task spend cap; no push rights or secrets beyond the worktree. The read-only status half ships first | 9 | $/task — biggest spend item, metered | idea |
 | Project status by voice | read-only tools: git log, `gh pr status`, running-session transcripts, summarized aloud | 9 | pennies | idea |
 
+## Assistant intelligence — architecture
+
+| Feature | Approach | Milestone | Cost | Status |
+| --- | --- | --- | --- | --- |
+| Generality upgrade (escape hatch) | Will's question 2026-08-31 ("is hard-coding skills right?"): hybrid architecture — keep curated tools as the reliable/opinionated fast path, add generic `call_ha_service` + entity search so HA's ENTIRE surface (climate, plugs, scenes, any future device) works day one with no new code; evaluate HA's own **MCP server** integration for the realtime engine (native MCP support) which may hand us a self-maintained toolbox. Curation becomes per-hot-path polish driven by field friction | next candidate | $0 | idea |
+
 ## Design notes already locked in
 
 - Audio layer keeps the command audio buffer after STT (voice ID needs it) and
