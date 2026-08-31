@@ -199,7 +199,7 @@ async def test_show_me_opens_urls_and_rejects_non_http(monkeypatch):
     _text, is_error = await executor.execute("show_me", {"url": "file:///C:/windows"})
     assert is_error  # only http(s)
 
-    text, is_error = await executor.execute(
+    _text, is_error = await executor.execute(
         "show_me", {"text": "milk\neggs", "title": "Groceries"}
     )
     assert not is_error and len(opened) == 2 and opened[1].startswith("file://")
