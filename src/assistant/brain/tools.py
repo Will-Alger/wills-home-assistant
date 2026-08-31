@@ -227,7 +227,19 @@ class ToolExecutor:
                 )
                 return f"Done ({tool_input['action']} on {player.name}).", False
             if name == "search_entities":
-                return json.dumps(await self._home.search_entities(str(tool_input["query"]))), False
+                found = await self._home.search_entities(str(tool_input["query"]))
+                if not found:
+                    # Literal search missed (words like "temperature" often do).
+                    # Hand back the whole inventory — the model matches meaning.
+                    inventory = await self._home.search_entities("")
+                    return json.dumps(
+                        {
+                            "note": "no literal matches — full home inventory follows; "
+                            "pick semantically",
+                            "entities": inventory,
+                        }
+                    ), False
+                return json.dumps(found), False
             if name == "get_entity":
                 detail = await self._home.get_entity(str(tool_input["entity_id"]))
                 return json.dumps(detail)[:1500], False

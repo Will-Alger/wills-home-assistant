@@ -130,12 +130,12 @@ class HomeAssistantClient:
                 )
 
     async def search_entities(self, query: str) -> list[dict]:
-        """HomeApi: fragment search across every entity in the house."""
-        needle = query.strip().lower()
+        """HomeApi: word-OR fragment search; empty query returns everything."""
+        words = query.strip().lower().split()
         results = []
         for s in await self.states():
-            haystack = f"{s.entity_id} {s.friendly_name} {s.attributes.get('area', '')}".lower()
-            if not needle or needle in haystack or needle == s.domain:
+            haystack = f"{s.entity_id} {s.friendly_name}".lower()
+            if not words or any(w in haystack or w == s.domain for w in words):
                 results.append(
                     {
                         "entity_id": s.entity_id,
@@ -144,7 +144,7 @@ class HomeAssistantClient:
                         "domain": s.domain,
                     }
                 )
-        return results[:25]
+        return results[:60]
 
     async def get_entity(self, entity_id: str) -> dict:
         resp = await self._http.get(f"/api/states/{entity_id}")

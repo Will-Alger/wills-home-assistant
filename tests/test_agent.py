@@ -222,6 +222,10 @@ async def test_search_finds_non_light_devices():
     text, is_error = await executor.execute("search_entities", {"query": "thermostat"})
     assert not is_error
     assert "climate.bedroom" in text
+    # a miss falls back to the full inventory so the model can match by meaning
+    text, is_error = await executor.execute("search_entities", {"query": "zzz_nonsense"})
+    assert not is_error
+    assert "full home inventory" in text and "climate.bedroom" in text
     text, _ = await executor.execute("get_entity", {"entity_id": "climate.bedroom"})
     assert "current_temperature" in text
 

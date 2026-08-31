@@ -125,13 +125,13 @@ class FakeHome:
         return rows
 
     async def search_entities(self, query: str) -> list[dict]:
-        needle = query.strip().lower()
+        words = query.strip().lower().split()
         out = []
         for row in self._all_entities():
             hay = f"{row['entity_id']} {row['name']}".lower()
-            if not needle or needle in hay or needle == row["domain"]:
+            if not words or any(w in hay or w == row["domain"] for w in words):
                 out.append({k: row[k] for k in ("entity_id", "name", "state", "domain")})
-        return out[:25]
+        return out[:60]
 
     async def get_entity(self, entity_id: str) -> dict:
         for row in self._all_entities():
