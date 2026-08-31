@@ -8,6 +8,7 @@ is a full LLM round trip, so per-bulb tools would multiply dead air.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -408,7 +409,19 @@ class ToolExecutor:
                     action,
                     volume_pct=tool_input.get("volume_pct"),
                 )
-                return f"Done ({action} on {player.name} [{player.entity_id}]).", False
+                kept_awake = ""
+                if action == "pause" and player.kind == "music":
+                    # Apple TVs sleep the instant their AirPlay session pauses
+                    # (verified in HA history: paused + TV off in the same
+                    # second). Re-wake it so pause means "paused", not "dark".
+                    with contextlib.suppress(Exception):  # cosmetic; never fail the pause
+                        tvs = [
+                            p for p in await self._home.media_players() if p.kind == "tv"
+                        ]
+                        if tvs:
+                            await self._home.media_command(tvs[0].entity_id, "turn_on")
+                            kept_awake = " Kept the TV awake."
+                return f"Done ({action} on {player.name} [{player.entity_id}]).{kept_awake}", False
             if name == "search_entities":
                 found = await self._home.search_entities(str(tool_input["query"]))
                 if not found:

@@ -219,7 +219,12 @@ async def test_playback_verbs_route_to_whats_actually_playing():
         "media_control", {"action": "pause", "player": "Apple TV"}
     )
     assert not is_error, text
-    assert home.media_commands == [("media_player.living_room_speakers", "pause")]
+    # pause hits the stream, then re-wakes the TV (ATVs sleep on session pause)
+    assert home.media_commands == [
+        ("media_player.living_room_speakers", "pause"),
+        ("media_player.living_room_tv", "turn_on"),
+    ]
+    assert "Kept the TV awake" in text
 
     # volume while music plays → the stream too
     text, is_error = await executor.execute(
