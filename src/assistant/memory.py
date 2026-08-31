@@ -77,4 +77,4 @@ class MemoryStore:
 
     def preferences_text(self) -> str:
         prefs = self.items("preference")
-        return "\n".join(f"- {p.text}" for p in prefs) or "(none stored yet)"
+        return "\n".join(f"- [id {p.id}] {p.text}" for p in prefs) or "(none stored yet)"

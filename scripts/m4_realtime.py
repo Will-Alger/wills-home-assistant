@@ -41,29 +41,46 @@ console = Console()
 class ConsoleUi:
     def __init__(self, name: str) -> None:
         self._name = name.lower()
+        self._last_status = ""
+
+    def _say(self, text: str) -> None:
+        self._last_status = ""
+        console.print(text, highlight=False)
 
     def listening(self) -> None:
-        console.print("[green]● listening[/green]")
+        if self._last_status != "listening":  # multi-step replies fire this repeatedly
+            self._last_status = "listening"
+            console.print("[green]● listening[/green]")
 
     def user_speaking(self) -> None:
         pass  # semantic VAD handles it; printing here is just noise
 
     def user_partial(self, heard_so_far: str) -> None:
-        console.print(f"[dim]… {heard_so_far.strip()}[/dim]", end="\r")
+        # One line, overwritten in place: show the TAIL, padded so shorter
+        # updates fully cover longer ones (wrapping broke the old version).
+        width = max(20, console.width - 6)
+        tail = heard_so_far.strip().replace("\n", " ")[-width:]
+        console.print(f"[dim]… {tail:<{width}}[/dim]", end="\r", highlight=False)
+        self._last_status = "partial"
 
     def user_said(self, transcript: str) -> None:
         if transcript.strip():
-            console.print(f"[bold]you>[/bold] {transcript.strip()}")
+            if self._last_status == "partial":
+                console.print(" " * max(20, console.width - 2), end="\r")  # clear the tail line
+            self._say(f"[bold]you>[/bold] {transcript.strip()}")
 
     def assistant_said(self, transcript: str) -> None:
         if transcript.strip():
-            console.print(f"[bold cyan]{self._name}>[/bold cyan] {transcript.strip()}")
+            self._say(f"[bold cyan]{self._name}>[/bold cyan] {transcript.strip()}")
 
     def interrupted(self) -> None:
-        console.print("[yellow]— interrupted —[/yellow]")
+        self._say("[yellow]— interrupted —[/yellow]")
+
+    def note(self, message: str) -> None:
+        self._say(f"[yellow]{message}[/yellow]")
 
     def error(self, message: str) -> None:
-        console.print(f"[red]{message}[/red]")
+        self._say(f"[red]{message}[/red]")
 
 
 def build_engine(fake: bool):

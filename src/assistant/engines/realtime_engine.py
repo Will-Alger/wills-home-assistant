@@ -65,6 +65,8 @@ Standing preferences ({owner}'s, apply them automatically, no announcement):
 
 Memory: when the speaker states a durable preference ("from now on…", \
 "I always want…", "call me…"), store it with remember(kind="preference"). \
+If a new preference updates or contradicts a stored one, forget the old id \
+first and store the new — never keep both versions. \
 Things they ask you to keep for later go in remember(kind="fact"); answer \
 "what do you remember?" via list_memories, and delete with forget after \
 checking ids. Store only what the speaker deliberately tells you — never \
@@ -440,6 +442,11 @@ class RealtimeEngine:
 
         async with self._client.realtime.connect(model=self._model) as connection:
             await self._configure(connection, transcription=True)
+            if self.voice_note:
+                note = getattr(ui, "note", None)
+                if note is not None:
+                    note(self.voice_note)
+                    self.voice_note = None
 
             async def pump_mic() -> None:
                 nonlocal speaking
