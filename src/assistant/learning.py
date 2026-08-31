@@ -31,6 +31,11 @@ teach nothing and empty lists are the normal result.
   targets, timing realities. Written as directives a future session can act
   on ("The music player entity is X", "Wake the TV before AirPlay").
   Never restate general knowledge or things already in instructions.
+  NEVER record a missing tool or capability as a lesson ("there is no way
+  to X", "deleting is not supported") — the assistant is actively developed
+  and its toolset grows between sessions, so such lessons rot into false
+  limitations that make it deny abilities it has gained. The same goes for
+  transient state (which jobs are running, what is currently broken).
 - observations (max 1): a behavioral pattern of the user worth ASKING about
   before making it a standing preference ("has asked for lower volume at
   night twice"). Only patterns, never one-offs.
