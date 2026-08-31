@@ -43,6 +43,9 @@ def main() -> int:
         LOG.replace(LOG.with_suffix(".log.old"))
 
     creation = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    # Redirected output on Windows defaults to cp1252, which chokes on the
+    # app's unicode status glyphs (○ ● ⚙ ✎). Force UTF-8 for the child.
+    child_env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
     backoff = 5.0
     with LOG.open("a", encoding="utf-8", errors="replace") as log:
         def note(msg: str) -> None:
@@ -53,7 +56,12 @@ def main() -> int:
         while not STOP_FLAG.exists():
             started = time.monotonic()
             child = subprocess.Popen(
-                child_command(), stdout=log, stderr=log, cwd=ROOT, creationflags=creation
+                child_command(),
+                stdout=log,
+                stderr=log,
+                cwd=ROOT,
+                creationflags=creation,
+                env=child_env,
             )
             PIDFILE.write_text(f"{os.getpid()}\n{child.pid}", encoding="utf-8")
             code = child.wait()
