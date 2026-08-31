@@ -178,7 +178,23 @@ async def test_browse_music_lists_playlists_and_filters():
     assert [i["name"] for i in json.loads(text)] == ["Cleveland 10K"]
 
     text, is_error = await executor.execute("browse_music", {"search": "zzz"})
-    assert not is_error and "nothing matching" in text
+    assert not is_error and "scope='catalog'" in text  # nudges toward catalog search
+
+
+@pytest.mark.asyncio
+async def test_browse_music_catalog_scope_searches_streaming():
+    executor = ToolExecutor(FakeHome())
+    text, is_error = await executor.execute(
+        "browse_music", {"scope": "catalog", "search": "jazz"}
+    )
+    assert not is_error
+    items = json.loads(text)
+    assert {i["name"] for i in items} == {"Jazz Chill", "Smooth Jazz Essentials"}
+    assert all(i["uri"] for i in items)  # uris enable exact playback
+
+    # catalog without a search term is a usage error, not a crash
+    text, is_error = await executor.execute("browse_music", {"scope": "catalog"})
+    assert is_error and "search term" in text
 
 
 @pytest.mark.asyncio

@@ -126,6 +126,23 @@ class FakeHome:
             items = [i for i in items if search.lower() in i["name"].lower()]
         return items[:limit]
 
+    async def music_search(
+        self, query: str, media_type: str = "playlist", limit: int = 8
+    ) -> list[dict]:
+        catalog = {
+            "playlist": [
+                {"name": "Jazz Chill", "media_type": "playlist",
+                 "uri": "apple_music://playlist/pl.jazzchill", "artists": None},
+                {"name": "Smooth Jazz Essentials", "media_type": "playlist",
+                 "uri": "apple_music://playlist/pl.smoothjazz", "artists": None},
+            ],
+        }
+        items = [
+            i for i in catalog.get(media_type, [])
+            if query.lower() in i["name"].lower()
+        ]
+        return items[:limit]
+
     def _all_entities(self) -> list[dict]:
         rows = [
             {"entity_id": light.entity_id, "name": light.name,

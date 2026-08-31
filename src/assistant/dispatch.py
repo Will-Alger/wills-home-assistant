@@ -277,9 +277,13 @@ class Dispatcher:
                     cwd=job.worktree,
                 )
             assert proc.stdin is not None and proc.stdout is not None
-            proc.stdin.write(prompt.encode("utf-8"))
-            await proc.stdin.drain()
-            proc.stdin.close()
+            try:
+                proc.stdin.write(prompt.encode("utf-8"))
+                await proc.stdin.drain()
+                proc.stdin.close()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass  # agent exited before reading the prompt; the exit-code
+                # path below reports that honestly instead of a pipe error
 
             deadline = time.monotonic() + self._timeout_s
             got_result = False

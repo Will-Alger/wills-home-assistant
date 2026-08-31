@@ -117,3 +117,9 @@ class HomeApi(Protocol):
     ) -> list[dict]:
         """Browse the music library: what playlists/artists/albums exist."""
         ...
+
+    async def music_search(
+        self, query: str, media_type: str = "playlist", limit: int = 8
+    ) -> list[dict]:
+        """Search the whole streaming catalog (beyond the owner's library)."""
+        ...

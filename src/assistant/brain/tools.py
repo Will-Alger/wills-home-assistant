@@ -72,12 +72,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "browse_music",
         "description": (
-            "List what actually exists in the music library: the owner's "
-            "playlists (default), artists, albums, or tracks. Use it when "
-            "asked what playlists there are, and BEFORE play_music whenever "
-            "you are not sure of the exact name — play_music needs a close "
-            "match, so check instead of guessing. Optional search filters by "
-            "name fragment."
+            "Find music. scope='library' (default) lists the owner's own "
+            "playlists/artists/albums — use for 'what playlists do I have'. "
+            "scope='catalog' searches the ENTIRE streaming catalog (Apple "
+            "Music) — use for discovery like 'find me a jazz playlist' or "
+            "anything not in the library; it requires a search term. Results "
+            "include a uri: pass it as play_music's media_id for an exact "
+            "match, no name guessing."
         ),
         "input_schema": {
             "type": "object",
@@ -86,7 +87,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "string",
                     "enum": ["playlist", "artist", "album", "track", "radio"],
                 },
-                "search": {"type": "string", "description": "name fragment to filter by"},
+                "search": {"type": "string", "description": "name/genre/mood to look for"},
+                "scope": {"type": "string", "enum": ["library", "catalog"]},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100},
             },
         },
@@ -94,12 +96,12 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "play_music",
         "description": (
-            "Play music via Music Assistant (Apple Music library behind it). "
-            "media_id is a plain NAME — playlist, artist, track, or album name; "
-            "search is built in. Use radio_mode for open-ended vibes ('play "
+            "Play music via Music Assistant (Apple Music behind it). media_id "
+            "is a name OR — better — a uri from browse_music results (exact, "
+            "never mis-resolves). Use radio_mode for open-ended vibes ('play "
             "something relaxing' → a fitting artist/track + radio_mode). Omit "
-            "player to use the default music player. Unsure of a playlist's "
-            "exact name? browse_music first."
+            "player to use the default music player. Unsure what exists? "
+            "browse_music first (library or catalog scope)."
         ),
         "input_schema": {
             "type": "object",
@@ -298,13 +300,29 @@ class ToolExecutor:
                     False,
                 )
             if name == "browse_music":
+                media_type = str(tool_input.get("media_type", "playlist"))
+                search = tool_input.get("search")
+                if tool_input.get("scope") == "catalog":
+                    if not search:
+                        return "catalog scope needs a search term", True
+                    items = await self._home.music_search(
+                        str(search), media_type=media_type,
+                        limit=int(tool_input.get("limit", 8)),
+                    )
+                    if not items:
+                        return "the catalog found nothing for that — try different words", False
+                    return json.dumps(items)[:2500], False
                 items = await self._home.music_library(
-                    media_type=str(tool_input.get("media_type", "playlist")),
-                    search=tool_input.get("search"),
+                    media_type=media_type,
+                    search=search,
                     limit=int(tool_input.get("limit", 50)),
                 )
                 if not items:
-                    return "the library has nothing matching that", False
+                    return (
+                        "the owner's library has nothing matching that — "
+                        "browse_music with scope='catalog' searches all of "
+                        "Apple Music instead"
+                    ), False
                 return json.dumps(items)[:2500], False
             if name == "media_control":
                 action = str(tool_input["action"])
@@ -316,7 +334,7 @@ class ToolExecutor:
                     action,
                     volume_pct=tool_input.get("volume_pct"),
                 )
-                return f"Done ({action} on {player.name}).", False
+                return f"Done ({action} on {player.name} [{player.entity_id}]).", False
             if name == "search_entities":
                 found = await self._home.search_entities(str(tool_input["query"]))
                 if not found:

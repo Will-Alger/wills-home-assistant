@@ -294,13 +294,7 @@ class HomeAssistantClient:
     ) -> list[dict[str, Any]]:
         """Browse the Music Assistant library (verified live 2026-08-31:
         get_library needs the MA config_entry_id and ?return_response)."""
-        if self._ma_entry_id is None:
-            resp = await self._http.get("/api/config/config_entries/entry?domain=music_assistant")
-            self._check(resp)
-            entries = resp.json()
-            if not entries:
-                raise HomeAssistantError("Music Assistant is not set up in Home Assistant")
-            self._ma_entry_id = entries[0]["entry_id"]
+        await self._ensure_ma_entry()
         data: dict[str, Any] = {
             "config_entry_id": self._ma_entry_id,
             "media_type": media_type,
@@ -312,15 +306,49 @@ class HomeAssistantClient:
             "music_assistant", "get_library", data, return_response=True
         )
         items = result.get("items", []) if isinstance(result, dict) else []
-        return [
+        return [self._media_item_view(i, media_type) for i in items if isinstance(i, dict)]
+
+    async def music_search(
+        self, query: str, media_type: str = "playlist", limit: int = 8
+    ) -> list[dict[str, Any]]:
+        """Search the whole streaming catalog (music_assistant.search — verified
+        live 2026-08-31: returns playlists/artists/albums/tracks keyed lists
+        with exact URIs; playing a URI skips name-resolution entirely)."""
+        await self._ensure_ma_entry()
+        result = await self.call_service(
+            "music_assistant",
+            "search",
             {
-                "name": i.get("name", ""),
-                "media_type": i.get("media_type", media_type),
-                "artists": [a.get("name") for a in i.get("artists", [])] or None,
-            }
-            for i in items
-            if isinstance(i, dict)
-        ]
+                "config_entry_id": self._ma_entry_id,
+                "name": query,
+                "media_type": media_type,
+                "limit": max(1, min(limit, 25)),
+            },
+            return_response=True,
+            timeout=45.0,
+        )
+        key = {"playlist": "playlists", "artist": "artists", "album": "albums",
+               "track": "tracks", "radio": "radio"}.get(media_type, media_type + "s")
+        items = result.get(key, []) if isinstance(result, dict) else []
+        return [self._media_item_view(i, media_type) for i in items if isinstance(i, dict)]
+
+    @staticmethod
+    def _media_item_view(i: dict, media_type: str) -> dict[str, Any]:
+        return {
+            "name": i.get("name", ""),
+            "media_type": i.get("media_type", media_type),
+            "uri": i.get("uri", ""),
+            "artists": [a.get("name") for a in i.get("artists", [])] or None,
+        }
+
+    async def _ensure_ma_entry(self) -> None:
+        if self._ma_entry_id is None:
+            resp = await self._http.get("/api/config/config_entries/entry?domain=music_assistant")
+            self._check(resp)
+            entries = resp.json()
+            if not entries:
+                raise HomeAssistantError("Music Assistant is not set up in Home Assistant")
+            self._ma_entry_id = entries[0]["entry_id"]
 
     async def light_on(
         self,
