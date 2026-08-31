@@ -135,6 +135,7 @@ class RealtimeEngine:
         name: str = "Jarvis",
         wake_phrase: str = "hey jarvis",
         idle_timeout_s: float = 20.0,
+        talk_over: bool = False,
         usage_log: Path | None = None,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
@@ -146,6 +147,7 @@ class RealtimeEngine:
         self._name = name
         self._wake_phrase = wake_phrase
         self._idle_timeout_s = idle_timeout_s
+        self._talk_over = talk_over  # headphones only: mic streams during playback
         self._usage_log = usage_log
 
     async def _session_config(self, transcription: bool) -> dict[str, Any]:
@@ -301,7 +303,7 @@ class RealtimeEngine:
                 nonlocal speaking
                 while True:
                     frame = await mic.get_frame()
-                    if speaking:
+                    if speaking and not self._talk_over:
                         # Half-duplex: don't feed our own voice back. But keep
                         # watching for the wake phrase = instant barge-in.
                         if wake is not None and wake.detect(downsample_24k_to_16k(frame)):
@@ -345,6 +347,13 @@ class RealtimeEngine:
                     elif kind == "conversation.item.input_audio_transcription.completed":
                         ui.user_said(getattr(event, "transcript", ""))
                     elif kind == "input_audio_buffer.speech_started":
+                        if self._talk_over and speaking:
+                            # Talk-over interrupt: you spoke, it stops.
+                            speaker.clear()
+                            if response_active:
+                                await connection.send({"type": "response.cancel"})
+                            speaking = False
+                            ui.interrupted()
                         ui.user_speaking()
                     elif kind == "response.done":
                         response_active = False

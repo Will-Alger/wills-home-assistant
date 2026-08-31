@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     realtime_model: str = "gpt-realtime-2.1"
     realtime_voice: str = "marin"  # marin/cedar recommended; also alloy, ash, ...
     realtime_idle_timeout_s: float = 20.0  # silent session auto-closes (it bills/min)
+    # True talk-over (interrupt by just speaking). ONLY with headphones — on
+    # open speakers the mic hears the assistant and it interrupts itself.
+    realtime_talk_over: bool = False
 
     # Alternate engine: ElevenLabs streaming TTS pipeline (custom voice, parked)
     elevenlabs_api_key: str = ""

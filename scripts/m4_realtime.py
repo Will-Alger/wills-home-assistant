@@ -72,6 +72,7 @@ def build_engine(fake: bool):
         home=home,
         owner=settings.owner_name,
         idle_timeout_s=settings.realtime_idle_timeout_s,
+        talk_over=settings.realtime_talk_over,
         usage_log=Path(__file__).resolve().parents[1] / ".usage.jsonl",
     )
     return settings, home, engine
