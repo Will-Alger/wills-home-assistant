@@ -320,6 +320,28 @@ CALENDAR_TOOLS: list[dict[str, Any]] = [
             "required": ["summary", "start"],
         },
     },
+    {
+        "name": "delete_calendar_event",
+        "description": (
+            "Remove one event from the owner's Apple calendar — this is "
+            "PERMANENT. First list_calendar_events to get the event's uid, "
+            "restate exactly which event aloud (title and time), and only "
+            "after an explicit yes call this with confirmed=true. Never "
+            "delete on a guess; if several events could match, ask."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "uid": {"type": "string", "description": "from list_calendar_events"},
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "true ONLY after the owner verbally approved deleting this exact event",
+                },
+                "calendar": {"type": "string", "description": "calendar name; omit for the default"},
+            },
+            "required": ["uid", "confirmed"],
+        },
+    },
 ]
 _CALENDAR_TOOL_NAMES = frozenset(tool["name"] for tool in CALENDAR_TOOLS)
 
@@ -526,6 +548,18 @@ class ToolExecutor:
                 }
             )
 
+        if name == "delete_calendar_event":
+            if not tool_input.get("confirmed"):
+                raise ValueError(
+                    "not deleted: restate exactly which event (title and time) to "
+                    "the owner and get an explicit yes, then retry with confirmed=true"
+                )
+            uid = str(tool_input.get("uid") or "").strip()
+            if not uid:
+                raise ValueError("deleting needs the event's uid — list_calendar_events shows them")
+            await self._calendar.delete_event(uid, calendar=target)
+            return "deleted — it's off the calendar"
+
         summary = str(tool_input.get("summary") or "").strip()
         if not summary:
             raise ValueError("an event needs a title")
@@ -704,6 +738,7 @@ def _event_view(event: CalendarEvent) -> dict[str, Any]:
         "summary": event.summary,
         "when": spoken_when(event),
         "start": event.start.isoformat(),
+        "uid": event.uid,  # the handle delete_calendar_event needs
     }
     if event.all_day:
         view["all_day"] = True

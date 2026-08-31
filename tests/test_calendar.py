@@ -126,6 +126,32 @@ async def test_duration_minutes_sets_the_end(executor) -> None:
     assert calendar.events[0].end == at("2026-09-02T09:15")
 
 
+async def test_delete_requires_confirmation_and_uses_the_uid(executor) -> None:
+    tools, calendar = executor
+    await calendar.create_event(
+        summary="Mistake", start=datetime.now(tz=TZ) + timedelta(days=1)
+    )
+    uid = calendar.events[0].uid
+    # listings expose the uid so the model can name the exact event
+    listed = json.loads((await tools.execute("list_calendar_events", {}))[0])
+    assert listed["events"][0]["uid"] == uid
+
+    text, is_error = await tools.execute("delete_calendar_event", {"uid": uid})
+    assert is_error and "explicit yes" in text
+    assert calendar.events  # still there — no confirmation, no deletion
+
+    text, is_error = await tools.execute(
+        "delete_calendar_event", {"uid": uid, "confirmed": True}
+    )
+    assert not is_error and "deleted" in text
+    assert calendar.events == []
+
+    text, is_error = await tools.execute(
+        "delete_calendar_event", {"uid": "nope", "confirmed": True}
+    )
+    assert is_error  # honest error for an unknown event
+
+
 async def test_backwards_event_and_unknown_calendar_come_back_as_errors(executor) -> None:
     tools, _ = executor
     result, is_error = await tools.execute(
