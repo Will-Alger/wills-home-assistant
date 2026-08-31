@@ -180,11 +180,16 @@ class HomeAssistantClient:
         if radio_mode:
             data["radio_mode"] = True
         try:
-            # MA search + AirPlay spin-up is slow; and if we time out anyway,
-            # the service keeps executing server-side — that's not a failure.
+            # MA search + AirPlay spin-up can legitimately take ~20s.
             await self.call_service("music_assistant", "play_media", data, timeout=30.0)
-        except httpx.ReadTimeout:
-            pass
+        except httpx.ReadTimeout as err:
+            # Do NOT claim success: a hang here usually means Music Assistant
+            # is stuck (e.g. Spotify rate-limiting with a long backoff).
+            raise HomeAssistantError(
+                "the music system did not confirm playback within 30s — it may "
+                "be temporarily rate-limited by Spotify or busy; worth trying "
+                "again in a little while"
+            ) from err
 
     _MEDIA_COMMANDS: typing.ClassVar[dict[str, str]] = {
         "pause": "media_pause",
