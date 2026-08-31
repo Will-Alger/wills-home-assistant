@@ -90,6 +90,24 @@ class ConsoleUi:
         self._say(f"[red]{message}[/red]")
 
 
+def build_calendar(settings, fake: bool):
+    """Fake apartment gets a fake calendar; otherwise iCloud, if configured."""
+    if fake:
+        from assistant.calendar.fake import FakeCalendar
+
+        return FakeCalendar()
+    if not (settings.icloud_username and settings.icloud_app_password):
+        return None  # unconfigured: the calendar tools stay hidden
+    from assistant.calendar.apple import AppleCalendar
+
+    return AppleCalendar(
+        settings.icloud_username,
+        settings.icloud_app_password,
+        url=settings.icloud_caldav_url,
+        default_calendar=settings.icloud_calendar_name,
+    )
+
+
 def build_engine(fake: bool):
     settings = load_settings()
     settings.require("openai_api_key")
@@ -97,6 +115,7 @@ def build_engine(fake: bool):
     if not fake:
         settings.require("ha_url", "ha_token")
     memory = MemoryStore(Path(__file__).resolve().parents[1] / "data" / "memory.json")
+    calendar = build_calendar(settings, fake)
     reflector = None
     if settings.use_claude_subscription:
         from assistant.llm.claude_cli import ClaudeCli
@@ -127,6 +146,7 @@ def build_engine(fake: bool):
         eagerness=settings.realtime_eagerness,
         extra_instructions=settings.assistant_extra_instructions,
         memory=memory,
+        calendar=calendar,
         dispatcher=(
             Dispatcher(
                 Path(__file__).resolve().parents[1],

@@ -68,7 +68,7 @@ none of the pipeline.
 | 3 | **Ears** — mic layer, openWakeWord, streaming STT; wake → transcript | ⏳ testing |
 | 4 | **Mouth** — voice-engine bake-off: OpenAI Realtime engine behind our wake word + tools (live-verified); ElevenLabs streaming pipeline as alternate engine | ⏳ testing |
 | 5 | **Music & media** — Spotify→AirPlay via Music Assistant + Apple TV tools (play by name, pause/skip/volume, app launching) | ⏳ testing (jazz confirmed streaming); YouTube deep-link stretch remains |
-| 6 | **Tool belt** — long-term memory & preferences ("from now on when I say movie time…" — stored locally, applied every session, `forget` to erase); still to come: web search, Apple Calendar events | ⏳ memory testing |
+| 6 | **Tool belt** — long-term memory & preferences ("from now on when I say movie time…" — stored locally, applied every session, `forget` to erase) + **Apple Calendar** over iCloud CalDAV (read the week ahead, add events by voice — needs an app-specific password); still to come: web search | ⏳ memory testing; calendar awaiting credentials |
 | 7 | **Voice ID** — local speaker embeddings (enroll Will's voiceprint); gates personal memories. Personalization, not security | |
 | 8 | **Satellites & Pi** — client/server split (thin mic/speaker/wake satellites → central brain), multi-device wake arbitration (closest responds), barge-in, custom wake phrase, custom voice clone | |
 | 9 | **Claude dispatch** — she commissions Claude Code on her own repo by voice: sandboxed worktree branches, background jobs, `check_work` progress, human review/merge at the keyboard | ⏳ Stages 1+2 live; Stage 3 (self-proposals) remains |
@@ -241,12 +241,14 @@ docker-compose.yml          fallback: HA container for Linux/Pi hosts
 src/assistant/
   config.py                 all settings/secrets from .env — nothing hardcoded
   home/                     HomeApi protocol, real HA client, fake apartment
+  calendar/                 CalendarApi protocol, iCloud CalDAV client, fake
   llm/                      provider interface + Anthropic adapter
   brain/                    agent loop, tools, system prompt, intents
   meter.py                  per-hop cost + latency, logs to .usage.jsonl
   stt/  tts/  audio/        (arrive with milestones 3–4)
 scripts/m1_smoke.py         M1 proof: list + control lights, zero voice
 scripts/m2_repl.py          M2 proof: typed commands → LLM tools → lights
+scripts/check_calendar.py   M6 proof: iCloud calendar reads (and --write-test)
 tests/                      free stub tests + opt-in live evals (RUN_EVALS=1)
 ```
 

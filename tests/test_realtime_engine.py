@@ -23,6 +23,15 @@ def test_tools_convert_to_realtime_shape() -> None:
         assert "input_schema" not in tool  # anthropic name must not leak
 
 
+def test_calendar_tools_appear_only_when_a_calendar_is_configured() -> None:
+    without = [tool["name"] for tool in realtime_tools()]
+    assert "list_calendar_events" not in without  # never advertise a calendar we can't read
+    with_calendar = [tool["name"] for tool in realtime_tools(calendar=True)]
+    assert "list_calendar_events" in with_calendar
+    assert "create_calendar_event" in with_calendar
+    assert with_calendar[-1] == "end_conversation"
+
+
 async def test_session_config_renders_jobs_and_repos(tmp_path) -> None:
     """The instructions template must format cleanly with a dispatcher wired
     in — a stray placeholder here would break every wake."""

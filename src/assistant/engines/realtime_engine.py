@@ -30,7 +30,8 @@ import numpy as np
 from openai import AsyncOpenAI
 from scipy.signal import resample_poly
 
-from assistant.brain.tools import TOOL_DEFINITIONS, ToolExecutor
+from assistant.brain.tools import CALENDAR_TOOLS, TOOL_DEFINITIONS, ToolExecutor
+from assistant.calendar.base import CalendarApi, spoken_now
 from assistant.dispatch import Dispatcher
 from assistant.home.base import HomeApi, device_table, media_table
 from assistant.memory import MemoryStore
@@ -108,7 +109,7 @@ Things they ask you to keep for later go in remember(kind="fact"); answer \
 checking ids. Store only what the speaker deliberately tells you — never \
 ambient chatter. You cannot yet react to events ("when the sun sets…") — \
 only to what is said to you; say so honestly if asked.
-
+{calendar}
 Your own development: you are an evolving open project. project_status shows \
 your recent code changes; read_roadmap returns your feature backlog. {owner} \
 may discuss your development with you — engage substantively, with opinions \
@@ -151,6 +152,16 @@ closing word and call end_conversation. When genuinely unsure which mode \
 you are in, close — being summoned again costs one word; hovering is \
 annoying. Never say the phrase "{wake_phrase}".
 {extra}"""
+
+_CALENDAR_INSTRUCTIONS = """
+Calendar: {owner}'s Apple calendar is connected, and right now it is {now}. \
+Read it with list_calendar_events before answering anything about the \
+schedule — never guess or recall. To add something, resolve the date and \
+time yourself from the time above, say back the title, day and time, and \
+call create_calendar_event only once {owner} agrees; never invent a detail \
+you weren't given. Speak times naturally ("Thursday at three"), never as \
+timestamps, and read back the events that matter, not every field.
+"""
 
 MEMORY_TOOLS: list[dict[str, Any]] = [
     {
@@ -344,8 +355,9 @@ _END_TOOL = {
 }
 
 
-def realtime_tools() -> list[dict[str, Any]]:
+def realtime_tools(*, calendar: bool = False) -> list[dict[str, Any]]:
     """Our Anthropic-shaped tool defs, converted to Realtime's function shape."""
+    definitions = TOOL_DEFINITIONS + (CALENDAR_TOOLS if calendar else [])
     converted = [
         {
             "type": "function",
@@ -353,7 +365,7 @@ def realtime_tools() -> list[dict[str, Any]]:
             "description": tool["description"],
             "parameters": tool["input_schema"],
         }
-        for tool in TOOL_DEFINITIONS
+        for tool in definitions
     ]
     return [*converted, _RESTART_TOOL, _END_TOOL]
 
@@ -411,6 +423,7 @@ class RealtimeEngine:
         extra_instructions: str = "",
         memory: MemoryStore | None = None,
         dispatcher: Dispatcher | None = None,
+        calendar: CalendarApi | None = None,
         usage_log: Path | None = None,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
@@ -419,7 +432,8 @@ class RealtimeEngine:
         self.voice_note: str | None = None
         self.restart_requested = False  # set by restart_self; the runner acts on it
         self._home = home
-        self._executor = ToolExecutor(home)
+        self._calendar = calendar
+        self._executor = ToolExecutor(home, calendar)
         self._owner = owner
         self._name = name
         self._wake_phrase = wake_phrase
@@ -462,6 +476,11 @@ class RealtimeEngine:
             lessons=self._memory.lessons_text() if self._memory else "(none)",
             observations=self._memory.observations_text() if self._memory else "(none)",
             other_repos=other_repos,
+            calendar=(
+                _CALENDAR_INSTRUCTIONS.format(owner=self._owner, now=spoken_now())
+                if self._calendar is not None
+                else ""
+            ),
             jobs=self._dispatcher.status_line() if self._dispatcher else "(dispatch not enabled)",
             extra=extra,
         )
@@ -471,7 +490,9 @@ class RealtimeEngine:
         }
         if transcription_model:
             audio_in["transcription"] = {"model": transcription_model}
-        tools = realtime_tools() + (MEMORY_TOOLS if self._memory else [])
+        tools = realtime_tools(calendar=self._calendar is not None) + (
+            MEMORY_TOOLS if self._memory else []
+        )
         if self._dispatcher is not None:
             tools += DISPATCH_TOOLS
         return {
