@@ -20,6 +20,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"  # progress bar makes big downloads ~10x slower
 
 # --- preflight -------------------------------------------------------------
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -57,12 +58,18 @@ $vmDir = "$env:PUBLIC\Documents\Hyper-V\$VmName"
 New-Item -ItemType Directory -Force $vmDir | Out-Null
 $zipPath = Join-Path $vmDir "haos.vhdx.zip"
 if (-not (Get-ChildItem $vmDir -Filter *.vhdx -ErrorAction SilentlyContinue)) {
-    Write-Host "Downloading HAOS image..."
+    # A leftover zip from an interrupted run is likely truncated — start clean.
+    if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+    Write-Host "Downloading HAOS image (a few hundred MB)..."
     Invoke-WebRequest -Uri $VhdxUrl -OutFile $zipPath
+    Write-Host "Extracting..."
     Expand-Archive -Path $zipPath -DestinationPath $vmDir -Force
     Remove-Item $zipPath
 }
 $vhdx = (Get-ChildItem $vmDir -Filter *.vhdx | Select-Object -First 1).FullName
+if (-not $vhdx) {
+    throw "No .vhdx found after extraction — the download may have failed; just re-run this script."
+}
 
 # --- create the VM (per official docs: Gen 2, existing disk, Secure Boot off)
 Write-Host "Creating Generation 2 VM '$VmName'..."
