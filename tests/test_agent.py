@@ -191,7 +191,7 @@ async def test_show_me_opens_urls_and_rejects_non_http(monkeypatch):
     monkeypatch.setattr(webbrowser, "open", lambda target: opened.append(target))
     executor = ToolExecutor(FakeHome())
 
-    text, is_error = await executor.execute(
+    _text, is_error = await executor.execute(
         "show_me", {"url": "https://claude.ai/code/session_x"}
     )
     assert not is_error and opened == ["https://claude.ai/code/session_x"]
