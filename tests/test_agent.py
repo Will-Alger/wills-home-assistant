@@ -184,6 +184,49 @@ async def test_ambiguous_media_control_lists_players():
 
 
 @pytest.mark.asyncio
+async def test_escape_hatch_calls_any_service():
+    home = FakeHome()
+    executor = ToolExecutor(home)
+    text, is_error = await executor.execute(
+        "ha_call_service",
+        {"domain": "climate", "service": "set_temperature",
+         "data": {"entity_id": "climate.bedroom", "temperature": 70}},
+    )
+    assert not is_error, text
+    assert home.generic_calls == [
+        ("climate", "set_temperature", {"entity_id": "climate.bedroom", "temperature": 70})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_escape_hatch_denies_infrastructure():
+    home = FakeHome()
+    executor = ToolExecutor(home)
+    for domain, service in (
+        ("hassio", "addon_stop"),
+        ("homeassistant", "restart"),
+        ("shell_command", "anything"),
+        ("light", "reload_all"),
+    ):
+        _text, is_error = await executor.execute(
+            "ha_call_service", {"domain": domain, "service": service, "data": {}}
+        )
+        assert is_error, f"{domain}.{service} should be denied"
+    assert home.generic_calls == []
+
+
+@pytest.mark.asyncio
+async def test_search_finds_non_light_devices():
+    home = FakeHome()
+    executor = ToolExecutor(home)
+    text, is_error = await executor.execute("search_entities", {"query": "thermostat"})
+    assert not is_error
+    assert "climate.bedroom" in text
+    text, _ = await executor.execute("get_entity", {"entity_id": "climate.bedroom"})
+    assert "current_temperature" in text
+
+
+@pytest.mark.asyncio
 async def test_capability_filtering_drops_rgb_on_white_bulbs():
     home = FakeHome()
     executor = ToolExecutor(home)

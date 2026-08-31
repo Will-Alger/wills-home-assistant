@@ -83,7 +83,7 @@ closest legitimate thing to "just pair it to Apple Home."
 
 | Feature | Approach | Milestone | Cost | Status |
 | --- | --- | --- | --- | --- |
-| Generality upgrade (escape hatch) | Will's question 2026-08-31 ("is hard-coding skills right?"): hybrid architecture — keep curated tools as the reliable/opinionated fast path, add generic `call_ha_service` + entity search so HA's ENTIRE surface (climate, plugs, scenes, any future device) works day one with no new code; evaluate HA's own **MCP server** integration for the realtime engine (native MCP support) which may hand us a self-maintained toolbox. Curation becomes per-hot-path polish driven by field friction | next candidate | $0 | idea |
+| Generality upgrade (escape hatch) | **BUILT + live-verified 2026-08-31**: `search_entities` (whole-home discovery, any domain), `get_entity` (full state/attrs), `ha_call_service` (any service, with an infrastructure denylist: no hassio/restart/shell/reload). Selection is description-driven: dedicated tools stay preferred, escape hatch declares itself last-resort. Live probe: "what's the weather?" — no weather tool exists — she searched, found the HAOS weather entity, read it, answered with real conditions. HA **MCP server** evaluation still pending as possible successor | done | $0 | testing |
 
 ## Design notes already locked in
 

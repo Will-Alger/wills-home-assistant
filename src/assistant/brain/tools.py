@@ -118,6 +118,52 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "search_entities",
+        "description": (
+            "Search EVERYTHING in the home (any device type: climate, switches, "
+            "sensors, scenes, covers, weather, people...) by name fragment or "
+            "domain. The home has more than the lights/media listed in your "
+            "instructions — use this to discover entities before ha_call_service, "
+            "or to answer 'do I have / what is' questions."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "get_entity",
+        "description": "Full state and attributes of one entity (temperatures, sensor values...).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"entity_id": {"type": "string"}},
+            "required": ["entity_id"],
+        },
+    },
+    {
+        "name": "ha_call_service",
+        "description": (
+            "ESCAPE HATCH — use only when no dedicated tool covers the request. "
+            "Calls any Home Assistant service (climate.set_temperature, "
+            "switch.turn_on, scene.turn_on, cover.close_cover, ...). Workflow: "
+            "search_entities first if unsure of the entity_id, then call with "
+            "data including entity_id. Standard HA service vocabulary applies."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string"},
+                "service": {"type": "string"},
+                "data": {
+                    "type": "object",
+                    "description": "service data, usually including entity_id",
+                },
+            },
+            "required": ["domain", "service", "data"],
+        },
+    },
+    {
         "name": "launch_app",
         "description": (
             "Open an app on the TV (see the TV's app list in your instructions), "
@@ -133,6 +179,15 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
 ]
+
+
+# The escape hatch controls the HOME, never the infrastructure.
+_DENIED_DOMAINS = frozenset(
+    {"hassio", "backup", "update", "shell_command", "python_script", "recorder", "system_log"}
+)
+_DENIED_SERVICES = frozenset(
+    {("homeassistant", "restart"), ("homeassistant", "stop"), ("homeassistant", "check_config")}
+)
 
 
 class ToolExecutor:
@@ -171,6 +226,22 @@ class ToolExecutor:
                     volume_pct=tool_input.get("volume_pct"),
                 )
                 return f"Done ({tool_input['action']} on {player.name}).", False
+            if name == "search_entities":
+                return json.dumps(await self._home.search_entities(str(tool_input["query"]))), False
+            if name == "get_entity":
+                detail = await self._home.get_entity(str(tool_input["entity_id"]))
+                return json.dumps(detail)[:1500], False
+            if name == "ha_call_service":
+                domain = str(tool_input["domain"]).lower()
+                service = str(tool_input["service"]).lower()
+                if (
+                    domain in _DENIED_DOMAINS
+                    or (domain, service) in _DENIED_SERVICES
+                    or service.startswith("reload")
+                ):
+                    return f"service {domain}.{service} is not allowed from voice", True
+                await self._home.generic_call(domain, service, dict(tool_input.get("data") or {}))
+                return f"called {domain}.{service}", False
             if name == "launch_app":
                 player = await self._resolve_player(tool_input.get("player"), kind="tv")
                 await self._wake_tv_if_off()

@@ -41,6 +41,15 @@ class FakeHome:
     played: list[dict] = field(default_factory=list)
     media_commands: list[tuple[str, str]] = field(default_factory=list)
     launched: list[tuple[str, str]] = field(default_factory=list)
+    extra_entities: list[dict] = field(
+        default_factory=lambda: [
+            {"entity_id": "climate.bedroom", "name": "Bedroom Thermostat", "state": "heat",
+             "domain": "climate", "attributes": {"temperature": 68, "current_temperature": 66}},
+            {"entity_id": "switch.desk_fan", "name": "Desk Fan", "state": "off",
+             "domain": "switch", "attributes": {}},
+        ]
+    )
+    generic_calls: list[tuple[str, str, dict]] = field(default_factory=list)
 
     async def get_lights(self) -> list[Light]:
         return sorted(self.lights.values(), key=lambda light: light.entity_id)
@@ -100,3 +109,35 @@ class FakeHome:
 
     async def launch_app(self, entity_id: str, app: str) -> None:
         self.launched.append((entity_id, app))
+
+    def _all_entities(self) -> list[dict]:
+        rows = [
+            {"entity_id": light.entity_id, "name": light.name,
+             "state": "on" if light.on else "off", "domain": "light", "attributes": {}}
+            for light in self.lights.values()
+        ]
+        rows += [
+            {"entity_id": p.entity_id, "name": p.name, "state": p.state,
+             "domain": "media_player", "attributes": {}}
+            for p in self.players
+        ]
+        rows += self.extra_entities
+        return rows
+
+    async def search_entities(self, query: str) -> list[dict]:
+        needle = query.strip().lower()
+        out = []
+        for row in self._all_entities():
+            hay = f"{row['entity_id']} {row['name']}".lower()
+            if not needle or needle in hay or needle == row["domain"]:
+                out.append({k: row[k] for k in ("entity_id", "name", "state", "domain")})
+        return out[:25]
+
+    async def get_entity(self, entity_id: str) -> dict:
+        for row in self._all_entities():
+            if row["entity_id"] == entity_id:
+                return row
+        raise KeyError(f"unknown entity: {entity_id}")
+
+    async def generic_call(self, domain: str, service: str, data: dict) -> None:
+        self.generic_calls.append((domain, service, data))

@@ -80,6 +80,18 @@ class HomeApi(Protocol):
 
     async def media_players(self) -> list[MediaPlayer]: ...
 
+    async def search_entities(self, query: str) -> list[dict]:
+        """Search ALL entities (any domain) by id/name/area/domain fragment."""
+        ...
+
+    async def get_entity(self, entity_id: str) -> dict:
+        """Full state + attributes of one entity."""
+        ...
+
+    async def generic_call(self, domain: str, service: str, data: dict) -> None:
+        """Escape hatch: call any (allowed) Home Assistant service."""
+        ...
+
     async def play_music(
         self,
         entity_id: str,

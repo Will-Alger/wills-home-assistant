@@ -129,6 +129,37 @@ class HomeAssistantClient:
                     transition=cmd.transition,
                 )
 
+    async def search_entities(self, query: str) -> list[dict]:
+        """HomeApi: fragment search across every entity in the house."""
+        needle = query.strip().lower()
+        results = []
+        for s in await self.states():
+            haystack = f"{s.entity_id} {s.friendly_name} {s.attributes.get('area', '')}".lower()
+            if not needle or needle in haystack or needle == s.domain:
+                results.append(
+                    {
+                        "entity_id": s.entity_id,
+                        "name": s.friendly_name,
+                        "state": s.state,
+                        "domain": s.domain,
+                    }
+                )
+        return results[:25]
+
+    async def get_entity(self, entity_id: str) -> dict:
+        resp = await self._http.get(f"/api/states/{entity_id}")
+        self._check(resp)
+        payload = resp.json()
+        return {
+            "entity_id": payload["entity_id"],
+            "state": payload["state"],
+            "attributes": payload.get("attributes", {}),
+            "last_changed": payload.get("last_changed"),
+        }
+
+    async def generic_call(self, domain: str, service: str, data: dict) -> None:
+        await self.call_service(domain, service, data, timeout=20.0)
+
     async def media_players(self) -> list[MediaPlayer]:
         """HomeApi: media players. Heuristic: an entity with a `remote.` sibling
         of the same suffix is a TV (pyatv-style); others are music players."""
