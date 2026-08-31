@@ -260,6 +260,69 @@ class Dispatcher:
             job.status = "failed" if event.get("is_error") else "done"
             self._save()  # persist atomically with the status flip (readers race us)
 
+    async def _cmd(self, cmd: list[str] | str, cwd: Path, timeout: float = 300.0) -> tuple[int, str]:
+        if isinstance(cmd, str):
+            proc = await asyncio.create_subprocess_shell(
+                cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+            )
+        else:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+            )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except TimeoutError:
+            proc.kill()
+            return 1, "timed out"
+        return proc.returncode or 0, out.decode(errors="replace")
+
+    async def merge(self, job_id: str) -> str:
+        """Voice-approved merge with gates: done local job, clean main,
+        independent lint+tests on the branch. Pushes on success."""
+        job = self._jobs.get(job_id)
+        if job is None:
+            return f"no job {job_id!r} — see check_work for ids"
+        if job.mode == "cloud":
+            return "cloud jobs land as GitHub pull requests — merge those from the PR page for now"
+        if job.status == "merged":
+            return f"{job.id} is already merged"
+        if job.status != "done":
+            return f"{job.id} is {job.status} — only finished jobs can be merged"
+
+        code, out = await self._cmd(
+            ["git", "status", "--porcelain", "--untracked-files=no"], self._root
+        )
+        if out.strip():
+            return "the main checkout has uncommitted changes — merge blocked until it's clean"
+
+        worktree = Path(job.worktree)
+        if (worktree / "pyproject.toml").exists():
+            for label, check in (
+                ("lint", "uv run ruff check src scripts tests"),
+                ("tests", "uv run pytest -q"),
+            ):
+                code, out = await self._cmd(check, worktree, timeout=600.0)
+                if code != 0:
+                    return f"merge blocked: {label} failed on {job.branch}:\n{out[-500:]}"
+
+        code, out = await self._cmd(
+            ["git", "merge", "--no-ff", job.branch, "-m",
+             f"Merge {job.branch}: {job.title} (voice-approved by owner)"],
+            self._root,
+        )
+        if code != 0:
+            await self._cmd(["git", "merge", "--abort"], self._root)
+            return f"merge conflict — aborted cleanly; a human needs to look:\n{out[-400:]}"
+
+        push_code, push_out = await self._cmd(["git", "push"], self._root)
+        job.status = "merged"
+        self._save()
+        push_note = "" if push_code == 0 else f" (push failed: {push_out[-120:]})"
+        return (
+            f"merged {job.branch} into main and pushed{push_note} — checks passed. "
+            "Offer to restart yourself so the change takes effect."
+        )
+
     def report(self, job_id: str | None = None) -> str:
         jobs = [self._jobs[job_id]] if job_id and job_id in self._jobs else self.jobs()[:5]
         if not jobs:

@@ -123,6 +123,49 @@ async def test_cloud_dispatch_records_session_url(tmp_path) -> None:
     assert again.jobs()[0].status == "running"
 
 
+async def test_voice_merge_with_gates(tmp_path) -> None:
+    repo = make_repo(tmp_path)
+    dispatcher = Dispatcher(
+        repo, claude_cmd=f'"{sys.executable}" "{FAKE_CLAUDE}"', timeout_s=20.0
+    )
+    job = await dispatcher.start("greeting", "greeting")
+    await wait_done(dispatcher, job.id)
+    # simulate the agent's committed work on the branch
+    wt = Path(job.worktree)
+    (wt / "GREETING.md").write_text("hello", encoding="utf-8")
+    await dispatcher._cmd(["git", "add", "-A"], wt)
+    await dispatcher._cmd(["git", "commit", "-m", "add greeting"], wt)
+
+    result = await dispatcher.merge(job.id)
+    assert "merged" in result and "restart" in result
+    assert (repo / "GREETING.md").exists()  # landed on main
+    assert dispatcher.jobs()[0].status == "merged"
+    # double-merge refused
+    assert "already merged" in await dispatcher.merge(job.id)
+    # unknown job refused
+    assert "no job" in await dispatcher.merge("nope")
+
+
+async def test_merge_blocked_by_dirty_main(tmp_path) -> None:
+    repo = make_repo(tmp_path)
+    dispatcher = Dispatcher(
+        repo, claude_cmd=f'"{sys.executable}" "{FAKE_CLAUDE}"', timeout_s=20.0
+    )
+    job = await dispatcher.start("x", "x")
+    await wait_done(dispatcher, job.id)
+    (repo / "README.md").write_text("dirty", encoding="utf-8")  # tracked file modified
+    assert "uncommitted changes" in await dispatcher.merge(job.id)
+
+
+def test_stop_command_matching() -> None:
+    from assistant.engines.realtime_engine import is_stop_command
+
+    for phrase in ("Alexa stop", "stop", "STOP.", "alexa, stop listening", "be quiet", "shut up"):
+        assert is_stop_command(phrase), phrase
+    for phrase in ("stop the music", "don't stop believing", "stop at the store tomorrow"):
+        assert not is_stop_command(phrase), phrase
+
+
 async def test_failed_agent_is_reported(tmp_path) -> None:
     repo = make_repo(tmp_path)
     dispatcher = Dispatcher(
