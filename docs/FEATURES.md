@@ -37,7 +37,7 @@ closest legitimate thing to "just pair it to Apple Home."
 
 | Feature | Approach | Milestone | Cost | Status |
 | --- | --- | --- | --- | --- |
-| Control lights via HA | REST client; HAOS VM with bridged NIC (WiZ auto-discovers; manual IP as fallback) | 1 | $0 | testing |
+| Control lights via HA | **DONE 2026-08-31**: HAOS 18.2 in Hyper-V VM (Wi-Fi-bridged eth0 at 192.168.1.114 + host-only eth1 at 172.28.144.50 as backup lane), first Matter bulb (light.living_room_plant_light_1, shared from Apple Home) ran the full color demo, visually confirmed. Gotchas recorded in README: port 80 on new HAOS, use IP not .local, post-onboarding update downtime | 1 | $0 | **done** |
 | LLM brain, no canned routines | Claude tool use (`claude-opus-5`, effort low), swappable provider interface; batched area-aware `set_lights`; end-of-turn intent via structured output; refusal fallbacks on | 2 | ~1–3¢/command (meter will tell) | testing |
 | Cost meter, caching, low effort | per-hop cost + latency, `.usage.jsonl` log, session totals in REPL; static prefix cached (1 h TTL), live state via tool | 2 | saves money | testing |
 | Audio-reality spike | `scripts/m3_spike.py`: device list, live score monitor (detections/hour stats), wav capture. First datapoint (2026-08-31, Blue Snowball, quiet room, 45 s): 0 false accepts, noise floor 0.01. Will runs the TV/music + say-it-10× protocol | 2.5 | $0 | testing |

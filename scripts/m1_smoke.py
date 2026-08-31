@@ -52,7 +52,9 @@ async def run(args: argparse.Namespace) -> int:
         if not await ha.api_alive():
             console.print(
                 f"[red]Cannot reach Home Assistant at {settings.ha_url}.[/red] "
-                "Is the container running? Try: docker compose up -d"
+                "Is the HAOS VM running? Note: new HAOS installs (2026.8+) serve "
+                "on port 80 — HA_URL usually needs no :8123. Prefer the VM's IP "
+                "over homeassistant.local (Python can't always resolve .local)."
             )
             return 1
         console.print(f"[green]✓[/green] Home Assistant API is up at {settings.ha_url}")

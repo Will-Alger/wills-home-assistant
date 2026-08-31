@@ -63,7 +63,7 @@ none of the pipeline.
 
 | # | Deliverable | Status |
 | - | ----------- | ------ |
-| 1 | **Lights, no voice** — HAOS in a Hyper-V VM, bulbs controlled from Python via REST | ⏳ testing |
+| 1 | **Lights, no voice** — HAOS in a Hyper-V VM, bulbs controlled from Python via REST | ✅ 2026-08-31 (Matter bulb, full color demo) |
 | 2 | **Brain, no audio** — text REPL → LLM with tools → HA ("get the room ready for a party", typed) | ⏳ testing |
 | 3 | **Ears** — mic layer, openWakeWord, streaming STT; wake → transcript | ⏳ testing |
 | 4 | **Mouth** — voice-engine bake-off: OpenAI Realtime engine behind our wake word + tools (live-verified); ElevenLabs streaming pipeline as alternate engine | ⏳ testing |
@@ -102,7 +102,12 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_haos_vm.ps1
 
 1. **Onboard HA**: after the VM boots (first boot takes minutes), open
    <http://homeassistant.local:8123>, create the owner account, set
-   location/timezone. Put that URL in `.env` as `HA_URL`.
+   location/timezone. ⚠ Hard-won notes: new HAOS installs (2026.8+) end up
+   serving on **port 80** (no :8123) once updated; put the VM's **IP** in
+   `.env` as `HA_URL` (HA → Settings → System → Network — Python can't
+   always resolve .local names); and expect a post-onboarding update +
+   restart cycle where the UI goes dark for 5–10 minutes ("Core:
+   landingpage" on the VM console = it's downloading, not broken).
 2. **Add the WiZ bulbs**: with the bridged VM they should be auto-discovered
    (*Settings → Devices & services* shows them as "Discovered"). If not, add
    the WiZ integration manually with each bulb's IP (router DHCP list or the
