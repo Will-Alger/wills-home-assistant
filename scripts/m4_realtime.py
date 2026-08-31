@@ -126,7 +126,11 @@ def build_engine(fake: bool):
         extra_instructions=settings.assistant_extra_instructions,
         memory=memory,
         dispatcher=(
-            Dispatcher(Path(__file__).resolve().parents[1])
+            Dispatcher(
+                Path(__file__).resolve().parents[1],
+                routine_id=settings.claude_routine_id,
+                routine_token=settings.claude_routine_token,
+            )
             if settings.use_claude_subscription
             else None
         ),

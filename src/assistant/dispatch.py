@@ -56,6 +56,8 @@ class Job:
     session_id: str = ""  # `claude --resume <id>` opens the full transcript
     cost_usd: float = 0.0
     last_activity: str = ""  # latest agent utterance, for live progress
+    mode: str = "local"  # "local" (worktree) or "cloud" (claude.ai/code session)
+    session_url: str = ""  # cloud jobs: open/continue at this claude.ai/code URL
 
 
 class DispatchError(RuntimeError):
@@ -71,10 +73,14 @@ class Dispatcher:
             "claude -p --output-format stream-json --verbose --dangerously-skip-permissions"
         ),
         timeout_s: float = 1500.0,
+        routine_id: str = "",
+        routine_token: str = "",
     ) -> None:
         self._root = root
         self._claude_cmd = claude_cmd
         self._timeout_s = timeout_s
+        self._routine_id = routine_id
+        self._routine_token = routine_token
         self._jobs_path = root / "data" / "jobs.json"
         self._jobs: dict[str, Job] = {}
         self._tasks: list[asyncio.Task] = []
@@ -85,7 +91,8 @@ class Dispatcher:
             return
         for row in json.loads(self._jobs_path.read_text(encoding="utf-8")):
             job = Job(**row)
-            if job.status == "running":  # app restarted mid-job
+            # Local jobs die with the app; cloud sessions keep running remotely.
+            if job.status == "running" and job.mode == "local":
                 job.status = "interrupted"
             self._jobs[job.id] = job
 
@@ -98,7 +105,52 @@ class Dispatcher:
     def jobs(self) -> list[Job]:
         return sorted(self._jobs.values(), key=lambda j: j.started, reverse=True)
 
+    @property
+    def cloud_enabled(self) -> bool:
+        return bool(self._routine_id and self._routine_token)
+
     async def start(self, request: str, title: str) -> Job:
+        if self.cloud_enabled:
+            return await self._start_cloud(request, title)
+        return await self._start_local(request, title)
+
+    async def _start_cloud(self, request: str, title: str) -> Job:
+        """Fire the dispatch routine: a claude.ai/code cloud session Will can
+        open, watch live, and continue in any Claude Code surface."""
+        import httpx
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"https://api.anthropic.com/v1/claude_code/routines/{self._routine_id}/fire",
+                headers={
+                    "Authorization": f"Bearer {self._routine_token}",
+                    "anthropic-beta": "experimental-cc-routine-2026-04-01",
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                },
+                json={"text": f"TASK ({title}): {request}"},
+            )
+        if resp.status_code >= 400:
+            raise DispatchError(f"routine fire failed ({resp.status_code}): {resp.text[:300]}")
+        payload = resp.json()
+        job = Job(
+            id=f"cloud-{uuid.uuid4().hex[:6]}",
+            title=title,
+            request=request,
+            status="running",
+            branch="(cloud session — lands as a GitHub branch/PR)",
+            worktree="",
+            started=time.time(),
+            mode="cloud",
+            session_id=str(payload.get("claude_code_session_id", "")),
+            session_url=str(payload.get("claude_code_session_url", "")),
+            summary="running in the cloud — open the session URL to watch or continue",
+        )
+        self._jobs[job.id] = job
+        self._save()
+        return job
+
+    async def _start_local(self, request: str, title: str) -> Job:
         slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:32] or "task"
         slug = f"{slug}-{uuid.uuid4().hex[:6]}"
         worktree = self._root / ".worktrees" / slug
@@ -226,7 +278,9 @@ class Dispatcher:
             }
             if j.status == "running" and j.last_activity:
                 entry["currently"] = j.last_activity
-            if j.session_id:
+            if j.mode == "cloud" and j.session_url:
+                entry["open_live"] = j.session_url  # web, desktop app, or phone
+            elif j.session_id:
                 entry["full_transcript"] = f"claude --resume {j.session_id} (run in a terminal)"
             out.append(entry)
         return json.dumps(out)

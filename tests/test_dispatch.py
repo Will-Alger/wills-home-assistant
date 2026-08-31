@@ -88,6 +88,41 @@ async def test_interrupted_jobs_marked_on_restart(tmp_path) -> None:
     assert dispatcher.jobs()[0].status == "interrupted"
 
 
+async def test_cloud_dispatch_records_session_url(tmp_path) -> None:
+    repo = make_repo(tmp_path)
+
+    class CloudDispatcher(Dispatcher):
+        async def _start_cloud(self, request: str, title: str):
+            # emulate the routine /fire response handling without HTTP
+            import time as _t
+            import uuid as _u
+
+            from assistant.dispatch import Job
+
+            job = Job(
+                id=f"cloud-{_u.uuid4().hex[:6]}", title=title, request=request,
+                status="running", branch="(cloud session — lands as a GitHub branch/PR)",
+                worktree="", started=_t.time(), mode="cloud",
+                session_id="session_01TEST", session_url="https://claude.ai/code/session_01TEST",
+                summary="running in the cloud",
+            )
+            self._jobs[job.id] = job
+            self._save()
+            return job
+
+    dispatcher = CloudDispatcher(repo, routine_id="trig_x", routine_token="tok_x")
+    assert dispatcher.cloud_enabled
+    job = await dispatcher.start("build the thing", "the thing")
+    assert job.mode == "cloud" and "claude.ai/code" in job.session_url
+
+    report = json.loads(dispatcher.report())
+    assert report[0]["open_live"] == "https://claude.ai/code/session_01TEST"
+
+    # restart must NOT mark cloud jobs interrupted — they run server-side
+    again = Dispatcher(repo, claude_cmd="unused")
+    assert again.jobs()[0].status == "running"
+
+
 async def test_failed_agent_is_reported(tmp_path) -> None:
     repo = make_repo(tmp_path)
     dispatcher = Dispatcher(

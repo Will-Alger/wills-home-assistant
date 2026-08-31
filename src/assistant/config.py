@@ -45,6 +45,12 @@ class Settings(BaseSettings):
     # Claude Code CLI = billed to the Max SUBSCRIPTION, not API tokens.
     # Set false to fall back to the API key below.
     use_claude_subscription: bool = True
+    # Cloud dispatch (preferred when set): a claude.ai/code "routine" for this
+    # repo — dispatched jobs become LIVE cloud sessions you can open in the
+    # web/desktop app/phone. Create at claude.ai/code/routines (API trigger),
+    # then paste the routine id (trig_...) and its bearer token here.
+    claude_routine_id: str = ""
+    claude_routine_token: str = ""
 
     # Milestone 2: LLM
     anthropic_api_key: str = ""
