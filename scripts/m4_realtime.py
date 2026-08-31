@@ -25,7 +25,7 @@ from assistant.audio import tones
 from assistant.audio.mic import Microphone, describe_device
 from assistant.audio.speaker import Speaker
 from assistant.config import load_settings
-from assistant.dispatch import Dispatcher
+from assistant.dispatch import Dispatcher, load_extra_routines
 from assistant.engines.realtime_engine import (
     FRAME_SAMPLES_24K,
     REALTIME_RATE,
@@ -130,6 +130,7 @@ def build_engine(fake: bool):
                 Path(__file__).resolve().parents[1],
                 routine_id=settings.claude_routine_id,
                 routine_token=settings.claude_routine_token,
+                extra_routines=load_extra_routines(Path(__file__).resolve().parents[1]),
             )
             if settings.use_claude_subscription
             else None

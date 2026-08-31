@@ -88,32 +88,41 @@ async def test_interrupted_jobs_marked_on_restart(tmp_path) -> None:
     assert dispatcher.jobs()[0].status == "interrupted"
 
 
+class FakeCloudDispatcher(Dispatcher):
+    """Emulates the routine /fire response handling without HTTP; records
+    which (routine_id, token) each dispatch would have fired."""
+
+    fired: list[tuple[str, str]]
+
+    async def _start_cloud(self, request, title, routine_id, token, repo=""):
+        import time as _t
+        import uuid as _u
+
+        from assistant.dispatch import Job
+
+        if not hasattr(self, "fired"):
+            self.fired = []
+        self.fired.append((routine_id, token))
+        job = Job(
+            id=f"cloud-{_u.uuid4().hex[:6]}", title=title, request=request,
+            status="running", branch="(cloud session — lands as a GitHub branch/PR)",
+            worktree="", started=_t.time(), mode="cloud",
+            session_id="session_01TEST", session_url="https://claude.ai/code/session_01TEST",
+            summary="running in the cloud", repo=repo,
+        )
+        self._jobs[job.id] = job
+        self._save()
+        return job
+
+
 async def test_cloud_dispatch_records_session_url(tmp_path) -> None:
     repo = make_repo(tmp_path)
 
-    class CloudDispatcher(Dispatcher):
-        async def _start_cloud(self, request: str, title: str):
-            # emulate the routine /fire response handling without HTTP
-            import time as _t
-            import uuid as _u
-
-            from assistant.dispatch import Job
-
-            job = Job(
-                id=f"cloud-{_u.uuid4().hex[:6]}", title=title, request=request,
-                status="running", branch="(cloud session — lands as a GitHub branch/PR)",
-                worktree="", started=_t.time(), mode="cloud",
-                session_id="session_01TEST", session_url="https://claude.ai/code/session_01TEST",
-                summary="running in the cloud",
-            )
-            self._jobs[job.id] = job
-            self._save()
-            return job
-
-    dispatcher = CloudDispatcher(repo, routine_id="trig_x", routine_token="tok_x")
+    dispatcher = FakeCloudDispatcher(repo, routine_id="trig_x", routine_token="tok_x")
     assert dispatcher.cloud_enabled
     job = await dispatcher.start("build the thing", "the thing")
     assert job.mode == "cloud" and "claude.ai/code" in job.session_url
+    assert dispatcher.fired == [("trig_x", "tok_x")]  # own routine, own creds
 
     report = json.loads(dispatcher.report())
     assert report[0]["open_live"] == "https://claude.ai/code/session_01TEST"
@@ -121,6 +130,58 @@ async def test_cloud_dispatch_records_session_url(tmp_path) -> None:
     # restart must NOT mark cloud jobs interrupted — they run server-side
     again = Dispatcher(repo, claude_cmd="unused")
     assert again.jobs()[0].status == "running"
+
+
+async def test_multi_repo_dispatch_routes_to_that_repos_routine(tmp_path) -> None:
+    repo = make_repo(tmp_path)
+    dispatcher = FakeCloudDispatcher(
+        repo,
+        routine_id="trig_self",
+        routine_token="tok_self",
+        extra_routines={"my-side-project": {"routine_id": "trig_side", "token": "tok_side"}},
+    )
+    assert dispatcher.extra_repo_names() == ["my-side-project"]
+
+    job = await dispatcher.start("fix the readme", "readme fix", repo="my side project")
+    assert job.repo == "my side project" and job.mode == "cloud"
+    assert dispatcher.fired == [("trig_side", "tok_side")]  # that repo's creds, not hers
+
+    # own-repo aliases still use her own routine
+    await dispatcher.start("tweak", "tweak", repo="self")
+    assert dispatcher.fired[-1] == ("trig_self", "tok_self")
+
+    report = json.loads(dispatcher.report())
+    assert {e["repo"] for e in report} == {"my side project", "own repo"}
+
+
+async def test_unknown_repo_fails_with_the_configured_list(tmp_path) -> None:
+    import pytest
+
+    from assistant.dispatch import DispatchError, load_extra_routines
+
+    repo = make_repo(tmp_path)
+    dispatcher = FakeCloudDispatcher(
+        repo,
+        routine_id="trig_self",
+        routine_token="tok_self",
+        extra_routines={"my-side-project": {"routine_id": "trig_side", "token": "tok_side"}},
+    )
+    with pytest.raises(DispatchError, match="my-side-project"):
+        await dispatcher.start("do stuff", "stuff", repo="nonexistent-repo")
+
+    # registry loader: valid entries only, absent/broken file -> empty
+    assert load_extra_routines(repo) == {}
+    (repo / "data").mkdir(exist_ok=True)
+    (repo / "data" / "routines.json").write_text(
+        json.dumps(
+            {
+                "good-repo": {"routine_id": "trig_a", "token": "tok_a"},
+                "missing-token": {"routine_id": "trig_b"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert list(load_extra_routines(repo)) == ["good-repo"]
 
 
 async def test_voice_merge_with_gates(tmp_path) -> None:

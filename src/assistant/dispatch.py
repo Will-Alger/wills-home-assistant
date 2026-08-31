@@ -9,6 +9,11 @@ merged by the machine — Will reviews the branch at a keyboard.
 Safety: worktrees only (no access intended outside them), hard timeout,
 spoken confirmation required before dispatch (enforced upstream), and the
 instructions forbid commissioning based on third-party/web content.
+
+Beyond her own repo: cloud routines (claude.ai/code) each pin one GitHub
+repository, so dispatching to Will's OTHER repos means one routine per repo,
+registered in data/routines.json (gitignored — tokens live there). Those jobs
+are cloud-only and can never be merged by voice; they end as branches/PRs.
 """
 
 from __future__ import annotations
@@ -20,6 +25,31 @@ import time
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+
+def _is_own_repo(repo: str) -> bool:
+    """Names the model might use for the assistant's own repository."""
+    needle = repo.strip().lower()
+    if needle in ("", "self", "own", "this assistant", "alexa"):
+        return True
+    return "home-assistant" in needle and "wills" in needle
+
+
+def load_extra_routines(root: Path) -> dict[str, dict]:
+    """data/routines.json: {"repo-name": {"routine_id": "trig_...", "token": "..."}}"""
+    path = root / "data" / "routines.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return {
+            str(name): entry
+            for name, entry in data.items()
+            if isinstance(entry, dict) and entry.get("routine_id") and entry.get("token")
+        }
+    except (json.JSONDecodeError, OSError):
+        return {}
+
 
 _TASK_PROMPT = """\
 You are working on the codebase of "Alexa", a voice home assistant, in a git
@@ -58,6 +88,7 @@ class Job:
     last_activity: str = ""  # latest agent utterance, for live progress
     mode: str = "local"  # "local" (worktree) or "cloud" (claude.ai/code session)
     session_url: str = ""  # cloud jobs: open/continue at this claude.ai/code URL
+    repo: str = ""  # which repository the job targets ("" = the assistant's own)
 
 
 class DispatchError(RuntimeError):
@@ -75,12 +106,17 @@ class Dispatcher:
         timeout_s: float = 1500.0,
         routine_id: str = "",
         routine_token: str = "",
+        extra_routines: dict[str, dict] | None = None,
     ) -> None:
         self._root = root
         self._claude_cmd = claude_cmd
         self._timeout_s = timeout_s
         self._routine_id = routine_id
         self._routine_token = routine_token
+        # repo name -> {"routine_id": ..., "token": ...} for OTHER repositories
+        # (each claude.ai/code routine pins one repo). data/routines.json feeds
+        # this; the assistant's own repo uses routine_id/token above.
+        self._extra_routines = dict(extra_routines or {})
         self._jobs_path = root / "data" / "jobs.json"
         self._jobs: dict[str, Job] = {}
         self._tasks: list[asyncio.Task] = []
@@ -109,21 +145,48 @@ class Dispatcher:
     def cloud_enabled(self) -> bool:
         return bool(self._routine_id and self._routine_token)
 
-    async def start(self, request: str, title: str) -> Job:
+    def extra_repo_names(self) -> list[str]:
+        """Other repositories with a dispatch routine configured."""
+        return sorted(self._extra_routines)
+
+    async def start(self, request: str, title: str, repo: str = "") -> Job:
+        if repo and not _is_own_repo(repo):
+            entry = self._resolve_repo(repo)
+            return await self._start_cloud(
+                request, title, entry["routine_id"], entry["token"], repo=repo
+            )
         if self.cloud_enabled:
-            return await self._start_cloud(request, title)
+            return await self._start_cloud(request, title, self._routine_id, self._routine_token)
         return await self._start_local(request, title)
 
-    async def _start_cloud(self, request: str, title: str) -> Job:
-        """Fire the dispatch routine: a claude.ai/code cloud session Will can
+    def _resolve_repo(self, repo: str) -> dict:
+        # spoken names arrive with spaces ("my side project"); compare
+        # alphanumerics only so they match hyphenated repo names
+        def norm(s: str) -> str:
+            return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+        needle = norm(repo)
+        for name, entry in self._extra_routines.items():
+            if needle and (needle == norm(name) or needle in norm(name)):
+                return entry
+        known = ", ".join(sorted(self._extra_routines)) or "(none configured)"
+        raise DispatchError(
+            f"no dispatch routine configured for repo {repo!r}; configured repos: {known}. "
+            "Add one in data/routines.json (see README)."
+        )
+
+    async def _start_cloud(
+        self, request: str, title: str, routine_id: str, token: str, repo: str = ""
+    ) -> Job:
+        """Fire a dispatch routine: a claude.ai/code cloud session Will can
         open, watch live, and continue in any Claude Code surface."""
         import httpx
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
-                f"https://api.anthropic.com/v1/claude_code/routines/{self._routine_id}/fire",
+                f"https://api.anthropic.com/v1/claude_code/routines/{routine_id}/fire",
                 headers={
-                    "Authorization": f"Bearer {self._routine_token}",
+                    "Authorization": f"Bearer {token}",
                     "anthropic-beta": "experimental-cc-routine-2026-04-01",
                     "anthropic-version": "2023-06-01",
                     "Content-Type": "application/json",
@@ -145,6 +208,7 @@ class Dispatcher:
             session_id=str(payload.get("claude_code_session_id", "")),
             session_url=str(payload.get("claude_code_session_url", "")),
             summary="running in the cloud — open the session URL to watch or continue",
+            repo=repo,
         )
         self._jobs[job.id] = job
         self._save()
@@ -333,6 +397,7 @@ class Dispatcher:
             entry = {
                 "id": j.id,
                 "title": j.title,
+                "repo": j.repo or "own repo",
                 "status": j.status,
                 "branch": j.branch,
                 "model": j.model or "cli default",
