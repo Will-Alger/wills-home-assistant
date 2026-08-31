@@ -185,6 +185,15 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "input_schema": {"type": "object", "properties": {}},
     },
     {
+        "name": "read_history",
+        "description": (
+            "Read the story of your own creation (docs/HISTORY.md) — how and "
+            "why you were built, the key decisions and moments. Use when asked "
+            "about your origins or the reasoning behind your design."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "launch_app",
         "description": (
             "Open an app on the TV (see the TV's app list in your instructions), "
@@ -280,6 +289,9 @@ class ToolExecutor:
             if name == "read_roadmap":
                 roadmap = (REPO_ROOT / "docs" / "FEATURES.md").read_text(encoding="utf-8")
                 return roadmap[:10_000], False
+            if name == "read_history":
+                history = (REPO_ROOT / "docs" / "HISTORY.md").read_text(encoding="utf-8")
+                return history[:10_000], False
             if name == "launch_app":
                 player = await self._resolve_player(tool_input.get("player"), kind="tv")
                 await self._wake_tv_if_off()
