@@ -60,8 +60,11 @@ none of the pipeline.
 | 2 | **Brain, no audio** — text REPL → LLM with tools → HA ("get the room ready for a party", typed) | |
 | 3 | **Ears** — mic layer, openWakeWord, streaming STT; wake → transcript | |
 | 4 | **Mouth** — ElevenLabs streaming TTS; full voice loop | |
-| 5 | **Music & media** — Spotify / Apple TV tools (likely via Music Assistant + AirPlay) | |
-| 6 | **Pi & polish** — barge-in, custom wake phrase, custom voice clone, Raspberry Pi deployment | |
+| 5 | **Music & media** — Spotify / Apple TV tools (likely via Music Assistant + AirPlay); stretch: YouTube search → play on Apple TV | |
+| 6 | **Tool belt** — web search (Anthropic server-side tool), Apple Calendar events (iCloud CalDAV), long-term memory (local store behind remember/recall tools) | |
+| 7 | **Voice ID** — local speaker embeddings (enroll Will's voiceprint); gates personal memories. Personalization, not security | |
+| 8 | **Satellites & Pi** — client/server split (thin mic/speaker/wake satellites → central brain), multi-device wake arbitration (closest responds), barge-in, custom wake phrase, custom voice clone | |
+| 9 | **Claude dispatch** — voice-launch Claude Code tasks on the desktop (Agent SDK, headless, own worktree + constrained permissions, voice-ID-gated) and voice status checks on projects/sessions | |
 
 ## Setup
 
