@@ -56,8 +56,8 @@ none of the pipeline.
 
 | # | Deliverable | Status |
 | - | ----------- | ------ |
-| 1 | **Lights, no voice** — HA running in Docker, bulbs controlled from Python via REST | ⏳ testing |
-| 2 | **Brain, no audio** — text REPL → LLM with tools → HA ("get the room ready for a party", typed) | |
+| 1 | **Lights, no voice** — HAOS in a Hyper-V VM, bulbs controlled from Python via REST | ⏳ testing |
+| 2 | **Brain, no audio** — text REPL → LLM with tools → HA ("get the room ready for a party", typed) | ⏳ testing |
 | 3 | **Ears** — mic layer, openWakeWord, streaming STT; wake → transcript | |
 | 4 | **Mouth** — ElevenLabs streaming TTS; full voice loop | |
 | 5 | **Music & media** — Spotify / Apple TV tools (likely via Music Assistant + AirPlay); stretch: YouTube search → play on Apple TV | |
@@ -71,7 +71,7 @@ backlog: [docs/FEATURES.md](docs/FEATURES.md).
 
 ## Setup
 
-Prereqs: Docker Desktop (running), [uv](https://docs.astral.sh/uv/), git.
+Prereqs: [uv](https://docs.astral.sh/uv/), git, Hyper-V (Windows 11 Pro).
 uv for a .NET person: `uv sync` ≈ `dotnet restore` (also provisions the right
 Python), `uv run x` ≈ `dotnet run` — you never activate a venv or touch the
 system Python.
@@ -79,28 +79,40 @@ system Python.
 ```powershell
 uv sync
 copy .env.example .env     # then edit .env — see comments in the file
-docker compose up -d       # Home Assistant on http://localhost:8123
+```
+
+Home Assistant runs as **HAOS in a Hyper-V VM** (bridged NIC = real LAN peer,
+so mDNS discovery, Matter, and AirPlay all work — Docker Desktop on Windows
+can't deliver multicast, which blocks all three; `docker-compose.yml` remains
+only as a Linux/Pi-era fallback):
+
+```powershell
+# elevated PowerShell:
+powershell -ExecutionPolicy Bypass -File scripts\setup_haos_vm.ps1
 ```
 
 ## Milestone 1 runbook: "HA sees and controls my lights"
 
-1. **Onboard HA**: open <http://localhost:8123>, create the owner account, set
-   location/timezone.
-2. **Add the WiZ bulbs** — auto-discovery does not work in Docker on Windows
-   (the container never sees LAN broadcast/mDNS traffic), so add them by IP:
-   find each bulb's IP in your router's DHCP client list or the WiZ app
-   (device → settings), ideally give them DHCP reservations, then in HA:
-   *Settings → Devices & services → Add integration → WiZ* → enter the IP.
-3. **The Linkind/AiDot (Matter) bulbs are a known gap on Windows Docker**:
-   joining a Matter fabric needs a Matter server with real host networking +
-   IPv6 multicast, which Docker Desktop cannot provide. Options: run HAOS in a
-   Hyper-V/VirtualBox VM with a bridged NIC now, or wait for the Raspberry Pi
-   (where `network_mode: host` makes discovery, Matter, and AirPlay all work).
-   Milestone 1 counts with WiZ only.
-4. **Create the API token**: click your user (bottom-left) → *Security* tab →
+1. **Onboard HA**: after the VM boots (first boot takes minutes), open
+   <http://homeassistant.local:8123>, create the owner account, set
+   location/timezone. Put that URL in `.env` as `HA_URL`.
+2. **Add the WiZ bulbs**: with the bridged VM they should be auto-discovered
+   (*Settings → Devices & services* shows them as "Discovered"). If not, add
+   the WiZ integration manually with each bulb's IP (router DHCP list or the
+   WiZ app; give them DHCP reservations either way).
+3. **Matter bulbs (Linkind/AiDot)**: install the Matter Server add-on
+   (*Settings → Add-ons*), then share the bulbs from Apple Home (they stay in
+   Apple Home — Matter multi-admin): *Settings → Devices & services → Add
+   integration → Matter*, choose "the device is already in use", follow the
+   share-code flow from the iPhone. Treat this as a stretch step — WiZ alone
+   completes M1.
+4. **Name and place everything** (required, not cosmetic): give every light a
+   human name and an **area** in the HA UI — the brain reasons in rooms, and
+   the API exposes no room data for unassigned entities.
+5. **Create the API token**: click your user (bottom-left) → *Security* tab →
    *Long-lived access tokens* → create one, paste into `.env` as `HA_TOKEN`
    (it's shown only once).
-5. **Prove it from Python**:
+6. **Prove it from Python**:
 
    ```powershell
    uv run scripts/m1_smoke.py                        # health check + list lights
@@ -108,17 +120,46 @@ docker compose up -d       # Home Assistant on http://localhost:8123
    uv run scripts/m1_smoke.py --entity light.<id> --off
    ```
 
-**Done when** the listing shows your bulbs and `--demo` visibly cycles one.
+**Done when** the listing shows your bulbs with areas and `--demo` cycles one.
+
+## Milestone 2 runbook: the brain (no audio)
+
+Typed commands → LLM with tools → lights. Works two ways:
+
+```powershell
+uv run scripts/m2_repl.py --fake    # in-memory 5-light apartment; no HA needed
+uv run scripts/m2_repl.py           # against your real Home Assistant (after M1)
+```
+
+Needs `ANTHROPIC_API_KEY` in `.env` (console.anthropic.com → API keys).
+Try: "turn off the hallway", "make the living room cozy", "get the apartment
+ready for a party", "is the bedroom light on?". Each reply prints the
+end-of-turn intent (`close` / `listen` / `confirm_close` — what the mic will
+do once audio exists) and a meter line: hops, latency, tokens, cache
+warm/cold, cost for the command and the session (also logged to
+`.usage.jsonl`). Notes: replies come through the API's refusal-fallback
+routing so a safety decline degrades gracefully instead of dead-ending; run
+the live evals with `$env:RUN_EVALS="1"; uv run pytest tests/test_evals.py`
+(costs cents).
+
+**Done when** party mode does something sensible to the fake apartment (and
+later the real one), and the meter numbers look sane to you.
 
 ## Layout
 
 ```
-docker-compose.yml       Home Assistant container (config in a named Docker volume)
+scripts/setup_haos_vm.ps1   creates the HAOS Hyper-V VM (elevated PowerShell)
+docker-compose.yml          fallback: HA container for Linux/Pi hosts
 src/assistant/
-  config.py              all settings/secrets, loaded from .env — nothing hardcoded
-  home/                  Home Assistant REST client
-  llm/  stt/  tts/  audio/   (arrive with their milestones)
-scripts/m1_smoke.py      milestone-1 proof: list + control lights, zero voice
+  config.py                 all settings/secrets from .env — nothing hardcoded
+  home/                     HomeApi protocol, real HA client, fake apartment
+  llm/                      provider interface + Anthropic adapter
+  brain/                    agent loop, tools, system prompt, intents
+  meter.py                  per-hop cost + latency, logs to .usage.jsonl
+  stt/  tts/  audio/        (arrive with milestones 3–4)
+scripts/m1_smoke.py         M1 proof: list + control lights, zero voice
+scripts/m2_repl.py          M2 proof: typed commands → LLM tools → lights
+tests/                      free stub tests + opt-in live evals (RUN_EVALS=1)
 ```
 
 ## Secrets

@@ -22,9 +22,9 @@ Claude Code dispatch runs anyway); pipeline code stays host-agnostic.
 
 | Feature | Approach | Milestone | Cost | Status |
 | --- | --- | --- | --- | --- |
-| Control lights via HA | REST client + WiZ manual-IP setup | 1 | $0 | testing |
-| LLM brain, no canned routines | Claude tool use (`claude-opus-5`), swappable to OpenAI | 2 | ~1–3¢/command | planned |
-| Cost meter, caching, low effort | log usage tokens per command; prompt-cache system+tools+device list | 2 | saves money | planned |
+| Control lights via HA | REST client; HAOS VM with bridged NIC (WiZ auto-discovers; manual IP as fallback) | 1 | $0 | testing |
+| LLM brain, no canned routines | Claude tool use (`claude-opus-5`, effort low), swappable provider interface; batched area-aware `set_lights`; end-of-turn intent via structured output; refusal fallbacks on | 2 | ~1–3¢/command (meter will tell) | testing |
+| Cost meter, caching, low effort | per-hop cost + latency, `.usage.jsonl` log, session totals in REPL; static prefix cached (1 h TTL), live state via tool | 2 | saves money | testing |
 | Audio-reality spike | record the real mic in the real room; measure openWakeWord false accepts/misses vs quiet / TV / Spotify **before** building M3 around it (review finding: this is where identical projects die) | 2.5 | $0 | planned |
 | Wake-word activation | openWakeWord, local (Porcupine free tier is dead; project is dormant — we own any Windows/ONNX friction) | 3 | $0 | planned |
 | Streaming STT | Deepgram Flux (semantic end-of-turn); swappable adapter | 3 | ~0.1¢/command ($200 credit first) | planned |
@@ -38,8 +38,8 @@ Claude Code dispatch runs anyway); pipeline code stays host-agnostic.
 | Feature | Approach | Milestone | Cost | Status |
 | --- | --- | --- | --- | --- |
 | "Party mode"-style reasoning | emergent from M2 tools — the whole point | 2 | — | planned |
-| Matter bulbs (Linkind/AiDot) | blocked on Windows Docker; needs HAOS VM (Hyper-V, bridged NIC) or a future Pi host | TBD | $0 | idea |
-| Spotify → Apple TV speakers | Music Assistant + AirPlay (stock Spotify integration can't start AirPlay playback); needs Premium + dev app. ⚠ AirPlay discovery is mDNS — **blocked under Docker Desktop exactly like Matter**; hangs on the platform decision below | 5 | $0 | planned |
+| Matter bulbs (Linkind/AiDot) | unblocked by the HAOS VM: Matter Server add-on + share from Apple Home (multi-admin, no unpairing) — M1 stretch step | 1 | $0 | planned |
+| Spotify → Apple TV speakers | Music Assistant + AirPlay (stock Spotify integration can't start AirPlay playback); needs Premium + dev app. mDNS discovery works from the bridged HAOS VM (was blocked under Docker) | 5 | $0 | planned |
 | YouTube search → play on Apple TV | YouTube Data API (free) for search; deep-link via pyatv/HA app launch — experimental; fallback: launch app + remote | 5 stretch | $0 | idea |
 
 ## Assistant intelligence
@@ -49,6 +49,7 @@ Claude Code dispatch runs anyway); pipeline code stays host-agnostic.
 | Web search ("google it") | Anthropic server-side `web_search` tool — declare it, zero code | 6 | ~$10/1k searches | planned |
 | Apple Calendar events | iCloud CalDAV + app-specific password (HA CalDAV or Python `caldav` — verify create-event support when building) | 6 | $0 | planned |
 | Long-term memory | local SQLite behind remember/recall tools (Anthropic memory-tool shape) | 6 | pennies | planned |
+| Preferences (learned + told) | preferences are memories with voice CRUD: "from now on when I ask X, do Y", "what are my preferences?", "forget that". Stored prefs render into the cached system prefix (rare changes = one cache miss each). ⚠ scope note: "when I *ask* X" works via prompt; "when X *happens*" is event-triggered automation and needs the assistant subscribed to HA's event stream — separate, later feature | 6 | pennies | idea |
 | Voice ID | local speaker embeddings (SpeechBrain ECAPA), enroll Will once, cosine-match per command. Personalization, NOT security — this project literally clones voices | 7 | $0 | idea |
 | Sensitive memories gated by voice ID | **re-scoped by review**: far-field 1–3 s speaker match has error rates too high to gate data, and our own TTS clone defeats it. Voice ID routes *preferences* (whose Spotify/calendar); nothing goes into memory that a houseguest shouldn't extract by voice; truly private recall would need a non-voice factor (phone push / button) | 7 | $0 | idea |
 
@@ -120,11 +121,11 @@ Added after the 2026-08-30 adversarial review:
 
 ## Open questions
 
-- **Platform (decides M5's fate, not just the Matter bulbs) — awaiting Will's call:**
-  HAOS in a Hyper-V VM now (review's #1 insisted change: unblocks Matter,
-  AirPlay/Music Assistant, all discovery; autostarts headless and survives
-  host reboots) vs Docker Desktop interim (fastest WiZ-only M1 today, but a
-  guaranteed redo of HA onboarding/entities/token when M5 arrives).
+- **Platform — DECIDED 2026-08-30: HAOS in a Hyper-V VM** (Will delegated;
+  review's #1 insisted change). `scripts/setup_haos_vm.ps1` creates it (Gen 2,
+  Secure Boot off, bridged external switch, per official docs). Unblocks
+  Matter (add-on), AirPlay/Music Assistant, all discovery; autostarts
+  headless. `docker-compose.yml` stays as the Linux/Pi-era fallback.
 - **Default command-path model — DECIDED 2026-08-30: Opus 5 everywhere to
   start** (Will's call: "probably fast enough"). The review's mitigations
   still apply and matter more, not less, on Opus: instant canned ack before

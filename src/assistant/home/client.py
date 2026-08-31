@@ -13,9 +13,22 @@ from typing import Any, Self
 
 import httpx
 
+from assistant.home.base import Light, LightCommand
+
 
 class HomeAssistantError(RuntimeError):
     pass
+
+
+# Renders "entity_id|area name" lines for every entity assigned to an area
+# (directly or via its device). Template functions verified against
+# https://www.home-assistant.io/template-functions/ (areas, area_entities,
+# area_name). POST /api/template returns plain text.
+_AREA_MAP_TEMPLATE = (
+    "{% for a in areas() %}{% for e in area_entities(a) %}"
+    "{{ e }}|{{ area_name(a) }}\n"
+    "{% endfor %}{% endfor %}"
+)
 
 
 @dataclass(frozen=True)
@@ -70,6 +83,50 @@ class HomeAssistantClient:
 
     async def lights(self) -> list[EntityState]:
         return [s for s in await self.states() if s.domain == "light"]
+
+    async def area_map(self) -> dict[str, str]:
+        """entity_id -> area name, for every entity assigned to an area."""
+        resp = await self._http.post("/api/template", json={"template": _AREA_MAP_TEMPLATE})
+        self._check(resp)
+        mapping: dict[str, str] = {}
+        for line in resp.text.splitlines():
+            entity_id, sep, area = line.strip().partition("|")
+            if sep and entity_id:
+                mapping[entity_id] = area
+        return mapping
+
+    async def get_lights(self) -> list[Light]:
+        """HomeApi: registry (name/area/capabilities) merged with live state."""
+        areas = await self.area_map()
+        lights: list[Light] = []
+        for state in await self.lights():
+            attrs = state.attributes
+            brightness = attrs.get("brightness")  # HA reports 0-255 when on
+            lights.append(
+                Light(
+                    entity_id=state.entity_id,
+                    name=state.friendly_name,
+                    area=areas.get(state.entity_id),
+                    color_modes=tuple(attrs.get("supported_color_modes") or ()),
+                    on=None if state.state in ("unavailable", "unknown") else state.state == "on",
+                    brightness_pct=round(brightness / 255 * 100) if brightness else None,
+                )
+            )
+        return sorted(lights, key=lambda light: light.entity_id)
+
+    async def apply(self, commands: list[LightCommand]) -> None:
+        """HomeApi: execute per-entity light commands."""
+        for cmd in commands:
+            if cmd.turn == "off":
+                await self.light_off(cmd.entity_id, transition=cmd.transition)
+            else:
+                await self.light_on(
+                    cmd.entity_id,
+                    brightness_pct=cmd.brightness_pct,
+                    rgb_color=cmd.rgb_color,
+                    color_temp_kelvin=cmd.color_temp_kelvin,
+                    transition=cmd.transition,
+                )
 
     async def call_service(self, domain: str, service: str, data: dict[str, Any]) -> Any:
         resp = await self._http.post(f"/api/services/{domain}/{service}", json=data)

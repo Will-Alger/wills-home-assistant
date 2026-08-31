@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     llm_provider: str = "anthropic"
     llm_model: str = "claude-opus-5"
+    # Thinking depth for the command path. "low" keeps routine commands snappy
+    # and cheap; raise per-request later via an explicit "think hard" route.
+    llm_effort: str = "low"
 
     # Milestone 3: wake word + STT
     # openWakeWord pretrained phrase (no API key needed); custom model later.
