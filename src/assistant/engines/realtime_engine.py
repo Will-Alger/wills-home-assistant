@@ -30,7 +30,7 @@ from openai import AsyncOpenAI
 from scipy.signal import resample_poly
 
 from assistant.brain.tools import TOOL_DEFINITIONS, ToolExecutor
-from assistant.home.base import HomeApi, device_table
+from assistant.home.base import HomeApi, device_table, media_table
 from assistant.memory import MemoryStore
 
 REALTIME_RATE = 24_000
@@ -54,11 +54,16 @@ compact: a sentence or two unless asked to go deeper.
 
 You control the home through tools. No canned routines: interpret intent and \
 decide. Prefer area targets, and batch every lighting change into ONE \
-set_lights call. If something is beyond your tools (music is not wired up \
-yet), say so honestly.
+set_lights call. Music: play_music takes plain names (playlist/artist/track) \
+— for open-ended asks ("something chill") pick a fitting artist or track and \
+set radio_mode. The TV can open apps via launch_app. If something is beyond \
+your tools, say so honestly.
 
-Devices:
+Lights:
 {devices}
+
+Media players:
+{media}
 
 Standing preferences ({owner}'s, apply them automatically, no announcement):
 {preferences}
@@ -220,6 +225,7 @@ class RealtimeEngine:
             owner=self._owner,
             wake_phrase=self._wake_phrase,
             devices=device_table(await self._home.get_lights()),
+            media=media_table(await self._home.media_players()),
             preferences=(
                 self._memory.preferences_text() if self._memory else "(memory not enabled)"
             ),

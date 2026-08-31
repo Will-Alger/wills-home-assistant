@@ -41,6 +41,14 @@ class LightCommand:
     transition: float | None = None
 
 
+def media_table(players: list[MediaPlayer]) -> str:
+    rows = []
+    for p in sorted(players, key=lambda x: x.entity_id):
+        extra = f" | apps: {', '.join(p.apps)}" if p.apps else ""
+        rows.append(f"- {p.entity_id} | {p.name} | {p.kind} | state: {p.state}{extra}")
+    return "\n".join(rows) or "- (no media players set up)"
+
+
 def device_table(lights: list[Light]) -> str:
     """Deterministic, prompt-ready device listing (sorted = cacheable prefix)."""
     rows = [
@@ -51,6 +59,16 @@ def device_table(lights: list[Light]) -> str:
     return "\n".join(rows) or "- (no lights found yet)"
 
 
+@dataclass(frozen=True)
+class MediaPlayer:
+    entity_id: str
+    name: str
+    state: str  # off / idle / playing / paused ...
+    kind: str  # "music" (Music Assistant / speakers) or "tv" (has a remote, launches apps)
+    apps: tuple[str, ...] = ()  # launchable sources for kind="tv"
+    now_playing: str | None = None
+
+
 class HomeApi(Protocol):
     async def get_lights(self) -> list[Light]:
         """Registry (name/area/capabilities) merged with live state."""
@@ -59,3 +77,25 @@ class HomeApi(Protocol):
     async def apply(self, commands: list[LightCommand]) -> None:
         """Execute per-entity light commands."""
         ...
+
+    async def media_players(self) -> list[MediaPlayer]: ...
+
+    async def play_music(
+        self,
+        entity_id: str,
+        media_id: str,
+        media_type: str,
+        *,
+        artist: str | None = None,
+        album: str | None = None,
+        enqueue: str | None = None,
+        radio_mode: bool = False,
+    ) -> None:
+        """Music Assistant play_media — media_id may be a plain name."""
+        ...
+
+    async def media_command(
+        self, entity_id: str, command: str, volume_pct: int | None = None
+    ) -> None: ...
+
+    async def launch_app(self, entity_id: str, app: str) -> None: ...

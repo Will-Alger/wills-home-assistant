@@ -56,7 +56,7 @@ closest legitimate thing to "just pair it to Apple Home."
 | --- | --- | --- | --- | --- |
 | "Party mode"-style reasoning | emergent from M2 tools — the whole point | 2 | — | planned |
 | Matter bulbs (Linkind/AiDot) | unblocked by the HAOS VM: Matter Server add-on + share from Apple Home (multi-admin, no unpairing) — M1 stretch step | 1 | $0 | planned |
-| Spotify → Apple TV speakers | Music Assistant + AirPlay (stock Spotify integration can't start AirPlay playback); needs Premium + dev app. mDNS discovery works from the bridged HAOS VM (was blocked under Docker) | 5 | $0 | planned |
+| Spotify → Apple TV speakers | **CORE DONE 2026-08-31**: Music Assistant add-on (Spotify provider + AirPlay player) + Apple TV integration; brain tools `play_music` (names, radio_mode, enqueue), `media_control` (pause/skip/volume/power), `launch_app` (TV apps). Live-verified: "find a good jazz playlist and play it on the apple tv" → Coffee Table Jazz streaming, both players `playing`. No Spotify dev app needed (MA handles auth) | 5 | $0 | testing |
 | YouTube search → play on Apple TV | YouTube Data API (free) for search; deep-link via pyatv/HA app launch — experimental; fallback: launch app + remote | 5 stretch | $0 | idea |
 
 ## Assistant intelligence

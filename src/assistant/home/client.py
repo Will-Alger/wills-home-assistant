@@ -8,12 +8,13 @@ and service data (entity_id + fields like brightness_pct) goes flat in one JSON 
 
 from __future__ import annotations
 
+import typing
 from dataclasses import dataclass
 from typing import Any, Self
 
 import httpx
 
-from assistant.home.base import Light, LightCommand
+from assistant.home.base import Light, LightCommand, MediaPlayer
 
 
 class HomeAssistantError(RuntimeError):
@@ -127,6 +128,88 @@ class HomeAssistantClient:
                     color_temp_kelvin=cmd.color_temp_kelvin,
                     transition=cmd.transition,
                 )
+
+    async def media_players(self) -> list[MediaPlayer]:
+        """HomeApi: media players. Heuristic: an entity with a `remote.` sibling
+        of the same suffix is a TV (pyatv-style); others are music players."""
+        states = await self.states()
+        remote_suffixes = {
+            s.entity_id.split(".", 1)[1] for s in states if s.domain == "remote"
+        }
+        players = []
+        for s in states:
+            if s.domain != "media_player":
+                continue
+            suffix = s.entity_id.split(".", 1)[1]
+            is_tv = suffix in remote_suffixes
+            attrs = s.attributes
+            players.append(
+                MediaPlayer(
+                    entity_id=s.entity_id,
+                    name=s.friendly_name,
+                    state=s.state,
+                    kind="tv" if is_tv else "music",
+                    apps=tuple(attrs.get("source_list") or ()),
+                    now_playing=attrs.get("media_title"),
+                )
+            )
+        return sorted(players, key=lambda p: p.entity_id)
+
+    async def play_music(
+        self,
+        entity_id: str,
+        media_id: str,
+        media_type: str,
+        *,
+        artist: str | None = None,
+        album: str | None = None,
+        enqueue: str | None = None,
+        radio_mode: bool = False,
+    ) -> None:
+        data: dict[str, Any] = {
+            "entity_id": entity_id,
+            "media_id": media_id,
+            "media_type": media_type,
+        }
+        if artist:
+            data["artist"] = artist
+        if album:
+            data["album"] = album
+        if enqueue:
+            data["enqueue"] = enqueue
+        if radio_mode:
+            data["radio_mode"] = True
+        await self.call_service("music_assistant", "play_media", data)
+
+    _MEDIA_COMMANDS: typing.ClassVar[dict[str, str]] = {
+        "pause": "media_pause",
+        "resume": "media_play",
+        "next": "media_next_track",
+        "previous": "media_previous_track",
+        "stop": "media_stop",
+        "turn_on": "turn_on",
+        "turn_off": "turn_off",
+    }
+
+    async def media_command(
+        self, entity_id: str, command: str, volume_pct: int | None = None
+    ) -> None:
+        if command == "volume_set":
+            await self.call_service(
+                "media_player",
+                "volume_set",
+                {"entity_id": entity_id, "volume_level": max(0, min(100, volume_pct or 0)) / 100},
+            )
+            return
+        service = self._MEDIA_COMMANDS.get(command)
+        if service is None:
+            raise HomeAssistantError(f"unknown media command: {command}")
+        await self.call_service("media_player", service, {"entity_id": entity_id})
+
+    async def launch_app(self, entity_id: str, app: str) -> None:
+        await self.call_service(
+            "media_player", "select_source", {"entity_id": entity_id, "source": app}
+        )
 
     async def call_service(self, domain: str, service: str, data: dict[str, Any]) -> Any:
         resp = await self._http.post(f"/api/services/{domain}/{service}", json=data)

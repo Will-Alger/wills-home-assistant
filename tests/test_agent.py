@@ -134,6 +134,37 @@ def test_target_resolution_rules():
 
 
 @pytest.mark.asyncio
+async def test_play_music_defaults_to_the_music_player():
+    home = FakeHome()
+    executor = ToolExecutor(home)
+    text, is_error = await executor.execute(
+        "play_music", {"media_id": "Chill Vibes", "media_type": "playlist"}
+    )
+    assert not is_error, text
+    (call,) = home.played
+    assert call["entity_id"] == "media_player.living_room_speakers"
+    assert call["media_id"] == "Chill Vibes"
+
+
+@pytest.mark.asyncio
+async def test_launch_app_targets_the_tv():
+    home = FakeHome()
+    executor = ToolExecutor(home)
+    text, is_error = await executor.execute("launch_app", {"app": "YouTube"})
+    assert not is_error, text
+    assert home.launched == [("media_player.living_room_tv", "YouTube")]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_media_control_lists_players():
+    home = FakeHome()
+    executor = ToolExecutor(home)
+    text, is_error = await executor.execute("media_control", {"action": "pause"})
+    assert is_error
+    assert "living_room_speakers" in text and "living_room_tv" in text
+
+
+@pytest.mark.asyncio
 async def test_capability_filtering_drops_rgb_on_white_bulbs():
     home = FakeHome()
     executor = ToolExecutor(home)

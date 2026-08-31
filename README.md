@@ -67,7 +67,7 @@ none of the pipeline.
 | 2 | **Brain, no audio** — text REPL → LLM with tools → HA ("get the room ready for a party", typed) | ⏳ testing |
 | 3 | **Ears** — mic layer, openWakeWord, streaming STT; wake → transcript | ⏳ testing |
 | 4 | **Mouth** — voice-engine bake-off: OpenAI Realtime engine behind our wake word + tools (live-verified); ElevenLabs streaming pipeline as alternate engine | ⏳ testing |
-| 5 | **Music & media** — Spotify / Apple TV tools (likely via Music Assistant + AirPlay); stretch: YouTube search → play on Apple TV | |
+| 5 | **Music & media** — Spotify→AirPlay via Music Assistant + Apple TV tools (play by name, pause/skip/volume, app launching) | ⏳ testing (jazz confirmed streaming); YouTube deep-link stretch remains |
 | 6 | **Tool belt** — long-term memory & preferences ("from now on when I say movie time…" — stored locally, applied every session, `forget` to erase); still to come: web search, Apple Calendar events | ⏳ memory testing |
 | 7 | **Voice ID** — local speaker embeddings (enroll Will's voiceprint); gates personal memories. Personalization, not security | |
 | 8 | **Satellites & Pi** — client/server split (thin mic/speaker/wake satellites → central brain), multi-device wake arbitration (closest responds), barge-in, custom wake phrase, custom voice clone | |
