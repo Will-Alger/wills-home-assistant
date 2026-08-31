@@ -86,6 +86,10 @@ class Settings(BaseSettings):
     # idle (open sessions bill by the minute). Raise it if conversations feel
     # cut short during quiet moments.
     realtime_idle_timeout_s: float = 45.0
+    # One-shot commands ("set the volume to 75%"): the engine closes the
+    # session this many seconds after the spoken confirmation if the speaker
+    # stays silent — no "that's all" needed. Speaking again cancels it.
+    realtime_command_close_s: float = 8.0
     # How fast semantic VAD decides you're done talking: low|medium|high|auto.
     # high = snappy replies; drop toward auto/low if it cuts off your pauses.
     realtime_eagerness: str = "high"

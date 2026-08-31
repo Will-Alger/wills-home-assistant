@@ -54,6 +54,17 @@ async def test_session_config_renders_jobs_and_repos(tmp_path) -> None:
     assert {"develop_feature", "check_work", "close_work", "merge_work"} <= tool_names
 
 
+def test_command_tools_cover_home_actions_only() -> None:
+    """COMMAND_TOOLS drives the engine's one-shot auto-close: action tools
+    only — info/chat tools must not trigger it."""
+    from assistant.engines.realtime_engine import COMMAND_TOOLS
+
+    assert {"set_lights", "media_control", "play_music", "launch_app"} <= COMMAND_TOOLS
+    for info_tool in ("browse_music", "search_entities", "get_entity", "check_work",
+                      "list_memories", "get_lights"):
+        assert info_tool not in COMMAND_TOOLS
+
+
 def test_downsample_produces_wake_sized_frames() -> None:
     frame_24k = np.zeros(FRAME_SAMPLES_24K, dtype=np.int16).tobytes()
     out = downsample_24k_to_16k(frame_24k)

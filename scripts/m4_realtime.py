@@ -121,6 +121,7 @@ def build_engine(fake: bool):
         name=settings.assistant_name,
         wake_phrase=settings.wake_phrase,
         idle_timeout_s=settings.realtime_idle_timeout_s,
+        command_close_s=settings.realtime_command_close_s,
         talk_over=settings.realtime_talk_over,
         eagerness=settings.realtime_eagerness,
         extra_instructions=settings.assistant_extra_instructions,

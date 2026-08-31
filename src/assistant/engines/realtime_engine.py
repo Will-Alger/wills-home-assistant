@@ -292,6 +292,13 @@ DISPATCH_TOOLS: list[dict[str, Any]] = [
 ]
 _DISPATCH_TOOL_NAMES = {tool["name"] for tool in DISPATCH_TOOLS}
 
+# Tools that ACT on the home. A session whose single user utterance only did
+# these is a one-shot command — the engine closes it itself a few seconds
+# after the spoken confirmation, because the model cannot be trusted to.
+COMMAND_TOOLS = frozenset(
+    {"set_lights", "media_control", "play_music", "launch_app", "ha_call_service"}
+)
+
 _RESTART_TOOL = {
     "type": "function",
     "name": "restart_self",
@@ -376,6 +383,7 @@ class RealtimeEngine:
         name: str = "Jarvis",
         wake_phrase: str = "hey jarvis",
         idle_timeout_s: float = 20.0,
+        command_close_s: float = 8.0,
         talk_over: bool = False,
         eagerness: str = "high",
         extra_instructions: str = "",
@@ -394,6 +402,8 @@ class RealtimeEngine:
         self._name = name
         self._wake_phrase = wake_phrase
         self._idle_timeout_s = idle_timeout_s
+        self._command_close_s = command_close_s
+        self.last_response_tools: list[str] = []  # set by _handle_response_done
         self._talk_over = talk_over  # headphones only: mic streams during playback
         self._eagerness = eagerness  # semantic VAD: how fast it decides you're done
         self._extra_instructions = extra_instructions
@@ -495,7 +505,10 @@ class RealtimeEngine:
         raise RuntimeError("Realtime session config could not be applied")
 
     async def _handle_response_done(self, connection: Any, event: Any, stats: SessionStats) -> bool:
-        """Execute any function calls; returns True when end_conversation fired."""
+        """Execute any function calls; returns True when end_conversation fired.
+        Side effect: self.last_response_tools lists what this response called —
+        the quick-close logic in run_conversation reads it."""
+        self.last_response_tools = []
         response = getattr(event, "response", None)
         usage = getattr(response, "usage", None)
         if usage is not None:
@@ -511,6 +524,7 @@ class RealtimeEngine:
                 continue
             call_name = item.name
             stats.tool_calls.append(call_name)
+            self.last_response_tools.append(call_name)
             if call_name == "end_conversation":
                 closing = True
                 continue
@@ -760,8 +774,17 @@ class RealtimeEngine:
                 else:
                     ui.listening()
 
+            # One-shot quick close: a single user utterance that only ran
+            # command tools gets its confirmation, then the ENGINE closes the
+            # session after a short silence — no "that's all" needed. Any
+            # further speech disarms it and the session becomes a conversation.
+            speech_segments = 0
+            command_pending = False
+            quick_close_armed = False
+
             async def receive() -> None:
                 nonlocal speaking, response_active, closing, last_activity
+                nonlocal speech_segments, command_pending, quick_close_armed
                 heard = ""  # live accumulation of the user's words
                 while True:
                     event = await connection.recv()
@@ -793,6 +816,11 @@ class RealtimeEngine:
                             stats.ended_by = "stop command"
                             ended.set()
                     elif kind == "input_audio_buffer.speech_started":
+                        speech_segments += 1
+                        if speech_segments > 1:
+                            # they kept talking — it's a conversation now
+                            command_pending = False
+                            quick_close_armed = False
                         if self._talk_over and speaking:
                             # Talk-over interrupt: you spoke, it stops.
                             speaker.clear()
@@ -804,18 +832,29 @@ class RealtimeEngine:
                     elif kind == "response.done":
                         response_active = False
                         closing = await self._handle_response_done(connection, event, stats)
+                        ran = self.last_response_tools
+                        if any(t in COMMAND_TOOLS for t in ran):
+                            command_pending = True
+                        elif not ran and command_pending and speech_segments <= 1:
+                            # the spoken confirmation after a one-shot command
+                            quick_close_armed = True
                         pending.append(asyncio.create_task(finish_playback(closing)))
                     elif kind == "error":
                         ui.error(str(getattr(event, "error", event)))
 
             async def idle_watchdog() -> None:
                 while True:
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(0.5)
                     quiet = time.monotonic() - last_activity
-                    if not speaking and not response_active and quiet > self._idle_timeout_s:
-                        stats.ended_by = "idle timeout"
-                        ended.set()
-                        return
+                    if not speaking and not response_active:
+                        if quick_close_armed and quiet > self._command_close_s:
+                            stats.ended_by = "command complete"
+                            ended.set()
+                            return
+                        if quiet > self._idle_timeout_s:
+                            stats.ended_by = "idle timeout"
+                            ended.set()
+                            return
 
             tasks = [
                 asyncio.create_task(pump_mic()),
