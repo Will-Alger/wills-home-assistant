@@ -215,13 +215,14 @@ class HomeAssistantClient:
             await self.call_service("music_assistant", "play_media", data, timeout=30.0)
         except httpx.ReadTimeout as err:
             # Do NOT claim success: a hang here usually means Music Assistant
-            # is stuck (e.g. Spotify rate-limiting with a ~1 hour backoff).
+            # is stuck (provider rate-limited or mid-sync; Spotify penalties
+            # ran ~1 hour and retries reset them — see FEATURES.md music row).
             raise HomeAssistantError(
-                "the music system did not confirm playback within 30s — this "
-                "usually means Spotify rate-limited it and it is waiting out a "
-                "penalty of up to an hour. DO NOT retry now: retries reset the "
-                "penalty and make it longer. Tell the owner honestly and "
-                "suggest trying again in about an hour"
+                "the music system did not confirm playback within 30s — the "
+                "music provider is likely rate-limited or busy syncing. DO NOT "
+                "retry immediately (retries can extend provider penalties). "
+                "Tell the owner honestly and suggest trying again in a few "
+                "minutes"
             ) from err
 
     _MEDIA_COMMANDS: typing.ClassVar[dict[str, str]] = {
