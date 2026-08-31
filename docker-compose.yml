@@ -15,10 +15,15 @@ services:
     container_name: homeassistant
     image: ghcr.io/home-assistant/home-assistant:stable
     volumes:
-      - ./ha-config:/config # gitignored: contains tokens & device registry
+      # Named volume, not a bind mount: HA's SQLite recorder through Docker
+      # Desktop's Windows file sharing is a known slow/corruption-prone combo.
+      - ha-config:/config
     environment:
       TZ: ${TZ:-America/New_York} # set TZ in .env (IANA name)
     ports:
       - "8123:8123"
     restart: unless-stopped
     stop_grace_period: 60s
+
+volumes:
+  ha-config:

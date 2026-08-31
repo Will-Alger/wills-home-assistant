@@ -51,12 +51,14 @@ class HomeAssistantClient:
         await self._http.aclose()
 
     async def api_alive(self) -> bool:
+        """False only when HA is unreachable; a bad token raises its own clear error."""
         # HA requires the trailing slash: /api/ not /api
         try:
             resp = await self._http.get("/api/")
         except httpx.HTTPError:
             return False
-        return resp.status_code == 200
+        self._check(resp)
+        return True
 
     async def states(self) -> list[EntityState]:
         resp = await self._http.get("/api/states")

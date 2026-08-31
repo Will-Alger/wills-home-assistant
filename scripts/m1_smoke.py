@@ -72,7 +72,27 @@ async def run(args: argparse.Namespace) -> int:
             return 0
 
         if args.demo:
-            for label, kwargs in DEMO_STEPS:
+            lights = {s.entity_id: s for s in await ha.lights()}
+            light = lights.get(args.entity)
+            if light is None:
+                console.print(
+                    f"[red]{args.entity} not found.[/red] Run without args to list lights."
+                )
+                return 1
+            # Only send what the bulb supports, or HA errors mid-cycle.
+            modes = set(light.attributes.get("supported_color_modes") or [])
+            has_rgb = bool(modes & {"rgb", "rgbw", "rgbww", "hs", "xy"})
+            has_ct = "color_temp" in modes
+            steps = [
+                (label, kwargs)
+                for label, kwargs in DEMO_STEPS
+                if ("rgb_color" not in kwargs or has_rgb)
+                and ("color_temp_kelvin" not in kwargs or has_ct)
+            ]
+            if not steps:
+                console.print(f"No color support ({sorted(modes)}); doing a brightness dip.")
+                steps = [("dim", {"brightness_pct": 20}), ("bright", {"brightness_pct": 100})]
+            for label, kwargs in steps:
                 console.print(f"  → {args.entity}: {label}")
                 await ha.light_on(args.entity, **kwargs)
                 await asyncio.sleep(1.5)

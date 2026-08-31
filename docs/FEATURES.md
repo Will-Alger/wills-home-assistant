@@ -25,7 +25,8 @@ Claude Code dispatch runs anyway); pipeline code stays host-agnostic.
 | Control lights via HA | REST client + WiZ manual-IP setup | 1 | $0 | testing |
 | LLM brain, no canned routines | Claude tool use (`claude-opus-5`), swappable to OpenAI | 2 | ~1–3¢/command | planned |
 | Cost meter, caching, low effort | log usage tokens per command; prompt-cache system+tools+device list | 2 | saves money | planned |
-| Wake-word activation | openWakeWord, local (Porcupine free tier is dead) | 3 | $0 | planned |
+| Audio-reality spike | record the real mic in the real room; measure openWakeWord false accepts/misses vs quiet / TV / Spotify **before** building M3 around it (review finding: this is where identical projects die) | 2.5 | $0 | planned |
+| Wake-word activation | openWakeWord, local (Porcupine free tier is dead; project is dormant — we own any Windows/ONNX friction) | 3 | $0 | planned |
 | Streaming STT | Deepgram Flux (semantic end-of-turn); swappable adapter | 3 | ~0.1¢/command ($200 credit first) | planned |
 | Custom-voice TTS | ElevenLabs Flash v2.5 over WebSocket; Starter plan ($6/mo) unlocks instant clone | 4 | $6/mo flat | planned |
 | Barge-in (interrupt while it talks) | duck TTS on wake/VAD during playback | 8 | $0 | idea |
@@ -36,7 +37,7 @@ Claude Code dispatch runs anyway); pipeline code stays host-agnostic.
 | --- | --- | --- | --- | --- |
 | "Party mode"-style reasoning | emergent from M2 tools — the whole point | 2 | — | planned |
 | Matter bulbs (Linkind/AiDot) | blocked on Windows Docker; needs HAOS VM (Hyper-V, bridged NIC) or a future Pi host | TBD | $0 | idea |
-| Spotify → Apple TV speakers | Music Assistant + AirPlay (stock Spotify integration can't start AirPlay playback); needs Premium + dev app | 5 | $0 | planned |
+| Spotify → Apple TV speakers | Music Assistant + AirPlay (stock Spotify integration can't start AirPlay playback); needs Premium + dev app. ⚠ AirPlay discovery is mDNS — **blocked under Docker Desktop exactly like Matter**; hangs on the platform decision below | 5 | $0 | planned |
 | YouTube search → play on Apple TV | YouTube Data API (free) for search; deep-link via pyatv/HA app launch — experimental; fallback: launch app + remote | 5 stretch | $0 | idea |
 
 ## Assistant intelligence
@@ -47,7 +48,7 @@ Claude Code dispatch runs anyway); pipeline code stays host-agnostic.
 | Apple Calendar events | iCloud CalDAV + app-specific password (HA CalDAV or Python `caldav` — verify create-event support when building) | 6 | $0 | planned |
 | Long-term memory | local SQLite behind remember/recall tools (Anthropic memory-tool shape) | 6 | pennies | planned |
 | Voice ID | local speaker embeddings (SpeechBrain ECAPA), enroll Will once, cosine-match per command. Personalization, NOT security — this project literally clones voices | 7 | $0 | idea |
-| Sensitive memories gated by voice ID | memory entries tagged private; recall tool checks speaker match | 7 | $0 | idea |
+| Sensitive memories gated by voice ID | **re-scoped by review**: far-field 1–3 s speaker match has error rates too high to gate data, and our own TTS clone defeats it. Voice ID routes *preferences* (whose Spotify/calendar); nothing goes into memory that a houseguest shouldn't extract by voice; truly private recall would need a non-voice factor (phone push / button) | 7 | $0 | idea |
 
 ## Multi-device & desktop integration
 
@@ -55,7 +56,7 @@ Claude Code dispatch runs anyway); pipeline code stays host-agnostic.
 | --- | --- | --- | --- | --- |
 | Satellites, closest one responds | client/server split; satellites report wake confidence + mic RMS in a ~1 s window, brain picks winner. Prototype desktop+laptop before buying Pis | 8 | hardware later | idea |
 | Custom wake phrase | train openWakeWord model (Colab, ~1–2 h, synthetic speech) | 8 | $0 | idea |
-| Voice-dispatch Claude Code | `start_coding_task` tool → headless Claude Code / Agent SDK in a dedicated worktree with constrained permissions; voice-ID-gated | 9 | $/task — biggest spend item, metered | idea |
+| Voice-dispatch Claude Code | `start_coding_task` tool → headless Claude Code / Agent SDK in a dedicated worktree with constrained permissions. **Review constraints adopted:** dispatch tools never share a context that ingested web content (injection surface); confirmation is a non-voice factor (phone push / button), not voice ID; hard per-task spend cap; no push rights or secrets beyond the worktree. The read-only status half ships first | 9 | $/task — biggest spend item, metered | idea |
 | Project status by voice | read-only tools: git log, `gh pr status`, running-session transcripts, summarized aloud | 9 | pennies | idea |
 
 ## Design notes already locked in
@@ -67,9 +68,53 @@ Claude Code dispatch runs anyway); pipeline code stays host-agnostic.
 - Budget: ~$20/month soft target (flexible). ElevenLabs sub is the fixed $6;
   the meter (M2) keeps the rest honest.
 
+Added after the 2026-08-30 adversarial review:
+
+- **Half-duplex is an M3/M4 requirement, not M8 polish**: wake detection is
+  suspended while TTS plays; HA media volume is ducked during capture.
+  "Issue a command while music is playing" is an M5 acceptance test.
+  (True barge-in — interrupting the assistant — stays M8.)
+- **Failure contract (M3/M4)**: per-stage timeout budget; a handful of
+  pre-rendered local WAVs in the cloned voice ("the internet seems down") so
+  the assistant can speak even when the cloud can't; single-flight rule — one
+  command in progress, wake events during processing are dropped.
+- **Cache design**: only the truly static prefix (system prompt + tool
+  schemas + entity registry *without* live state) gets cached; live state is
+  fetched via a tool. Live state in the prompt = byte-changed prefix = 0% hit
+  rate at cache-write premium prices.
+- **Latency design**: speak an instant canned ack ("on it") before the LLM
+  round trip; tools are batched and area-aware (`set_lights(area=…, […])`),
+  never one call per bulb; the M2 meter logs per-hop latency, not just tokens.
+- **M1 done-criteria addition**: every entity gets a human name **and an
+  area** in the HA UI — `GET /api/states` carries no room topology, so the
+  client grows a registry/area fetch (WebSocket API) before M2, or "get the
+  room ready" dims the bedroom too.
+- **M2 ships an eval set**: ~10 golden typed commands with expected tool
+  calls, so prompt/model tweaks aren't vibes-tested against live bulbs.
+- **TTS character budget**: hard cap in the system prompt — ElevenLabs
+  Starter's ceiling is ~60k Flash characters/month (~8–13 modest replies/day).
+- **Appliance-ness (by M4)**: Task Scheduler at-logon launch + a watchdog;
+  the assistant must survive Patch Tuesday unattended.
+- **Privacy posture**: a mic mute affordance and audible/visible "listening"
+  cue; set retention opt-outs at Deepgram/ElevenLabs; long-term memory stores
+  owner-directed facts only (guests' chatter is not data); cloned voice is
+  Will's own or has written consent.
+- **"Proved itself" gate for hardware purchases**: the M4 loop used daily for
+  a month plus one working media feature. M7+ is speculative until then.
+  Once the platform question is settled, stand up HA Assist for an afternoon
+  as an honest latency/behavior benchmark the DIY pipeline has to beat.
+
 ## Open questions
 
-- Matter bulb path: HAOS VM on the desktop now, or park until Pi hardware? (Affects only those bulbs.)
+- **Platform (decides M5's fate, not just the Matter bulbs) — awaiting Will's call:**
+  HAOS in a Hyper-V VM now (review's #1 insisted change: unblocks Matter,
+  AirPlay/Music Assistant, all discovery; autostarts headless and survives
+  host reboots) vs Docker Desktop interim (fastest WiZ-only M1 today, but a
+  guaranteed redo of HA onboarding/entities/token when M5 arrives).
+- **Default command-path model — awaiting Will's call:** Opus 5 with default
+  thinking on multi-hop commands means multi-second silences and most of the
+  budget; review insists on Sonnet 5 (or Haiku 4.5) at low effort for the
+  command path, with Opus behind an explicit escalation for open-ended asks.
 - Whose voice to clone for TTS, and record the 1–2 min sample (Starter-tier instant clone).
 - Wake phrase — stock "Hey Jarvis" until custom training day; pick the real phrase.
 - Can pyatv deep-link a specific YouTube video, or only launch the app? (Settles M5 stretch scope.)

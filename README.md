@@ -113,7 +113,7 @@ docker compose up -d       # Home Assistant on http://localhost:8123
 ## Layout
 
 ```
-docker-compose.yml       Home Assistant container (config in ./ha-config, gitignored)
+docker-compose.yml       Home Assistant container (config in a named Docker volume)
 src/assistant/
   config.py              all settings/secrets, loaded from .env — nothing hardcoded
   home/                  Home Assistant REST client
