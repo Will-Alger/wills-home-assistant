@@ -34,6 +34,7 @@ from assistant.home.base import HomeApi, device_table
 
 REALTIME_RATE = 24_000
 FRAME_SAMPLES_24K = 1920  # 80 ms
+FALLBACK_VOICE = "marin"  # used automatically when the configured voice is gated
 
 # $/1M tokens, gpt-realtime-2.1 (pricing page, 2026-08; approximate meter —
 # cached tokens all billed at the cached-audio rate for simplicity).
@@ -136,11 +137,13 @@ class RealtimeEngine:
         wake_phrase: str = "hey jarvis",
         idle_timeout_s: float = 20.0,
         talk_over: bool = False,
+        eagerness: str = "high",
         usage_log: Path | None = None,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
         self._model = model
-        self._voice = voice
+        self._voice = voice  # may be swapped to FALLBACK_VOICE during _configure
+        self.voice_note: str | None = None
         self._home = home
         self._executor = ToolExecutor(home)
         self._owner = owner
@@ -148,9 +151,10 @@ class RealtimeEngine:
         self._wake_phrase = wake_phrase
         self._idle_timeout_s = idle_timeout_s
         self._talk_over = talk_over  # headphones only: mic streams during playback
+        self._eagerness = eagerness  # semantic VAD: how fast it decides you're done
         self._usage_log = usage_log
 
-    async def _session_config(self, transcription: bool) -> dict[str, Any]:
+    async def _session_config(self, transcription_model: str | None) -> dict[str, Any]:
         instructions = _INSTRUCTIONS.format(
             name=self._name,
             owner=self._owner,
@@ -159,10 +163,10 @@ class RealtimeEngine:
         )
         audio_in: dict[str, Any] = {
             "format": {"type": "audio/pcm", "rate": REALTIME_RATE},
-            "turn_detection": {"type": "semantic_vad"},
+            "turn_detection": {"type": "semantic_vad", "eagerness": self._eagerness},
         }
-        if transcription:
-            audio_in["transcription"] = {"model": "whisper-1"}
+        if transcription_model:
+            audio_in["transcription"] = {"model": transcription_model}
         return {
             "type": "realtime",
             "instructions": instructions,
@@ -177,6 +181,43 @@ class RealtimeEngine:
                 },
             },
         }
+
+    async def _configure(self, connection: Any, transcription: bool) -> None:
+        """Send session config and wait for acceptance before any audio flows —
+        otherwise a rejected update leaves a session running with no tools.
+        Degrades gracefully: a gated voice falls back; transcription steps
+        down streaming model -> whisper -> none.
+        """
+        # mini-transcribe streams deltas (live typing); whisper-1 is the
+        # widely-available fallback (transcript arrives only at end of turn).
+        transcribers: list[str | None] = (
+            ["gpt-4o-mini-transcribe", "whisper-1", None] if transcription else [None]
+        )
+        for _attempt in range(6):
+            await connection.send(
+                {"type": "session.update", "session": await self._session_config(transcribers[0])}
+            )
+            resend = False
+            while not resend:
+                event = await connection.recv()
+                kind = event.type
+                if kind == "session.updated":
+                    return
+                if kind == "error":
+                    message = str(getattr(event, "error", event)).lower()
+                    if "voice" in message and self._voice != FALLBACK_VOICE:
+                        self.voice_note = (
+                            f"voice '{self._voice}' not available yet — using {FALLBACK_VOICE}"
+                        )
+                        self._voice = FALLBACK_VOICE
+                        resend = True
+                    elif "transcri" in message and len(transcribers) > 1:
+                        transcribers.pop(0)
+                        resend = True
+                    else:
+                        raise RuntimeError(f"Realtime session config rejected: {message}")
+                # anything else (session.created, ...) is ignored during setup
+        raise RuntimeError("Realtime session config could not be applied")
 
     async def _handle_response_done(self, connection: Any, event: Any, stats: SessionStats) -> bool:
         """Execute any function calls; returns True when end_conversation fired."""
@@ -246,9 +287,7 @@ class RealtimeEngine:
         transcript_parts: list[str] = []
         audio = bytearray()
         async with self._client.realtime.connect(model=self._model) as connection:
-            await connection.send(
-                {"type": "session.update", "session": await self._session_config(False)}
-            )
+            await self._configure(connection, transcription=False)
             await connection.send(
                 {
                     "type": "conversation.item.create",
@@ -290,14 +329,11 @@ class RealtimeEngine:
         speaking = False
         response_active = False
         closing = False
-        transcription = True
         last_activity = time.monotonic()
         ended = asyncio.Event()
 
         async with self._client.realtime.connect(model=self._model) as connection:
-            await connection.send(
-                {"type": "session.update", "session": await self._session_config(True)}
-            )
+            await self._configure(connection, transcription=True)
 
             async def pump_mic() -> None:
                 nonlocal speaking
@@ -332,7 +368,8 @@ class RealtimeEngine:
                     ui.listening()
 
             async def receive() -> None:
-                nonlocal speaking, response_active, closing, transcription, last_activity
+                nonlocal speaking, response_active, closing, last_activity
+                heard = ""  # live accumulation of the user's words
                 while True:
                     event = await connection.recv()
                     kind = event.type
@@ -344,7 +381,11 @@ class RealtimeEngine:
                         response_active = True
                     elif kind.endswith("audio_transcript.done"):
                         ui.assistant_said(getattr(event, "transcript", ""))
+                    elif kind == "conversation.item.input_audio_transcription.delta":
+                        heard += getattr(event, "delta", "") or ""
+                        ui.user_partial(heard)
                     elif kind == "conversation.item.input_audio_transcription.completed":
+                        heard = ""
                         ui.user_said(getattr(event, "transcript", ""))
                     elif kind == "input_audio_buffer.speech_started":
                         if self._talk_over and speaking:
@@ -360,18 +401,7 @@ class RealtimeEngine:
                         closing = await self._handle_response_done(connection, event, stats)
                         asyncio.create_task(finish_playback(closing))
                     elif kind == "error":
-                        message = str(getattr(event, "error", event))
-                        if transcription and "transcription" in message.lower():
-                            # Transcription config rejected: retry without it.
-                            transcription = False
-                            await connection.send(
-                                {
-                                    "type": "session.update",
-                                    "session": await self._session_config(False),
-                                }
-                            )
-                        else:
-                            ui.error(message)
+                        ui.error(str(getattr(event, "error", event)))
 
             async def idle_watchdog() -> None:
                 while True:

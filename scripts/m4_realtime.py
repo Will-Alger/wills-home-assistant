@@ -47,6 +47,9 @@ class ConsoleUi:
     def user_speaking(self) -> None:
         pass  # semantic VAD handles it; printing here is just noise
 
+    def user_partial(self, heard_so_far: str) -> None:
+        console.print(f"[dim]… {heard_so_far.strip()}[/dim]", end="\r")
+
     def user_said(self, transcript: str) -> None:
         if transcript.strip():
             console.print(f"[bold]you>[/bold] {transcript.strip()}")
@@ -78,6 +81,7 @@ def build_engine(fake: bool):
         wake_phrase=settings.wake_phrase,
         idle_timeout_s=settings.realtime_idle_timeout_s,
         talk_over=settings.realtime_talk_over,
+        eagerness=settings.realtime_eagerness,
         usage_log=Path(__file__).resolve().parents[1] / ".usage.jsonl",
     )
     return settings, home, engine
@@ -87,6 +91,8 @@ async def text_probe(fake: bool, text: str) -> int:
     settings, home, engine = build_engine(fake)
     console.print(f"[dim]probing {settings.realtime_model} · voice {settings.realtime_voice}[/dim]")
     transcript, audio, stats = await engine.text_probe(text)
+    if engine.voice_note:
+        console.print(f"[yellow]{engine.voice_note}[/yellow]")
     console.print(f"[bold]you (typed)>[/bold] {text}")
     console.print(
         f"[bold cyan]{settings.assistant_name.lower()}>[/bold cyan] "
@@ -150,6 +156,9 @@ async def voice(fake: bool) -> int:
                     console.print(f"[red]session error: {err}[/red]")
                     continue
             total_cost += stats.cost_usd
+            if engine.voice_note:
+                console.print(f"[yellow]{engine.voice_note}[/yellow]")
+                engine.voice_note = None
             tones.play("close")
             console.print(
                 f"[dim]conversation over ({stats.ended_by}) · {stats.responses} replies · "

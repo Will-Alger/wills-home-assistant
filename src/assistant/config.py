@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     # can talk to it — this just names the household owner.
     owner_name: str = "Will"
     # The assistant's persona name (what it calls itself).
-    assistant_name: str = "Gary"
+    assistant_name: str = "Alexa"
 
     # Milestone 1: Home Assistant
     ha_url: str = "http://localhost:8123"
@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     # Milestone 3: wake word + STT
     # A pretrained openWakeWord name ("hey_jarvis") OR a path to a custom
     # trained model, e.g. models/hey_gary.onnx — see docs/custom-wake-word.md
-    wake_model: str = "hey_jarvis"
+    wake_model: str = "alexa"
     wake_threshold: float = 0.5  # raise if false wakes, lower if it misses you
     audio_input_device: str = ""  # "" = default mic; index or name substring
     stt_provider: str = "deepgram"
@@ -65,8 +65,13 @@ class Settings(BaseSettings):
     # Milestone 4: voice engines
     # Primary candidate: OpenAI Realtime (speech-native; uses OPENAI_API_KEY).
     realtime_model: str = "gpt-realtime-2.1"
-    realtime_voice: str = "marin"  # marin/cedar recommended; also alloy, ash, ...
+    # "sol" is Will's pick; it's org-gated today, so the engine automatically
+    # falls back to marin until OpenAI unlocks it — then this just works.
+    realtime_voice: str = "sol"
     realtime_idle_timeout_s: float = 20.0  # silent session auto-closes (it bills/min)
+    # How fast semantic VAD decides you're done talking: low|medium|high|auto.
+    # high = snappy replies; drop toward auto/low if it cuts off your pauses.
+    realtime_eagerness: str = "high"
     # True talk-over (interrupt by just speaking). ONLY with headphones — on
     # open speakers the mic hears the assistant and it interrupts itself.
     realtime_talk_over: bool = False

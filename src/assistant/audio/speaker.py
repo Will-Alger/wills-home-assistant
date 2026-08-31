@@ -60,7 +60,7 @@ class Speaker:
         with self._lock:
             return len(self._buffer) / 2 / self._samplerate
 
-    async def wait_idle(self, tail_s: float = 0.25) -> None:
+    async def wait_idle(self, tail_s: float = 0.1) -> None:
         """Return once queued audio has (approximately) finished playing."""
         while self.pending_seconds > 0:
             await asyncio.sleep(0.05)
