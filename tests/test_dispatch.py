@@ -50,9 +50,14 @@ async def test_full_job_lifecycle(tmp_path) -> None:
     job = dispatcher.jobs()[0]
     assert job.status == "done"
     assert "did the task" in job.summary
+    assert job.session_id == "sess-fake"
+    assert job.model == "claude-fake-1"
+    assert job.last_activity == "working on the task now"
+    assert (repo / "logs" / "jobs" / f"{job.id}.log").exists()
 
     report = json.loads(dispatcher.report())
     assert report[0]["status"] == "done"
+    assert "claude --resume sess-fake" in report[0]["full_transcript"]
 
     # persistence: a fresh dispatcher reads the record back
     again = Dispatcher(repo, claude_cmd="unused")
@@ -92,4 +97,4 @@ async def test_failed_agent_is_reported(tmp_path) -> None:
     await wait_done(dispatcher, job.id)
     job = dispatcher.jobs()[0]
     assert job.status == "failed"
-    assert "exited 3" in job.summary
+    assert "exit 3" in job.summary

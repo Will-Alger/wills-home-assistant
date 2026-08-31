@@ -52,6 +52,10 @@ class Job:
     started: float
     finished: float | None = None
     summary: str = ""
+    model: str = ""
+    session_id: str = ""  # `claude --resume <id>` opens the full transcript
+    cost_usd: float = 0.0
+    last_activity: str = ""  # latest agent utterance, for live progress
 
 
 class DispatchError(RuntimeError):
@@ -63,7 +67,9 @@ class Dispatcher:
         self,
         root: Path,
         *,
-        claude_cmd: str = "claude -p --output-format json --dangerously-skip-permissions",
+        claude_cmd: str = (
+            "claude -p --output-format stream-json --verbose --dangerously-skip-permissions"
+        ),
         timeout_s: float = 1500.0,
     ) -> None:
         self._root = root
@@ -127,37 +133,80 @@ class Dispatcher:
         return job
 
     async def _run(self, job: Job) -> None:
+        job_log = self._root / "logs" / "jobs" / f"{job.id}.log"
+        job_log.parent.mkdir(parents=True, exist_ok=True)
         try:
             prompt = _TASK_PROMPT.format(request=job.request)
-            proc = await asyncio.create_subprocess_shell(
-                self._claude_cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=job.worktree,
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(prompt.encode("utf-8")), timeout=self._timeout_s
+            with job_log.open("ab") as errlog:
+                proc = await asyncio.create_subprocess_shell(
+                    self._claude_cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=errlog,
+                    cwd=job.worktree,
                 )
-            except TimeoutError:
-                proc.kill()
+            assert proc.stdin is not None and proc.stdout is not None
+            proc.stdin.write(prompt.encode("utf-8"))
+            await proc.stdin.drain()
+            proc.stdin.close()
+
+            deadline = time.monotonic() + self._timeout_s
+            got_result = False
+            with job_log.open("a", encoding="utf-8", errors="replace") as log:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        proc.kill()
+                        job.status = "failed"
+                        job.summary = f"timed out after {self._timeout_s:.0f}s"
+                        return
+                    try:
+                        raw = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+                    except TimeoutError:
+                        continue
+                    if not raw:
+                        break
+                    line = raw.decode("utf-8", errors="replace").rstrip()
+                    log.write(line + "\n")
+                    log.flush()
+                    self._ingest_event(job, line)
+                    if job.status != "running":
+                        got_result = True
+            await proc.wait()
+            if not got_result:
                 job.status = "failed"
-                job.summary = f"timed out after {self._timeout_s:.0f}s"
-                return
-            if proc.returncode != 0:
-                job.status = "failed"
-                job.summary = f"agent exited {proc.returncode}: {stderr.decode(errors='replace')[:300]}"
-                return
-            envelope = json.loads(stdout.decode("utf-8", errors="replace"))
-            job.summary = str(envelope.get("result", ""))[:2000]
-            job.status = "failed" if envelope.get("is_error") else "done"
+                job.summary = f"agent ended (exit {proc.returncode}) without a result — see {job_log.name}"
         except Exception as err:  # noqa: BLE001 — a job may never crash the app
             job.status = "failed"
             job.summary = f"{type(err).__name__}: {err}"
         finally:
             job.finished = time.time()
             self._save()
+
+    def _ingest_event(self, job: Job, line: str) -> None:
+        """Parse one stream-json line into live job state."""
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        kind = event.get("type")
+        if kind == "system" and event.get("subtype") == "init":
+            job.session_id = str(event.get("session_id", "")) or job.session_id
+            job.model = str(event.get("model", "")) or job.model
+            self._save()
+        elif kind == "assistant":
+            blocks = (event.get("message") or {}).get("content") or []
+            texts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
+            if any(texts):
+                job.last_activity = " ".join(texts)[-200:]
+                self._save()
+        elif kind == "result":
+            job.summary = str(event.get("result", ""))[:2000]
+            job.session_id = str(event.get("session_id", "")) or job.session_id
+            job.cost_usd = float(event.get("total_cost_usd") or 0.0)
+            job.finished = time.time()
+            job.status = "failed" if event.get("is_error") else "done"
+            self._save()  # persist atomically with the status flip (readers race us)
 
     def report(self, job_id: str | None = None) -> str:
         jobs = [self._jobs[job_id]] if job_id and job_id in self._jobs else self.jobs()[:5]
@@ -166,14 +215,18 @@ class Dispatcher:
         out = []
         for j in jobs:
             elapsed = (j.finished or time.time()) - j.started
-            out.append(
-                {
-                    "id": j.id,
-                    "title": j.title,
-                    "status": j.status,
-                    "branch": j.branch,
-                    "minutes": round(elapsed / 60, 1),
-                    "summary": j.summary[:600],
-                }
-            )
+            entry = {
+                "id": j.id,
+                "title": j.title,
+                "status": j.status,
+                "branch": j.branch,
+                "model": j.model or "cli default",
+                "minutes": round(elapsed / 60, 1),
+                "summary": j.summary[:600],
+            }
+            if j.status == "running" and j.last_activity:
+                entry["currently"] = j.last_activity
+            if j.session_id:
+                entry["full_transcript"] = f"claude --resume {j.session_id} (run in a terminal)"
+            out.append(entry)
         return json.dumps(out)
