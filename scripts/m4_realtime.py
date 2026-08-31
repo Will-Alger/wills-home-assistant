@@ -32,6 +32,8 @@ from assistant.engines.realtime_engine import (
 )
 from assistant.home import HomeAssistantClient
 from assistant.home.fake import FakeHome
+from assistant.learning import Reflector
+from assistant.llm.anthropic_provider import AnthropicProvider
 from assistant.memory import MemoryStore
 from assistant.wake.detector import WakeDetector
 
@@ -93,6 +95,18 @@ def build_engine(fake: bool):
     home = FakeHome() if fake else HomeAssistantClient(settings.ha_url, settings.ha_token)
     if not fake:
         settings.require("ha_url", "ha_token")
+    memory = MemoryStore(Path(__file__).resolve().parents[1] / "data" / "memory.json")
+    reflector = None
+    if settings.anthropic_api_key:
+        reflector = Reflector(
+            AnthropicProvider(
+                model=settings.llm_model,
+                effort="low",
+                api_key=settings.anthropic_api_key,
+                workspace_id=settings.anthropic_workspace_id or None,
+            ),
+            memory,
+        )
     engine = RealtimeEngine(
         api_key=settings.openai_api_key,
         model=settings.realtime_model,
@@ -105,14 +119,14 @@ def build_engine(fake: bool):
         talk_over=settings.realtime_talk_over,
         eagerness=settings.realtime_eagerness,
         extra_instructions=settings.assistant_extra_instructions,
-        memory=MemoryStore(Path(__file__).resolve().parents[1] / "data" / "memory.json"),
+        memory=memory,
         usage_log=Path(__file__).resolve().parents[1] / ".usage.jsonl",
     )
-    return settings, home, engine
+    return settings, home, engine, reflector
 
 
 async def text_probe(fake: bool, text: str) -> int:
-    settings, home, engine = build_engine(fake)
+    settings, home, engine, _reflector = build_engine(fake)
     console.print(f"[dim]probing {settings.realtime_model} · voice {settings.realtime_voice}[/dim]")
     transcript, audio, stats = await engine.text_probe(text)
     if engine.voice_note:
@@ -140,7 +154,7 @@ async def text_probe(fake: bool, text: str) -> int:
 
 
 async def voice(fake: bool) -> int:
-    settings, _home, engine = build_engine(fake)
+    settings, _home, engine, reflector = build_engine(fake)
     console.print("Loading wake model...")
     wake = WakeDetector(settings.wake_model, threshold=settings.wake_threshold)
     session_wake = WakeDetector(settings.wake_model, threshold=settings.wake_threshold)
@@ -154,7 +168,9 @@ async def voice(fake: bool) -> int:
     with contextlib.suppress(KeyboardInterrupt, asyncio.CancelledError):
         while True:
             try:
-                total_cost = await one_cycle(settings, engine, wake, session_wake, total_cost)
+                total_cost = await one_cycle(
+                    settings, engine, wake, session_wake, total_cost, reflector
+                )
             except (KeyboardInterrupt, asyncio.CancelledError):
                 raise
             except Exception as err:  # noqa: BLE001 — the app must never die on its own
@@ -164,7 +180,7 @@ async def voice(fake: bool) -> int:
     return 0
 
 
-async def one_cycle(settings, engine, wake, session_wake, total_cost: float) -> float:
+async def one_cycle(settings, engine, wake, session_wake, total_cost: float, reflector) -> float:
     """One idle→wake→conversation cycle; returns the updated running cost."""
     await asyncio.sleep(0.2)  # let PortAudio settle between 24k/16k stream switches
     # IDLE: wake-gate on a 16 kHz mic (local, free, private)
@@ -202,6 +218,13 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float) -> 
         f"tools: {stats.tool_calls or 'none'} · ${stats.cost_usd:.4f} "
         f"(${total_cost:.4f} session)"
     )
+    if reflector is not None and stats.transcript:
+        with contextlib.suppress(Exception):  # learning must never break the loop
+            reflection = await reflector.reflect(stats.transcript)
+            for lesson in reflection.lessons:
+                console.print(f"[magenta]✎ learned:[/magenta] {lesson}")
+            for obs in reflection.observations:
+                console.print(f"[magenta]✎ noticed (will ask):[/magenta] {obs}")
     return total_cost
 
 

@@ -17,7 +17,12 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-KINDS = ("preference", "fact")
+# preference/fact: stored via the voice tools (deliberate, user-directed).
+# lesson/observation/episode: written by the session-end reflection pass —
+# lessons are operational recipes injected into future instructions;
+# observations await the user's consent before becoming preferences;
+# episodes are the searchable conversation journal.
+KINDS = ("preference", "fact", "lesson", "observation", "episode")
 
 
 @dataclass(frozen=True)
@@ -78,3 +83,11 @@ class MemoryStore:
     def preferences_text(self) -> str:
         prefs = self.items("preference")
         return "\n".join(f"- [id {p.id}] {p.text}" for p in prefs) or "(none stored yet)"
+
+    def lessons_text(self, limit: int = 15) -> str:
+        lessons = self.items("lesson")[-limit:]
+        return "\n".join(f"- [id {x.id}] {x.text}" for x in lessons) or "(none yet)"
+
+    def observations_text(self, limit: int = 5) -> str:
+        obs = self.items("observation")[-limit:]
+        return "\n".join(f"- [id {x.id}] {x.text}" for x in obs) or "(none)"

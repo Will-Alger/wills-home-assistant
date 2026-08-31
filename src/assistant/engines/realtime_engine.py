@@ -73,6 +73,14 @@ Media players:
 Standing preferences ({owner}'s, apply them automatically, no announcement):
 {preferences}
 
+Learned lessons from past sessions — treat as house truths:
+{lessons}
+
+Observations awaiting confirmation — at a natural moment, ask {owner} whether \
+to make one a standing preference (if yes: remember it as a preference, then \
+forget the observation's id; if no: just forget it):
+{observations}
+
 Memory: when the speaker states a durable preference ("from now on…", \
 "I always want…", "call me…"), store it with remember(kind="preference"). \
 If a new preference updates or contradicts a stored one, forget the old id \
@@ -112,8 +120,20 @@ MEMORY_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "name": "list_memories",
-        "description": "List all stored preferences and facts with their ids.",
-        "parameters": {"type": "object", "properties": {}},
+        "description": (
+            "List stored memories with ids. Optional kind filter: preference, "
+            "fact, lesson, observation, or episode (the conversation journal — "
+            "use for 'what did we talk about/figure out recently?')."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ["preference", "fact", "lesson", "observation", "episode"],
+                }
+            },
+        },
     },
     {
         "type": "function",
@@ -160,6 +180,7 @@ class SessionStats:
     cost_usd: float = 0.0
     tool_calls: list[str] = field(default_factory=list)
     ended_by: str = "unknown"
+    transcript: list[tuple[str, str]] = field(default_factory=list)  # for reflection
 
 
 def _usage_cost(usage: Any) -> float:
@@ -234,6 +255,8 @@ class RealtimeEngine:
             preferences=(
                 self._memory.preferences_text() if self._memory else "(memory not enabled)"
             ),
+            lessons=self._memory.lessons_text() if self._memory else "(none)",
+            observations=self._memory.observations_text() if self._memory else "(none)",
             extra=extra,
         )
         audio_in: dict[str, Any] = {
@@ -327,6 +350,8 @@ class RealtimeEngine:
             tool_hook = getattr(self, "_ui_tool_hook", None)
             if tool_hook is not None:
                 tool_hook(call_name, result_text, is_error)
+            outcome = "ERROR: " if is_error else ""
+            stats.transcript.append((f"tool {call_name}", outcome + result_text[:200]))
             outputs.append(
                 {
                     "type": "conversation.item.create",
@@ -363,7 +388,7 @@ class RealtimeEngine:
                     self._instructions_stale = True
                 return f"stored (id {item.id})", False
             if name == "list_memories":
-                items = self._memory.items()
+                items = self._memory.items(args.get("kind") or None)
                 if not items:
                     return "nothing stored yet", False
                 return json.dumps(
@@ -510,13 +535,17 @@ class RealtimeEngine:
                     elif kind == "response.created":
                         response_active = True
                     elif kind.endswith("audio_transcript.done"):
-                        ui.assistant_said(getattr(event, "transcript", ""))
+                        said = getattr(event, "transcript", "")
+                        stats.transcript.append(("alexa", said))
+                        ui.assistant_said(said)
                     elif kind == "conversation.item.input_audio_transcription.delta":
                         heard += getattr(event, "delta", "") or ""
                         ui.user_partial(heard)
                     elif kind == "conversation.item.input_audio_transcription.completed":
                         heard = ""
-                        ui.user_said(getattr(event, "transcript", ""))
+                        said = getattr(event, "transcript", "")
+                        stats.transcript.append(("you", said))
+                        ui.user_said(said)
                     elif kind == "input_audio_buffer.speech_started":
                         if self._talk_over and speaking:
                             # Talk-over interrupt: you spoke, it stops.
