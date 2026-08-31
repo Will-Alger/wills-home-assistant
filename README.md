@@ -66,7 +66,7 @@ none of the pipeline.
 | 1 | **Lights, no voice** — HAOS in a Hyper-V VM, bulbs controlled from Python via REST | ⏳ testing |
 | 2 | **Brain, no audio** — text REPL → LLM with tools → HA ("get the room ready for a party", typed) | ⏳ testing |
 | 3 | **Ears** — mic layer, openWakeWord, streaming STT; wake → transcript | ⏳ testing |
-| 4 | **Mouth** — ElevenLabs streaming TTS; full voice loop | |
+| 4 | **Mouth** — voice-engine bake-off: GPT-Live/Realtime engine (primary candidate) behind our wake word + tools; ElevenLabs streaming pipeline as alternate engine | |
 | 5 | **Music & media** — Spotify / Apple TV tools (likely via Music Assistant + AirPlay); stretch: YouTube search → play on Apple TV | |
 | 6 | **Tool belt** — web search (Anthropic server-side tool), Apple Calendar events (iCloud CalDAV), long-term memory (local store behind remember/recall tools) | |
 | 7 | **Voice ID** — local speaker embeddings (enroll Will's voiceprint); gates personal memories. Personalization, not security | |
