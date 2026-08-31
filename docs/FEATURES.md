@@ -29,7 +29,9 @@ Claude Code dispatch runs anyway); pipeline code stays host-agnostic.
 | Wake-word activation | openWakeWord, local (Porcupine free tier is dead; project is dormant — we own any Windows/ONNX friction) | 3 | $0 | planned |
 | Streaming STT | Deepgram Flux (semantic end-of-turn); swappable adapter | 3 | ~0.1¢/command ($200 credit first) | planned |
 | Custom-voice TTS | ElevenLabs Flash v2.5 over WebSocket; Starter plan ($6/mo) unlocks instant clone | 4 | $6/mo flat | planned |
-| Barge-in (interrupt while it talks) | duck TTS on wake/VAD during playback | 8 | $0 | idea |
+| One-shot vs open conversation | one state machine, not two modes: the LLM ends each turn with an intent — `close` / `listen` / `confirm_close` ("anything else?" then waits) — deciding whether the mic re-opens without a wake word. Session = growing message history (built in the M2 REPL first); tools available every turn, so commands work mid-chat | 4 | in-session context growth, cache-absorbed | planned |
+| Wake-word interrupt | while SPEAKING, full STT is off (half-duplex) but the wake detector keeps running — wake phrase mid-reply cuts TTS and returns to LISTENING; TTS is never allowed to say the wake phrase | 4 | $0 | planned |
+| Barge-in (interrupt by just talking) | VAD-based open-mic interruption during playback — one extra transition in the M4 state machine, not a rewrite | 8 | $0 | idea |
 
 ## Smart home & media
 
@@ -70,10 +72,22 @@ Claude Code dispatch runs anyway); pipeline code stays host-agnostic.
 
 Added after the 2026-08-30 adversarial review:
 
-- **Half-duplex is an M3/M4 requirement, not M8 polish**: wake detection is
-  suspended while TTS plays; HA media volume is ducked during capture.
-  "Issue a command while music is playing" is an M5 acceptance test.
-  (True barge-in — interrupting the assistant — stays M8.)
+- **Half-duplex is an M3/M4 requirement, not M8 polish**: full STT is
+  suspended while TTS plays — but the wake detector stays hot, so the wake
+  phrase mid-reply cuts TTS and interrupts (and TTS is never allowed to speak
+  the wake phrase). HA media volume is ducked during capture. "Issue a
+  command while music is playing" is an M5 acceptance test. (VAD-based
+  barge-in — interrupting by just talking — stays M8.)
+- **Session state machine (M3/M4)**: IDLE → wake → LISTENING → THINKING →
+  SPEAKING → then the LLM's end-of-turn intent, a structured flag with three
+  values: `close` (one-shot done → IDLE), `listen` (it asked a question — mic
+  re-opens, no wake word), or `confirm_close` (it thinks it's done but checks
+  — "anything else?" — mic re-opens briefly; explicit "no/that's all" or
+  ~6 s silence → IDLE, anything else continues the conversation). "Let's
+  chat" pins the session open. One-shot commands and open conversation are
+  the same code path; session = growing message history; a soft earcon plays
+  whenever the mic re-opens (doubles as the privacy "listening" cue). The
+  intent flag is designed and tested in the M2 text REPL before audio exists.
 - **Failure contract (M3/M4)**: per-stage timeout budget; a handful of
   pre-rendered local WAVs in the cloned voice ("the internet seems down") so
   the assistant can speak even when the cloud can't; single-flight rule — one
