@@ -125,10 +125,12 @@ Added after the 2026-08-30 adversarial review:
   AirPlay/Music Assistant, all discovery; autostarts headless and survives
   host reboots) vs Docker Desktop interim (fastest WiZ-only M1 today, but a
   guaranteed redo of HA onboarding/entities/token when M5 arrives).
-- **Default command-path model — awaiting Will's call:** Opus 5 with default
-  thinking on multi-hop commands means multi-second silences and most of the
-  budget; review insists on Sonnet 5 (or Haiku 4.5) at low effort for the
-  command path, with Opus behind an explicit escalation for open-ended asks.
+- **Default command-path model — DECIDED 2026-08-30: Opus 5 everywhere to
+  start** (Will's call: "probably fast enough"). The review's mitigations
+  still apply and matter more, not less, on Opus: instant canned ack before
+  the LLM round trip, batched area-aware tools, low effort on routine turns.
+  The M2 meter logs per-hop latency + cost precisely so this decision gets
+  re-examined with real data; the downshift is a one-line `.env` change.
 - Whose voice to clone for TTS, and record the 1–2 min sample (Starter-tier instant clone).
 - Wake phrase — stock "Hey Jarvis" until custom training day; pick the real phrase.
 - Can pyatv deep-link a specific YouTube video, or only launch the app? (Settles M5 stretch scope.)
