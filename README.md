@@ -66,6 +66,9 @@ none of the pipeline.
 | 8 | **Satellites & Pi** — client/server split (thin mic/speaker/wake satellites → central brain), multi-device wake arbitration (closest responds), barge-in, custom wake phrase, custom voice clone | |
 | 9 | **Claude dispatch** — voice-launch Claude Code tasks on the desktop (Agent SDK, headless, own worktree + constrained permissions, voice-ID-gated) and voice status checks on projects/sessions | |
 
+Per-feature detail, hardware plan, and open questions live in the working
+backlog: [docs/FEATURES.md](docs/FEATURES.md).
+
 ## Setup
 
 Prereqs: Docker Desktop (running), [uv](https://docs.astral.sh/uv/), git.
