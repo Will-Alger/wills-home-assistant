@@ -93,6 +93,15 @@ class Settings(BaseSettings):
     # open speakers the mic hears the assistant and it interrupts itself.
     realtime_talk_over: bool = False
 
+    # Milestone 6: Apple Calendar over iCloud CalDAV. The password MUST be an
+    # app-specific one (appleid.apple.com); the Apple ID password is rejected.
+    # Both empty = the calendar tools stay hidden from the assistant.
+    icloud_username: str = ""
+    icloud_app_password: str = ""
+    icloud_caldav_url: str = "https://caldav.icloud.com"
+    # Which calendar to read/write by default. "" = the account's first one.
+    icloud_calendar_name: str = ""
+
     # Alternate engine: ElevenLabs streaming TTS pipeline (custom voice, parked)
     elevenlabs_api_key: str = ""
     elevenlabs_voice_id: str = ""

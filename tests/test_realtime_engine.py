@@ -23,6 +23,15 @@ def test_tools_convert_to_realtime_shape() -> None:
         assert "input_schema" not in tool  # anthropic name must not leak
 
 
+def test_calendar_tools_appear_only_when_a_calendar_is_configured() -> None:
+    without = [tool["name"] for tool in realtime_tools()]
+    assert "list_calendar_events" not in without  # never advertise a calendar we can't read
+    with_calendar = [tool["name"] for tool in realtime_tools(calendar=True)]
+    assert "list_calendar_events" in with_calendar
+    assert "create_calendar_event" in with_calendar
+    assert with_calendar[-1] == "end_conversation"
+
+
 def test_downsample_produces_wake_sized_frames() -> None:
     frame_24k = np.zeros(FRAME_SAMPLES_24K, dtype=np.int16).tobytes()
     out = downsample_24k_to_16k(frame_24k)

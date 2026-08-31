@@ -9,9 +9,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from assistant.calendar.base import (
+    CalendarApi,
+    CalendarEvent,
+    as_datetime,
+    default_end,
+    local_tz,
+    parse_when,
+    spoken_now,
+    spoken_when,
+)
 from assistant.home.base import HomeApi, Light, LightCommand
 
 REPO_ROOT = Path(__file__).resolve().parents[3]  # the assistant's own codebase
@@ -228,6 +239,68 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
 ]
 
+# Only offered when an iCloud account is configured (see RealtimeEngine) —
+# an assistant that lists a calendar tool it can't reach invents answers.
+CALENDAR_TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "list_calendar_events",
+        "description": (
+            "Read what's scheduled on the owner's Apple calendar. Defaults to "
+            "the next week from now. ALWAYS call this before answering "
+            "anything about the schedule ('what's on today', 'am I free "
+            "Thursday', 'when is the dentist') — never answer from memory."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "start": {
+                    "type": "string",
+                    "description": (
+                        "ISO local date or datetime (2026-09-02 or "
+                        "2026-09-02T15:00); defaults to now"
+                    ),
+                },
+                "end": {
+                    "type": "string",
+                    "description": "ISO local date or datetime; defaults to a week after start",
+                },
+                "calendar": {"type": "string", "description": "calendar name; omit for the default"},
+            },
+        },
+    },
+    {
+        "name": "create_calendar_event",
+        "description": (
+            "Add an event to the owner's Apple calendar. Work the exact date "
+            "out yourself from the current time in your instructions, restate "
+            "title, day and time aloud, and only call this after an explicit "
+            "yes. A date-only start makes it all-day; otherwise it lasts an "
+            "hour unless you give end or duration_minutes."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string", "description": "what the event is called"},
+                "start": {
+                    "type": "string",
+                    "description": "ISO local datetime (2026-09-02T15:00), or a date for all-day",
+                },
+                "end": {"type": "string", "description": "ISO local datetime"},
+                "duration_minutes": {"type": "integer", "minimum": 1},
+                "location": {"type": "string"},
+                "description": {"type": "string"},
+                "calendar": {"type": "string", "description": "calendar name; omit for the default"},
+            },
+            "required": ["summary", "start"],
+        },
+    },
+]
+_CALENDAR_TOOL_NAMES = frozenset(tool["name"] for tool in CALENDAR_TOOLS)
+
+_DEFAULT_EVENT_MINUTES = 60
+_DEFAULT_WINDOW_DAYS = 7
+_MAX_EVENTS_REPORTED = 40
+
 
 # The escape hatch controls the HOME, never the infrastructure.
 _DENIED_DOMAINS = frozenset(
@@ -239,8 +312,9 @@ _DENIED_SERVICES = frozenset(
 
 
 class ToolExecutor:
-    def __init__(self, home: HomeApi) -> None:
+    def __init__(self, home: HomeApi, calendar: CalendarApi | None = None) -> None:
         self._home = home
+        self._calendar = calendar
 
     async def execute(self, name: str, tool_input: dict[str, Any]) -> tuple[str, bool]:
         """Returns (result_text, is_error)."""
@@ -302,6 +376,8 @@ class ToolExecutor:
                     return f"service {domain}.{service} is not allowed from voice", True
                 await self._home.generic_call(domain, service, dict(tool_input.get("data") or {}))
                 return f"called {domain}.{service}", False
+            if name in _CALENDAR_TOOL_NAMES:
+                return await self._calendar_tool(name, tool_input), False
             if name == "show_me":
                 return self._show_me(tool_input), False
             if name == "project_status":
@@ -347,6 +423,57 @@ class ToolExecutor:
                 )
         await self._home.apply(commands)
         return f"Done: {len(commands)} light(s) updated."
+
+    async def _calendar_tool(self, name: str, tool_input: dict[str, Any]) -> str:
+        if self._calendar is None:
+            raise ValueError(
+                "the calendar isn't connected — it needs an iCloud Apple ID and "
+                "app-specific password in the settings"
+            )
+        target = str(tool_input.get("calendar") or "").strip() or None
+        if name == "list_calendar_events":
+            now = datetime.now(tz=local_tz())
+            start_spec = str(tool_input.get("start") or "").strip()
+            start = as_datetime(parse_when(start_spec)) if start_spec else now
+            end_spec = str(tool_input.get("end") or "").strip()
+            end = (
+                as_datetime(parse_when(end_spec), end_of_day=True)
+                if end_spec
+                else start + timedelta(days=_DEFAULT_WINDOW_DAYS)
+            )
+            if end <= start:
+                raise ValueError("that range ends before it starts")
+            events = await self._calendar.list_events(start, end, calendar=target)
+            return json.dumps(
+                {
+                    "now": spoken_now(now),
+                    "events": [_event_view(event) for event in events[:_MAX_EVENTS_REPORTED]],
+                }
+            )
+
+        summary = str(tool_input.get("summary") or "").strip()
+        if not summary:
+            raise ValueError("an event needs a title")
+        start_when = parse_when(str(tool_input.get("start") or ""))
+        end_spec = str(tool_input.get("end") or "").strip()
+        minutes = tool_input.get("duration_minutes")
+        if end_spec:
+            end_when = parse_when(end_spec)
+        elif minutes:
+            end_when = default_end(start_when, int(minutes))
+        else:
+            end_when = default_end(start_when, _DEFAULT_EVENT_MINUTES)
+        if end_when is not None and as_datetime(end_when) <= as_datetime(start_when):
+            raise ValueError("that event would end before it starts")
+        created = await self._calendar.create_event(
+            summary=summary,
+            start=start_when,
+            end=end_when,
+            calendar=target,
+            location=str(tool_input.get("location") or "").strip() or None,
+            description=str(tool_input.get("description") or "").strip() or None,
+        )
+        return f'Added "{created.summary}" to {created.calendar}: {spoken_when(created)}.'
 
     def _show_me(self, tool_input: dict[str, Any]) -> str:
         import html
@@ -447,6 +574,22 @@ def _resolve_target(target: str, lights: list[Light]) -> list[Light]:
     if by_entity:
         return by_entity
     return [light for light in lights if (light.area or "").lower() == needle]
+
+
+def _event_view(event: CalendarEvent) -> dict[str, Any]:
+    """Speakable "when" first; ISO start so follow-up calls can be precise."""
+    view: dict[str, Any] = {
+        "summary": event.summary,
+        "when": spoken_when(event),
+        "start": event.start.isoformat(),
+    }
+    if event.all_day:
+        view["all_day"] = True
+    if event.location:
+        view["location"] = event.location
+    if event.calendar:
+        view["calendar"] = event.calendar
+    return view
 
 
 def _light_state_view(light: Light) -> dict[str, Any]:
