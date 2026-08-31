@@ -54,6 +54,7 @@ class HomeAssistantClient:
             headers={"Authorization": f"Bearer {token}"},
             timeout=timeout,
         )
+        self._ma_entry_id: str | None = None  # cached Music Assistant config entry
 
     async def __aenter__(self) -> Self:
         return self
@@ -256,15 +257,63 @@ class HomeAssistantClient:
         )
 
     async def call_service(
-        self, domain: str, service: str, data: dict[str, Any], *, timeout: float | None = None
+        self,
+        domain: str,
+        service: str,
+        data: dict[str, Any],
+        *,
+        timeout: float | None = None,
+        return_response: bool = False,
     ) -> Any:
+        url = f"/api/services/{domain}/{service}"
+        if return_response:
+            url += "?return_response"
         resp = await self._http.post(
-            f"/api/services/{domain}/{service}",
+            url,
             json=data,
             timeout=timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT,
         )
         self._check(resp)
-        return resp.json()
+        payload = resp.json()
+        if return_response and isinstance(payload, dict):
+            return payload.get("service_response", {})
+        return payload
+
+    async def music_library(
+        self,
+        media_type: str = "playlist",
+        search: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Browse the Music Assistant library (verified live 2026-08-31:
+        get_library needs the MA config_entry_id and ?return_response)."""
+        if self._ma_entry_id is None:
+            resp = await self._http.get("/api/config/config_entries/entry?domain=music_assistant")
+            self._check(resp)
+            entries = resp.json()
+            if not entries:
+                raise HomeAssistantError("Music Assistant is not set up in Home Assistant")
+            self._ma_entry_id = entries[0]["entry_id"]
+        data: dict[str, Any] = {
+            "config_entry_id": self._ma_entry_id,
+            "media_type": media_type,
+            "limit": max(1, min(limit, 100)),
+        }
+        if search:
+            data["search"] = search
+        result = await self.call_service(
+            "music_assistant", "get_library", data, return_response=True
+        )
+        items = result.get("items", []) if isinstance(result, dict) else []
+        return [
+            {
+                "name": i.get("name", ""),
+                "media_type": i.get("media_type", media_type),
+                "artists": [a.get("name") for a in i.get("artists", [])] or None,
+            }
+            for i in items
+            if isinstance(i, dict)
+        ]
 
     async def light_on(
         self,

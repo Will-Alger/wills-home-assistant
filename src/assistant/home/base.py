@@ -111,3 +111,9 @@ class HomeApi(Protocol):
     ) -> None: ...
 
     async def launch_app(self, entity_id: str, app: str) -> None: ...
+
+    async def music_library(
+        self, media_type: str = "playlist", search: str | None = None, limit: int = 50
+    ) -> list[dict]:
+        """Browse the music library: what playlists/artists/albums exist."""
+        ...

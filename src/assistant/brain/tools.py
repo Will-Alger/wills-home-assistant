@@ -70,13 +70,36 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "input_schema": {"type": "object", "properties": {}},
     },
     {
+        "name": "browse_music",
+        "description": (
+            "List what actually exists in the music library: the owner's "
+            "playlists (default), artists, albums, or tracks. Use it when "
+            "asked what playlists there are, and BEFORE play_music whenever "
+            "you are not sure of the exact name — play_music needs a close "
+            "match, so check instead of guessing. Optional search filters by "
+            "name fragment."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "media_type": {
+                    "type": "string",
+                    "enum": ["playlist", "artist", "album", "track", "radio"],
+                },
+                "search": {"type": "string", "description": "name fragment to filter by"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            },
+        },
+    },
+    {
         "name": "play_music",
         "description": (
-            "Play music via Music Assistant (Spotify library behind it). "
+            "Play music via Music Assistant (Apple Music library behind it). "
             "media_id is a plain NAME — playlist, artist, track, or album name; "
             "search is built in. Use radio_mode for open-ended vibes ('play "
             "something relaxing' → a fitting artist/track + radio_mode). Omit "
-            "player to use the default music player."
+            "player to use the default music player. Unsure of a playlist's "
+            "exact name? browse_music first."
         ),
         "input_schema": {
             "type": "object",
@@ -266,6 +289,15 @@ class ToolExecutor:
                     f"{note}Started on {player.name} (audio may take a few seconds to begin).",
                     False,
                 )
+            if name == "browse_music":
+                items = await self._home.music_library(
+                    media_type=str(tool_input.get("media_type", "playlist")),
+                    search=tool_input.get("search"),
+                    limit=int(tool_input.get("limit", 50)),
+                )
+                if not items:
+                    return "the library has nothing matching that", False
+                return json.dumps(items)[:2500], False
             if name == "media_control":
                 player = await self._resolve_player(tool_input.get("player"), kind=None)
                 await self._home.media_command(

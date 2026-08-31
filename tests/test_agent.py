@@ -166,6 +166,22 @@ async def test_play_music_wakes_a_sleeping_tv_first():
 
 
 @pytest.mark.asyncio
+async def test_browse_music_lists_playlists_and_filters():
+    executor = ToolExecutor(FakeHome())
+    text, is_error = await executor.execute("browse_music", {})
+    assert not is_error
+    names = [i["name"] for i in json.loads(text)]
+    assert "Cleveland 10K" in names and "Chill Vibes" in names
+
+    text, is_error = await executor.execute("browse_music", {"search": "cleveland"})
+    assert not is_error
+    assert [i["name"] for i in json.loads(text)] == ["Cleveland 10K"]
+
+    text, is_error = await executor.execute("browse_music", {"search": "zzz"})
+    assert not is_error and "nothing matching" in text
+
+
+@pytest.mark.asyncio
 async def test_launch_app_targets_the_tv():
     home = FakeHome()
     executor = ToolExecutor(home)

@@ -110,6 +110,22 @@ class FakeHome:
     async def launch_app(self, entity_id: str, app: str) -> None:
         self.launched.append((entity_id, app))
 
+    async def music_library(
+        self, media_type: str = "playlist", search: str | None = None, limit: int = 50
+    ) -> list[dict]:
+        library = {
+            "playlist": [
+                {"name": "Chill Vibes", "media_type": "playlist", "artists": None},
+                {"name": "Workout Mix", "media_type": "playlist", "artists": None},
+                {"name": "Cleveland 10K", "media_type": "playlist", "artists": None},
+            ],
+            "artist": [{"name": "Dave Brubeck", "media_type": "artist", "artists": None}],
+        }
+        items = library.get(media_type, [])
+        if search:
+            items = [i for i in items if search.lower() in i["name"].lower()]
+        return items[:limit]
+
     def _all_entities(self) -> list[dict]:
         rows = [
             {"entity_id": light.entity_id, "name": light.name,
