@@ -7,6 +7,7 @@ is a full LLM round trip, so per-bulb tools would multiply dead air.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -147,6 +148,7 @@ class ToolExecutor:
                 return await self._set_lights(tool_input), False
             if name == "play_music":
                 player = await self._resolve_player(tool_input.get("player"), kind="music")
+                woke = await self._wake_tv_if_off()
                 await self._home.play_music(
                     player.entity_id,
                     str(tool_input["media_id"]),
@@ -156,7 +158,11 @@ class ToolExecutor:
                     enqueue=tool_input.get("enqueue"),
                     radio_mode=bool(tool_input.get("radio_mode", False)),
                 )
-                return f"Started on {player.name} (audio may take a few seconds to begin).", False
+                note = "Woke the TV first. " if woke else ""
+                return (
+                    f"{note}Started on {player.name} (audio may take a few seconds to begin).",
+                    False,
+                )
             if name == "media_control":
                 player = await self._resolve_player(tool_input.get("player"), kind=None)
                 await self._home.media_command(
@@ -167,6 +173,7 @@ class ToolExecutor:
                 return f"Done ({tool_input['action']} on {player.name}).", False
             if name == "launch_app":
                 player = await self._resolve_player(tool_input.get("player"), kind="tv")
+                await self._wake_tv_if_off()
                 await self._home.launch_app(player.entity_id, str(tool_input["app"]))
                 return f"Opened {tool_input['app']} on {player.name}.", False
             return f"Unknown tool: {name}", True
@@ -199,6 +206,20 @@ class ToolExecutor:
                 )
         await self._home.apply(commands)
         return f"Done: {len(commands)} light(s) updated."
+
+    async def _wake_tv_if_off(self) -> bool:
+        """Music rides through the Apple TV — wake it before playing/launching.
+        Only auto-wakes when exactly one TV exists and it's clearly not on."""
+        tvs_off = [
+            p
+            for p in await self._home.media_players()
+            if p.kind == "tv" and p.state in ("off", "standby", "unavailable", "unknown")
+        ]
+        if len(tvs_off) != 1:
+            return False
+        await self._home.media_command(tvs_off[0].entity_id, "turn_on")
+        await asyncio.sleep(3)  # give it a beat to wake before streaming at it
+        return True
 
     async def _resolve_player(self, spec, kind: str | None):
         """Pick a media player by name/entity_id fragment; default by kind."""

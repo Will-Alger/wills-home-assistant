@@ -147,6 +147,25 @@ async def test_play_music_defaults_to_the_music_player():
 
 
 @pytest.mark.asyncio
+async def test_play_music_wakes_a_sleeping_tv_first():
+    from dataclasses import replace as dc_replace
+
+    home = FakeHome()
+    home.players = [
+        home.players[0],
+        dc_replace(home.players[1], state="off"),
+    ]
+    executor = ToolExecutor(home)
+    text, is_error = await executor.execute(
+        "play_music", {"media_id": "Focus Beats", "media_type": "playlist"}
+    )
+    assert not is_error, text
+    assert ("media_player.living_room_tv", "turn_on") in home.media_commands
+    assert "Woke the TV" in text
+    assert home.played  # and the music still started
+
+
+@pytest.mark.asyncio
 async def test_launch_app_targets_the_tv():
     home = FakeHome()
     executor = ToolExecutor(home)
