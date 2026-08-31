@@ -34,8 +34,10 @@ class WakeDetector:
             self._model = Model(wakeword_models=[model], inference_framework="onnx")
         except Exception:  # noqa: BLE001 — whatever failed, a fresh model
             # download is the one self-repair worth trying before giving up.
-            # First run: pretrained models need downloading (one-time, needs net).
-            openwakeword.utils.download_models()
+            # First run: download ONLY the requested model (plus the shared
+            # feature models the library always needs) — not the whole zoo.
+            names = [] if model.endswith((".onnx", ".tflite")) else [model]
+            openwakeword.utils.download_models(model_names=names or ["alexa"])
             self._model = Model(wakeword_models=[model], inference_framework="onnx")
         self.threshold = threshold
         self._cooldown_s = cooldown_s
