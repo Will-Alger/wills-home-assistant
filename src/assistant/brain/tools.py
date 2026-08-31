@@ -194,6 +194,24 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "input_schema": {"type": "object", "properties": {}},
     },
     {
+        "name": "show_me",
+        "description": (
+            "Display something on the owner's desktop screen: open an https "
+            "URL in the browser (a cloud work session, a pull request, a "
+            "dashboard), or render a short text note as a page. Use when asked "
+            "to 'show me', 'pull it up', 'open it on my screen'. Offer it "
+            "proactively when you're holding a URL worth seeing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "https URL to open"},
+                "text": {"type": "string", "description": "short note to display (if no url)"},
+                "title": {"type": "string"},
+            },
+        },
+    },
+    {
         "name": "launch_app",
         "description": (
             "Open an app on the TV (see the TV's app list in your instructions), "
@@ -284,6 +302,8 @@ class ToolExecutor:
                     return f"service {domain}.{service} is not allowed from voice", True
                 await self._home.generic_call(domain, service, dict(tool_input.get("data") or {}))
                 return f"called {domain}.{service}", False
+            if name == "show_me":
+                return self._show_me(tool_input), False
             if name == "project_status":
                 return await self._project_status(), False
             if name == "read_roadmap":
@@ -327,6 +347,33 @@ class ToolExecutor:
                 )
         await self._home.apply(commands)
         return f"Done: {len(commands)} light(s) updated."
+
+    def _show_me(self, tool_input: dict[str, Any]) -> str:
+        import html
+        import time
+        import webbrowser
+
+        url = str(tool_input.get("url") or "").strip()
+        if url:
+            if not url.startswith(("http://", "https://")):
+                raise ValueError("only http(s) URLs can be shown")
+            webbrowser.open(url)
+            return "opened on the desktop screen"
+        text = str(tool_input.get("text") or "").strip()
+        if not text:
+            raise ValueError("give me a url or some text to show")
+        title = html.escape(str(tool_input.get("title") or "From Alexa"))
+        page = REPO_ROOT / "data" / "shown" / f"note-{int(time.time())}.html"
+        page.parent.mkdir(parents=True, exist_ok=True)
+        page.write_text(
+            "<meta charset='utf-8'><title>" + title + "</title>"
+            "<body style='font:18px/1.6 system-ui;max-width:640px;margin:8vh auto;"
+            "padding:0 24px'><h2>" + title + "</h2>"
+            "<pre style='white-space:pre-wrap;font:inherit'>" + html.escape(text) + "</pre>",
+            encoding="utf-8",
+        )
+        webbrowser.open(page.as_uri())
+        return "showing it on the desktop screen"
 
     async def _project_status(self) -> str:
         async def git(*args: str) -> str:

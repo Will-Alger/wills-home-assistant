@@ -184,6 +184,28 @@ async def test_ambiguous_media_control_lists_players():
 
 
 @pytest.mark.asyncio
+async def test_show_me_opens_urls_and_rejects_non_http(monkeypatch):
+    import webbrowser
+
+    opened = []
+    monkeypatch.setattr(webbrowser, "open", lambda target: opened.append(target))
+    executor = ToolExecutor(FakeHome())
+
+    text, is_error = await executor.execute(
+        "show_me", {"url": "https://claude.ai/code/session_x"}
+    )
+    assert not is_error and opened == ["https://claude.ai/code/session_x"]
+
+    _text, is_error = await executor.execute("show_me", {"url": "file:///C:/windows"})
+    assert is_error  # only http(s)
+
+    text, is_error = await executor.execute(
+        "show_me", {"text": "milk\neggs", "title": "Groceries"}
+    )
+    assert not is_error and len(opened) == 2 and opened[1].startswith("file://")
+
+
+@pytest.mark.asyncio
 async def test_self_awareness_tools_read_the_real_repo():
     executor = ToolExecutor(FakeHome())
     status, is_error = await executor.execute("project_status", {})
