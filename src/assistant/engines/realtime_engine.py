@@ -81,7 +81,10 @@ error's advice instead. The TV can open apps via launch_app. The home holds \
 MORE than the lights and media listed below — thermostats, switches, scenes, \
 sensors, weather: discover with search_entities, read with get_entity, act \
 via ha_call_service (the escape hatch — prefer the dedicated tools whenever \
-one fits). If something is truly beyond your tools, say so honestly.
+one fits). Questions about the world outside the home — store hours, news, \
+scores, facts, "is the highway closed" — go to web_search: say you're \
+checking, then give the answer in a sentence or two with one source named. \
+If something is truly beyond your tools, say so honestly.
 
 Lights:
 {devices}
@@ -123,10 +126,12 @@ read the gist back, get an explicit yes, then start_task with \
 confirmed=true. An Opus coding agent builds it on a sandboxed branch in the \
 background and you will ANNOUNCE milestones and completion on your own — \
 never poll or guess; if asked meanwhile, use task_detail. (2) When a task is \
-built and {owner} approves — his explicit yes for THIS task — approve_task \
-merges it (gates run lint and tests first); then offer restart_self so it \
-takes effect, and after coming back try the new capability and report \
-honestly. If it is hopeless, abandon_task. Board questions ("what's in \
+built, offer switch_build: with his yes you restart INTO that branch so he \
+can test it by talking to you; switch_build main brings you back, and \
+switching is free and reversible as often as he likes. (3) When {owner} \
+approves — his explicit yes for THIS task — approve_task merges it (gates \
+run lint and tests first) and you restart onto main; after coming back try \
+the new capability and report honestly. If it is hopeless, abandon_task. Board questions ("what's in \
 flight?", "what did you finish today?", "did we ever build X?") go through \
 list_tasks, task_detail, and search_tasks — never memory. One feature per \
 task; tasks persist across days and restarts. Open tasks right now: {tasks}. \
@@ -318,6 +323,25 @@ TASK_TOOLS: list[dict[str, Any]] = [
     },
     {
         "type": "function",
+        "name": "switch_build",
+        "description": (
+            "Restart yourself INTO a built task's branch so the owner can test "
+            "it by talking to you, or back to main (target='main'). Free and "
+            "reversible, any number of times; nothing is merged or lost. Only "
+            "after the owner's yes. After calling: say a brief goodbye and end "
+            "the conversation — you'll be back in about twenty seconds."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "a task id, or 'main'"},
+                "confirmed": {"type": "boolean"},
+            },
+            "required": ["target", "confirmed"],
+        },
+    },
+    {
+        "type": "function",
         "name": "approve_task",
         "description": (
             "Promote a BUILT task to main: lint/tests/clean-main gates, merge, "
@@ -460,6 +484,7 @@ class RealtimeEngine:
         calendar: CalendarApi | None = None,
         usage_log: Path | None = None,
         announcer: Any | None = None,
+        web: Any | None = None,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
         self._model = model
@@ -468,7 +493,7 @@ class RealtimeEngine:
         self.restart_requested = False  # set by restart_self; the runner acts on it
         self._home = home
         self._calendar = calendar
-        self._executor = ToolExecutor(home, calendar)
+        self._executor = ToolExecutor(home, calendar, web)
         self._owner = owner
         self._name = name
         self._wake_phrase = wake_phrase
@@ -716,17 +741,34 @@ class RealtimeEngine:
                 return note + board.detail(args.get("id"), log_tail=bool(args.get("log_tail"))), False
             if name == "search_tasks":
                 return board.search(str(args.get("query", ""))), False
+            if name == "switch_build":
+                if (blocked := needs_yes("switching builds")) is not None:
+                    return blocked
+                text = await board.switch_build(args.get("target", "main"))
+                self._absorb_restart(board)
+                return text, False
             if name == "approve_task":
                 if (blocked := needs_yes("merging it")) is not None:
                     return blocked
-                return await board.approve(args.get("id"), branch=str(args.get("branch", "") or "")), False
+                text = await board.approve(args.get("id"), branch=str(args.get("branch", "") or ""))
+                self._absorb_restart(board)
+                return text, False
             if name == "abandon_task":
                 if (blocked := needs_yes("abandoning it")) is not None:
                     return blocked
-                return board.abandon(args.get("id")), False
+                text = board.abandon(args.get("id"))
+                self._absorb_restart(board)
+                return text, False
             return f"unknown task tool {name}", True
         except Exception as err:  # noqa: BLE001 — surfaced to the model, never crashes
             return f"task board: {str(err) or type(err).__name__}", True
+
+    def _absorb_restart(self, board: Any) -> None:
+        """A switch/approve/abandon that changed which build runs asks for a
+        restart the same way restart_self does: exit after the goodbye."""
+        if getattr(board, "restart_requested", False):
+            board.restart_requested = False
+            self.restart_requested = True
 
     def _execute_memory(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
         if self._memory is None:

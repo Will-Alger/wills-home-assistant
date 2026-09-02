@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import os
 import wave
 from pathlib import Path
 
@@ -26,7 +27,7 @@ from assistant.app import wait_for_trigger
 from assistant.audio import tones
 from assistant.audio.mic import Microphone, describe_device
 from assistant.audio.speaker import Speaker
-from assistant.config import load_settings
+from assistant.config import home_dir, load_settings
 from assistant.dispatch import Dispatcher, load_extra_routines
 from assistant.engines.realtime_engine import (
     FRAME_SAMPLES_24K,
@@ -40,6 +41,7 @@ from assistant.llm.anthropic_provider import AnthropicProvider
 from assistant.memory import MemoryStore
 from assistant.tasks import TaskBoard
 from assistant.wake.detector import WakeDetector
+from assistant.web import WebSearch
 
 console = Console()
 
@@ -117,7 +119,8 @@ def build_engine(fake: bool):
     home = FakeHome() if fake else HomeAssistantClient(settings.ha_url, settings.ha_token)
     if not fake:
         settings.require("ha_url", "ha_token")
-    root = Path(__file__).resolve().parents[1]
+    root = home_dir()  # .env, data/, logs/: the MAIN repo even when staged
+    staged = os.environ.get("ALEXA_STAGED_TASK", "").strip()
     memory = MemoryStore(root / "data" / "memory.json")
     announcer = Announcer(
         root / "data" / "announcements.json",
@@ -168,12 +171,19 @@ def build_engine(fake: bool):
                     effort=settings.dispatch_effort,
                 ),
                 announcer=announcer,
+                staged_task_id=int(staged) if staged.isdigit() else None,
+                uv_exe=settings.uv_exe,
             )
             if settings.use_claude_subscription
             else None
         ),
         usage_log=root / ".usage.jsonl",
         announcer=announcer,
+        web=WebSearch(
+            settings.openai_api_key,
+            model=settings.web_search_model,
+            context_size=settings.web_search_context,
+        ),
     )
     return settings, home, engine, reflector
 
@@ -208,6 +218,13 @@ async def text_probe(fake: bool, text: str) -> int:
 
 async def voice(fake: bool) -> int:
     settings, _home, engine, reflector = build_engine(fake)
+    board = getattr(engine, "_board", None)
+    if board is not None:
+        with contextlib.suppress(Exception):  # housekeeping must never block boot
+            await board.startup_maintenance()
+    staged = os.environ.get("ALEXA_STAGED_TASK", "").strip()
+    if staged:
+        console.print(f"[magenta]◈ running the STAGED build of task {staged}[/magenta]")
     console.print("Loading wake model...")
     wake = WakeDetector(settings.wake_model, threshold=settings.wake_threshold)
     session_wake = WakeDetector(settings.wake_model, threshold=settings.wake_threshold)

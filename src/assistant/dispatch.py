@@ -20,8 +20,11 @@ touch .env/data or push/merge. Spoken confirmation is enforced upstream.
 from __future__ import annotations
 
 import asyncio
+import glob
 import json
+import os
 import re
+import shutil
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -312,6 +315,31 @@ class Dispatcher:
             run.status = "failed" if event.get("is_error") else "done"
             return "result"
         return ""
+
+    # ── dependencies ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def resolve_uv(configured: str = "") -> str | None:
+        """uv.exe: the configured path, PATH, then the WinGet install dir."""
+        if configured and Path(configured).exists():
+            return configured
+        found = shutil.which("uv")
+        if found:
+            return found
+        local = os.environ.get("LOCALAPPDATA", "")
+        if local:
+            hits = glob.glob(str(Path(local) / "Microsoft" / "WinGet" / "Packages" / "astral-sh.uv_*" / "uv.exe"))
+            if hits:
+                return hits[0]
+        return None
+
+    async def uv_sync(self, cwd: Path, uv_exe: str = "") -> tuple[bool, str]:
+        """Make a checkout's .venv match its lockfile (a branch may add deps)."""
+        uv = self.resolve_uv(uv_exe)
+        if uv is None:
+            return False, "uv was not found (set UV_EXE in .env)"
+        code, out = await self._cmd([uv, "sync", "--quiet"], cwd, timeout=600.0)
+        return code == 0, out[-300:].strip()
 
     # ── merge gates ─────────────────────────────────────────────────────────
 

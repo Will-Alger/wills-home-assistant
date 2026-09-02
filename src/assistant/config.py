@@ -8,13 +8,28 @@ when a needed value is missing.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Anchor .env to the repo root so `uv run` works from any directory.
-# Real environment variables always take precedence over the file.
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+def code_root() -> Path:
+    """The checkout this code was imported from (main, or a staged worktree)."""
+    return Path(__file__).resolve().parents[2]
+
+
+def home_dir() -> Path:
+    """Where .env, data/ and logs/ live: the MAIN repo, even when the code
+    runs from a staged worktree (the watchdog sets ALEXA_HOME)."""
+    override = os.environ.get("ALEXA_HOME", "").strip()
+    return Path(override).resolve() if override else code_root()
+
+
+# Anchor .env to the home dir so `uv run` works from any directory and a
+# staged worktree still reads the real secrets. Real environment variables
+# always take precedence over the file.
+_REPO_ROOT = home_dir()
 
 
 class MissingSettingError(RuntimeError):
@@ -60,6 +75,13 @@ class Settings(BaseSettings):
     # this many times before it is dropped with a log line.
     announce_quiet_hours: str = "23:00-08:00"
     announce_max_attempts: int = 4
+    # Path to uv.exe for syncing a staged branch's dependencies; "" = look on
+    # PATH, then the WinGet install location.
+    uv_exe: str = ""
+    # Web search (OpenAI Responses API web_search tool, same OPENAI_API_KEY):
+    # the model that reads the results, and how much context it pulls.
+    web_search_model: str = "gpt-5-mini"
+    web_search_context: str = "low"
 
     # Milestone 2: LLM
     anthropic_api_key: str = ""

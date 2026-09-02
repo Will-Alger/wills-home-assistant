@@ -11,7 +11,6 @@ import asyncio
 import contextlib
 import json
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 from assistant.calendar.base import (
@@ -24,9 +23,12 @@ from assistant.calendar.base import (
     spoken_now,
     spoken_when,
 )
+from assistant.config import code_root, home_dir
 from assistant.home.base import HomeApi, Light, LightCommand
 
-REPO_ROOT = Path(__file__).resolve().parents[3]  # the assistant's own codebase
+# Her own codebase: the checkout this code runs from (main or a staged
+# worktree) for docs and git; the HOME dir for anything written to data/.
+CODE_ROOT = code_root()
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
@@ -155,6 +157,20 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "player": {"type": "string", "description": "player name or entity_id"},
             },
             "required": ["action"],
+        },
+    },
+    {
+        "name": "web_search",
+        "description": (
+            "Search the web and get a short, current answer with sources — "
+            "store hours, news, scores, facts, anything outside the home. Use "
+            "it instead of guessing or saying you can't browse. Takes a few "
+            "seconds; say you're checking."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "the question, in full"}},
+            "required": ["query"],
         },
     },
     {
@@ -360,7 +376,10 @@ _DENIED_SERVICES = frozenset(
 
 
 class ToolExecutor:
-    def __init__(self, home: HomeApi, calendar: CalendarApi | None = None) -> None:
+    def __init__(
+        self, home: HomeApi, calendar: CalendarApi | None = None, web: Any | None = None
+    ) -> None:
+        self._web = web  # WebSearch, or None when no key is configured
         self._home = home
         self._calendar = calendar
 
@@ -444,6 +463,11 @@ class ToolExecutor:
                             await self._home.media_command(tvs[0].entity_id, "turn_on")
                             kept_awake = " Kept the TV awake."
                 return f"Done ({action} on {player.name} [{player.entity_id}]).{kept_awake}", False
+            if name == "web_search":
+                if self._web is None:
+                    return "web search isn't configured (it needs OPENAI_API_KEY)", True
+                answer = await self._web.search(str(tool_input.get("query", "")))
+                return str(answer)[:2000], False
             if name == "search_entities":
                 found = await self._home.search_entities(str(tool_input["query"]))
                 if not found:
@@ -479,10 +503,10 @@ class ToolExecutor:
             if name == "project_status":
                 return await self._project_status(), False
             if name == "read_roadmap":
-                roadmap = (REPO_ROOT / "docs" / "FEATURES.md").read_text(encoding="utf-8")
+                roadmap = (CODE_ROOT / "docs" / "FEATURES.md").read_text(encoding="utf-8")
                 return roadmap[:10_000], False
             if name == "read_history":
-                history = (REPO_ROOT / "docs" / "HISTORY.md").read_text(encoding="utf-8")
+                history = (CODE_ROOT / "docs" / "HISTORY.md").read_text(encoding="utf-8")
                 return history[:10_000], False
             if name == "launch_app":
                 player = await self._resolve_player(tool_input.get("player"), kind="tv")
@@ -599,7 +623,7 @@ class ToolExecutor:
         if not text:
             raise ValueError("give me a url or some text to show")
         title = html.escape(str(tool_input.get("title") or "From Alexa"))
-        page = REPO_ROOT / "data" / "shown" / f"note-{int(time.time())}.html"
+        page = home_dir() / "data" / "shown" / f"note-{int(time.time())}.html"
         page.parent.mkdir(parents=True, exist_ok=True)
         page.write_text(
             "<meta charset='utf-8'><title>" + title + "</title>"
@@ -616,7 +640,7 @@ class ToolExecutor:
             proc = await asyncio.create_subprocess_exec(
                 "git",
                 *args,
-                cwd=REPO_ROOT,
+                cwd=CODE_ROOT,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

@@ -48,6 +48,34 @@ _TRANSITIONS: dict[str, set[str]] = {
 
 _MAX_MILESTONES = 3
 _STATUS_LINE_LIMIT = 5
+POINTER_NAME = "active_checkout.json"
+
+
+def pointer_path(root: Path) -> Path:
+    return root / "data" / POINTER_NAME
+
+
+def read_pointer(root: Path) -> dict[str, Any] | None:
+    path = pointer_path(root)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) and data.get("task_id") else None
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def write_pointer(root: Path, data: dict[str, Any]) -> None:
+    path = pointer_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def clear_pointer(root: Path) -> None:
+    pointer_path(root).unlink(missing_ok=True)
 
 
 @dataclass
@@ -156,11 +184,16 @@ class TaskBoard:
         runner: Any,
         announcer: Any | None = None,
         now: Callable[[], float] = time.time,
+        staged_task_id: int | None = None,
+        uv_exe: str = "",
     ) -> None:
         self._root = root
         self._runner = runner
         self._announcer = announcer
         self._now = now
+        self._staged_task_id = staged_task_id  # this PROCESS runs that task's build
+        self._uv_exe = uv_exe
+        self.restart_requested = False  # a switch/approve/abandon wants a restart
         self._path = root / "data" / "tasks.json"
         self._next_id = 1
         self._tasks: dict[int, Task] = {}
@@ -427,7 +460,7 @@ class TaskBoard:
             self._announce(
                 f"Task {task.id}, '{task.title}', is built and ready for your test."
                 + (f" The agent says: {gist}." if gist else "")
-                + f" Say 'approve task {task.id}' to merge it, or ask me for its details.",
+                + f" Say 'switch to task {task.id}' to try it, or 'approve task {task.id}' to merge it.",
                 kind="task",
                 ref=f"task:{task.id}:{iteration.n}:built",
             )
@@ -514,18 +547,49 @@ class TaskBoard:
         task.merged_at = self._now()
         task.cleanup_pending = task.mode == "local"
         self._log(task, "merged", merge_ref)
+        # main's venv must match the merged lockfile BEFORE anything restarts
+        # into it: a crash-looping main is the one thing the watchdog can't
+        # roll back from.
+        synced, note = await self._runner.uv_sync(self._root, self._uv_exe)
+        pointer = read_pointer(self._root)
+        if not synced and "not found" not in note:
+            self._save()
+            return (
+                f"{message} Task {task.id} is merged, but syncing main's dependencies failed "
+                f"({note}) — NOT restarting; the owner should run uv sync and restart by hand."
+            )
+        if pointer is not None:
+            clear_pointer(self._root)
+            for other in self._tasks.values():
+                if other.state == "staged":
+                    other.state = "built"
+                    self._log(other, "unstaged", f"task {task.id} merged")
         self._save()
+        if self._staged_task_id is not None:
+            self.restart_requested = True
+            return (
+                f"{message} Task {task.id} is merged into main — restarting onto main now: "
+                "say a brief goodbye and end the conversation."
+            )
         return f"{message} Task {task.id} is merged — offer to restart yourself so it takes effect."
 
     def abandon(self, ref: Any) -> str:
         task = self.get(ref)
         self._check(task, "abandon")
+        was_staged = task.state == "staged"
         task.state = "abandoned"
         task.closed = True
         task.cleanup_pending = task.mode == "local"
         self._log(task, "abandoned")
+        pointer = read_pointer(self._root)
+        if pointer is not None and int(pointer.get("task_id", 0)) == task.id:
+            clear_pointer(self._root)
         self._save()
-        return f"task {task.id} ('{task.title}') abandoned — its branch is kept if you change your mind"
+        note = f"task {task.id} ('{task.title}') abandoned — its branch is kept if you change your mind"
+        if was_staged and self._staged_task_id == task.id:
+            self.restart_requested = True
+            note += "; restarting onto main — say a brief goodbye and end the conversation"
+        return note
 
     # ── queries ────────────────────────────────────────────────────────────
 
@@ -668,4 +732,107 @@ class TaskBoard:
         return "; ".join(parts)
 
     def staged_paragraph(self) -> str:
-        return ""  # Phase 3: "you are running the STAGED build of task N…"
+        if self._staged_task_id is None or self._staged_task_id not in self._tasks:
+            return ""
+        task = self._tasks[self._staged_task_id]
+        it = task.current
+        gist = (it.summary[:300] if it and it.summary else "(no summary)")
+        return (
+            f"IMPORTANT: you are running the STAGED build of task {task.id} '{task.title}' "
+            f"(iteration {it.n if it else '?'}, not merged). What the agent built: {gist} "
+            "When it fits, ask how the test is going. 'ship it' → approve_task after a yes; "
+            "'go back to main' → switch_build main; problems → note them precisely for a "
+            "revision. "
+        )
+
+    async def switch_build(self, target: Any) -> str:
+        """Run a built task's branch (restart into it) or go back to main.
+        Free and reversible: nothing is merged, abandoned, or lost."""
+        text = str(target).strip().lower()
+        pointer = read_pointer(self._root)
+        if text in ("", "main", "master", "stable", "normal"):
+            if pointer is None and self._staged_task_id is None:
+                return "already running main — nothing to switch"
+            clear_pointer(self._root)
+            for other in self._tasks.values():
+                if other.state == "staged":
+                    other.state = "built"
+                    self._log(other, "unstaged", "switched back to main")
+            self._save()
+            self.restart_requested = True
+            return "switching back to main now — say a brief goodbye and end the conversation; back in about twenty seconds"
+        task = self.get(target)
+        self._check(task, "stage")
+        if task.mode != "local" or not task.worktree or not Path(task.worktree).exists():
+            raise DispatchError(f"task {task.id} has no local build to run (cloud tasks merge by branch)")
+        if any(t.running for t in self._tasks.values()):
+            raise DispatchError("a build is still running — switching would kill it; wait for it to finish")
+        synced, note = await self._runner.uv_sync(Path(task.worktree), self._uv_exe)
+        warning = "" if synced else f" (dependency sync skipped: {note})"
+        it = task.current
+        write_pointer(
+            self._root,
+            {
+                "task_id": task.id,
+                "slug": task.slug,
+                "worktree": task.worktree,
+                "branch": task.branch,
+                "iteration": it.n if it else 0,
+                "set_at": self._now(),
+            },
+        )
+        for other in self._tasks.values():
+            if other.state == "staged" and other.id != task.id:
+                other.state = "built"
+                self._log(other, "unstaged", f"switched to task {task.id}")
+        task.state = "staged"
+        task.staged_at = self._now()
+        self._log(task, "staged", "switching into this build")
+        self._save()
+        self.restart_requested = True
+        return (
+            f"switching to task {task.id}'s build now{warning} — say a brief goodbye and end the "
+            "conversation; back in about twenty seconds running it"
+        )
+
+    async def startup_maintenance(self) -> None:
+        """Run once at app start: absorb a rollback, confirm a staged start,
+        and remove worktrees that are no longer needed."""
+        failed = pointer_path(self._root).with_name("active_checkout.failed.json")
+        if failed.exists():
+            try:
+                data = json.loads(failed.read_text(encoding="utf-8"))
+                task = self._tasks.get(int(data.get("task_id", 0)))
+            except (json.JSONDecodeError, OSError, ValueError):
+                task = None
+            if task is not None:
+                task.state = "built"
+                task.last_error = (
+                    "the staged build crashed twice at startup and was rolled back to main — "
+                    "see logs/alexa.log"
+                )
+                self._log(task, "rolled back", "crashed at startup twice")
+            failed.unlink(missing_ok=True)
+        if self._staged_task_id is not None and self._staged_task_id in self._tasks:
+            task = self._tasks[self._staged_task_id]
+            if task.state != "staged":
+                task.state = "staged"
+                self._log(task, "staged", "process started from this build")
+            it = task.current
+            gist = it.summary.strip().split(". ")[0][:160] if it and it.summary else ""
+            self._announce(
+                f"I've restarted into the staged build of task {task.id}, '{task.title}'."
+                + (f" The agent says: {gist}." if gist else "")
+                + " Try it out — say 'go back to main' any time.",
+                kind="system",
+                ref=f"task:{task.id}:staged:{it.n if it else 0}",
+            )
+        pointer = read_pointer(self._root)
+        live = int(pointer.get("task_id", 0)) if pointer else None
+        for task in self._tasks.values():
+            if not (task.cleanup_pending and task.id != live and task.worktree):
+                continue
+            if not Path(task.worktree).exists() or await self._runner.remove_worktree(task.worktree):
+                task.cleanup_pending = False
+                self._log(task, "cleaned up", "worktree removed")
+        self._save()
