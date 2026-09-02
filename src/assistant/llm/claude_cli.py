@@ -12,11 +12,16 @@ Tools are not supported here; response_schema is enforced by instruction
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
 import json
 import time
 from typing import Any
 
 from assistant.llm.base import TurnResult, Usage
+
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0  # she runs windowless
+
 
 
 class ClaudeCliError(RuntimeError):
@@ -62,6 +67,7 @@ class ClaudeCli:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            creationflags=NO_WINDOW,
         )
         try:
             stdout, stderr = await asyncio.wait_for(

@@ -8,6 +8,8 @@ is a full LLM round trip, so per-bulb tools would multiply dead air.
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
 import contextlib
 import json
 from datetime import datetime, timedelta
@@ -365,6 +367,9 @@ _DEFAULT_EVENT_MINUTES = 60
 _DEFAULT_WINDOW_DAYS = 7
 _MAX_EVENTS_REPORTED = 40
 
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0  # she runs windowless
+
+
 
 # The escape hatch controls the HOME, never the infrastructure.
 _DENIED_DOMAINS = frozenset(
@@ -643,6 +648,7 @@ class ToolExecutor:
                 cwd=CODE_ROOT,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                creationflags=NO_WINDOW,
             )
             out, _ = await proc.communicate()
             return out.decode(errors="replace").strip()

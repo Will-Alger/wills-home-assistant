@@ -20,6 +20,8 @@ touch .env/data or push/merge. Spoken confirmation is enforced upstream.
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
 import glob
 import json
 import os
@@ -29,6 +31,9 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0  # she runs windowless
+
 
 
 def _is_own_repo(repo: str) -> bool:
@@ -193,11 +198,13 @@ class Dispatcher:
     ) -> tuple[int, str]:
         if isinstance(cmd, str):
             proc = await asyncio.create_subprocess_shell(
-                cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+                cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                creationflags=NO_WINDOW,
             )
         else:
             proc = await asyncio.create_subprocess_exec(
-                *cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+                *cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                creationflags=NO_WINDOW,
             )
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -232,7 +239,8 @@ class Dispatcher:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=errlog,
                     cwd=cwd,
-                )
+                creationflags=NO_WINDOW,
+            )
             assert proc.stdin is not None and proc.stdout is not None
             try:
                 proc.stdin.write(prompt.encode("utf-8"))
@@ -454,7 +462,8 @@ class Dispatcher:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self.root,
-        )
+                creationflags=NO_WINDOW,
+            )
         try:
             out, err = await asyncio.wait_for(
                 proc.communicate(_REFRESH_PROMPT.encode("utf-8")),
