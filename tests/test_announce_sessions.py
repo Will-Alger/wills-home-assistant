@@ -42,9 +42,10 @@ async def test_finished_build_queues_a_spoken_announcement(tmp_path: Path) -> No
             await asyncio.sleep(0.1)
 
     texts = [a.text for a in announcer.pending()]
-    assert any(t.startswith("Progress on task 1, 'greeting file': tests are passing") for t in texts)
     assert any("Task 1, 'greeting file', is built and ready for your test" in t for t in texts)
     assert announcer.due()
+    rows = announcer.items(limit=50)
+    assert any(r["kind"] == "milestone" and r["state"] == "resolved" for r in rows)  # built superseded it
 
 
 async def test_announcement_opens_a_session_speaks_and_closes(tmp_path: Path) -> None:
@@ -109,6 +110,21 @@ async def test_opener_with_a_reply_is_read(tmp_path: Path) -> None:
     stats = await engine.run_conversation(NeverMic(), InstantSpeaker(), None, QuietUi(), announce=True)
     assert stats.replied and ("you", "nice, thanks") in stats.transcript
     assert item.state == "read" and announcer.unread() == []
+
+
+async def test_question_opener_asks_and_waits(tmp_path: Path) -> None:
+    announcer = Announcer(tmp_path / "a.json")
+    announcer.enqueue(
+        "Task 7 needs your call: first name or full name?", kind="question", ref="task:7:1:question"
+    )
+    engine, client = make_engine(announcer, info_close_s=0.2)
+    stats = await engine.run_conversation(NeverMic(), InstantSpeaker(), None, QuietUi(), announce=True)
+    lead = next(
+        e for e in client.connection.sent if e["type"] == "conversation.item.create"
+    )["item"]["content"][0]["text"]
+    assert "ASK him" in lead and "answer_task" in lead
+    assert stats.ended_by == "no reply"  # she waited the question window, then closed
+    assert announcer.get(1).state == "spoken"  # still unread: he never answered
 
 
 async def test_mid_session_injection_is_read_at_once(tmp_path: Path, monkeypatch) -> None:

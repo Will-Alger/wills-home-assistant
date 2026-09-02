@@ -58,8 +58,10 @@ async def test_draft_build_announce_and_approve(tmp_path: Path) -> None:
     assert task.current.status == "done" and task.current.milestones == 1
     assert task.session_id == "sess-fake"
     texts = [a.text for a in announcer.pending()]
-    assert any(t.startswith("Progress on task 1, 'Startup greeting': tests are passing") for t in texts)
     assert any("Task 1, 'Startup greeting', is built and ready for your test" in t for t in texts)
+    milestone = next(r for r in announcer.items(limit=50) if r["kind"] == "milestone")
+    assert milestone["text"].startswith("Progress on task 1, 'Startup greeting': tests are passing")
+    assert milestone["state"] == "resolved"  # never spoken: "built" superseded it
 
     # simulate the agent's committed work, then approve → merge gates → main
     (Path(task.worktree) / "GREETING.md").write_text("hello", encoding="utf-8")

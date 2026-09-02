@@ -164,6 +164,24 @@ async def test_cloud_refresh_returns_the_status_line(tmp_path: Path) -> None:
     assert await runner.refresh_cloud("session_x") == "DONE: opened PR 7"
 
 
+def test_ingest_keeps_only_a_trailing_question() -> None:
+    import json
+
+    from assistant.dispatch import AgentRun
+
+    run = AgentRun()
+
+    def say(text: str) -> str:
+        line = json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}})
+        return Dispatcher._ingest(run, line)
+
+    assert say("MILESTONE: plan settled\nQUESTION: first name or full name?") == "question"
+    assert run.question == "first name or full name?" and run.milestones == ["plan settled"]
+    assert say("going with the first name for now") == "progress"
+    assert run.question == ""  # it asked, then answered itself: nothing to park on
+    assert say("question: which room?") == "question" and run.question == "which room?"
+
+
 def test_stop_command_matching() -> None:
     from assistant.engines.realtime_engine import is_stop_command
 

@@ -9,6 +9,9 @@ the "-once" behaviors:
                   later runs: normal (a Max-window death, then a good retry)
   no-session-once first RESUMED run: exit 1 with no init (session not found);
                   later runs: normal
+  ask-once        first run: init + progress, then a trailing QUESTION: line
+                  and a result (the agent stopped for the owner); later runs
+                  (the resume with his answer): normal
 """
 
 import json
@@ -45,6 +48,32 @@ emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "wor
 if mode == "no-result-once" and marker is not None and not marker.exists():
     marker.write_text("used", encoding="utf-8")
     sys.exit(0)  # died without a result
+
+if mode == "ask-once" and marker is not None and not marker.exists():
+    marker.write_text("used", encoding="utf-8")
+    emit(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "I need a decision before the greeting can be written.\n"
+                        "QUESTION: should the greeting use his first name or his full name?",
+                    }
+                ]
+            },
+        }
+    )
+    emit(
+        {
+            "type": "result",
+            "result": "fake agent: stopped to ask the owner a question.",
+            "session_id": session,
+            "total_cost_usd": 0.005,
+        }
+    )
+    sys.exit(0)
 
 if mode == "slow":
     time.sleep(3)

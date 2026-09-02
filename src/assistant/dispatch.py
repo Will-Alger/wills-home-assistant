@@ -95,6 +95,11 @@ Rules:
   in place, tests passing, committed), write one line on its own starting
   with `MILESTONE:` followed by one short plain sentence — at most three per
   task. The owner hears these read aloud.
+- Blocked on a decision only the owner can make? Write ONE line on its own
+  starting with `QUESTION:` — one plain sentence naming the options — and
+  then STOP: end your reply immediately, doing nothing else. You will be
+  resumed with his answer. Never guess on such a decision; never ask more
+  than one question at a time; never ask what the spec already answers.
 - End your reply with a short plain-language summary of what you did, the
   state of tests, and how the owner should test it by voice.
 """
@@ -128,6 +133,22 @@ branch, keeping what already works.
     + _RULES
 )
 
+_ANSWER_PROMPT = (
+    """\
+You are continuing your own earlier work on this branch of "Alexa", a voice
+home assistant. You stopped to ask the owner:
+
+{question}
+
+The owner answers: {answer}
+
+The spec at {spec_path} records this as "Answer {n}". Continue the task from
+where you stopped, keeping what already works.
+
+"""
+    + _RULES
+)
+
 _REFRESH_PROMPT = """\
 STATUS CHECK (automated, sent by the voice assistant that commissioned this \
 task — the owner is asking how it's going). Reply with exactly one line \
@@ -149,6 +170,7 @@ class AgentRun:
     cost_usd: float = 0.0
     progress: list[str] = field(default_factory=list)  # recent agent utterances
     milestones: list[str] = field(default_factory=list)  # MILESTONE: lines seen
+    question: str = ""  # a trailing QUESTION: line — the agent stopped for the owner
     returncode: int | None = None
     pid: int = 0  # the detached process, so a restarted app can re-attach
     saw_init: bool = False  # the CLI came up and reported a session
@@ -439,11 +461,18 @@ class Dispatcher:
             joined = " ".join(texts)
             run.progress = (run.progress + [joined[-200:]])[-10:]
             result = "progress"
+            # only a TRAILING question parks the task: an agent that asks and
+            # then keeps working has answered itself
+            run.question = ""
             for raw in joined.splitlines():
                 said = raw.strip()
                 if said.upper().startswith("MILESTONE:"):
                     run.milestones.append(said[10:].strip())
                     result = "milestone"
+                elif said.upper().startswith("QUESTION:"):
+                    run.question = said[9:].strip()
+            if run.question:
+                result = "question"
             return result
         if kind == "result":
             run.summary = str(event.get("result", ""))[:2000]

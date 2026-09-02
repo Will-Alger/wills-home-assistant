@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from assistant.dispatch import (
+    _ANSWER_PROMPT,
     _REVISE_PROMPT,
     _TASK_PROMPT,
     AgentRun,
@@ -38,14 +39,17 @@ from assistant.dispatch import (
     pid_alive,
 )
 
-STATES = ("drafting", "building", "built", "staged", "revising", "merged", "failed", "abandoned")
-OPEN_STATES = ("drafting", "building", "built", "staged", "revising", "failed")
+STATES = (
+    "drafting", "building", "needs_input", "built", "staged", "revising", "merged", "failed", "abandoned",
+)
+OPEN_STATES = ("drafting", "building", "needs_input", "built", "staged", "revising", "failed")
 
 _TRANSITIONS: dict[str, set[str]] = {
     "start": {"drafting", "failed"},
+    "answer": {"needs_input"},
     "approve": {"built", "staged"},
-    "abandon": {"drafting", "building", "built", "staged", "revising", "failed"},
-    "revise": {"built", "staged", "failed"},
+    "abandon": {"drafting", "building", "needs_input", "built", "staged", "revising", "failed"},
+    "revise": {"needs_input", "built", "staged", "failed"},
     "stage": {"built", "staged"},
 }
 
@@ -84,8 +88,9 @@ def clear_pointer(root: Path) -> None:
 @dataclass
 class Iteration:
     n: int
-    kind: str = "build"  # build | revise | retry
-    feedback: str = ""
+    kind: str = "build"  # build | revise | retry | answer
+    feedback: str = ""  # the owner's words (revision feedback, or his answer)
+    question: str = ""  # what the agent stopped to ask (needs_input), or was answered
     started: float = 0.0
     finished: float | None = None
     status: str = "running"  # running | done | failed | interrupted
@@ -125,6 +130,12 @@ class Task:
     @property
     def current(self) -> Iteration | None:
         return self.iterations[-1] if self.iterations else None
+
+    @property
+    def question(self) -> str:
+        """The open question when the agent is waiting on the owner."""
+        it = self.current
+        return it.question if (self.state == "needs_input" and it is not None) else ""
 
     @property
     def running(self) -> bool:
@@ -299,12 +310,34 @@ class TaskBoard:
         task.updated = self._now()
         task.history.append({"ts": task.updated, "event": event, "detail": detail})
 
-    def _announce(self, text: str, *, kind: str, ref: str, priority: str = "normal") -> None:
+    def _announce(
+        self,
+        text: str,
+        *,
+        kind: str,
+        ref: str,
+        priority: str = "normal",
+        mode: str = "speak",
+        context: dict[str, Any] | None = None,
+        actions: list[str] | None = None,
+    ) -> None:
         if self._announcer is None:
             return
         try:
-            self._announcer.enqueue(text, kind=kind, ref=ref, priority=priority)
+            self._announcer.enqueue(
+                text, kind=kind, ref=ref, priority=priority, mode=mode, context=context, actions=actions
+            )
         except Exception:  # noqa: BLE001 — never let an announcement break the board
+            return
+
+    def _resolve(self, ref_prefix: str) -> None:
+        """Supersede earlier notifications about a task (built → approved, ...)."""
+        resolve = getattr(self._announcer, "resolve", None)
+        if resolve is None:
+            return
+        try:
+            resolve(ref_prefix)
+        except Exception:  # noqa: BLE001
             return
 
     # ── lookup ─────────────────────────────────────────────────────────────
@@ -365,9 +398,15 @@ class TaskBoard:
     def _spec_document(task: Task) -> str:
         lines = [f"# Task {task.id}: {task.title}", "", task.spec.strip(), ""]
         for it in task.iterations:
+            stamp = datetime.fromtimestamp(it.started).astimezone().strftime("%Y-%m-%d")
             if it.kind == "revise" and it.feedback:
-                stamp = datetime.fromtimestamp(it.started).astimezone().strftime("%Y-%m-%d")
                 lines += [f"## Revision {it.n} — {stamp}", "", it.feedback.strip(), ""]
+            elif it.kind == "answer" and it.feedback:
+                lines += [
+                    f"## Answer {it.n} — {stamp}", "",
+                    f"Q: {it.question.strip() or '(the agent asked a question)'}", "",
+                    f"A: {it.feedback.strip()}", "",
+                ]
         return "\n".join(lines)
 
     # ── building ───────────────────────────────────────────────────────────
@@ -485,9 +524,28 @@ class TaskBoard:
         iteration.cost_usd = run.cost_usd
         iteration.status = run.status
         iteration.finished = self._now()
+        question = " ".join(str(getattr(run, "question", "") or "").split())
+        if run.status == "done" and question:
+            # the agent stopped on a decision only the owner can make
+            iteration.question = question
+            task.state = "needs_input"
+            self._log(task, "needs input", question[:200])
+            self._resolve(f"task:{task.id}:{iteration.n}:milestone:")
+            self._announce(
+                f"Task {task.id}, '{task.title}', needs your call: {question}"
+                + ("" if question.endswith(("?", ".", "!")) else ".")
+                + f" Say 'answer task {task.id}' and tell me.",
+                kind="question",
+                ref=f"task:{task.id}:{iteration.n}:question",
+                context={"task_id": task.id},
+                actions=["answer"],
+            )
+            self._save()
+            return
         if run.status == "done":
             task.state = "built"
             self._log(task, "built", iteration.summary[:200])
+            self._resolve(f"task:{task.id}:")  # earlier built/question rows are superseded
             gist = iteration.summary.strip().split(". ")[0][:160]
             what = (
                 f"Revision {iteration.n} of task {task.id}, '{task.title}', is built"
@@ -500,6 +558,8 @@ class TaskBoard:
                 + f" Say 'switch to task {task.id}' to try it, or 'approve task {task.id}' to merge it.",
                 kind="task",
                 ref=f"task:{task.id}:{iteration.n}:built",
+                context={"task_id": task.id},
+                actions=["approve", "later"],
             )
             self._save()
             return
@@ -507,7 +567,7 @@ class TaskBoard:
         died_quietly = (
             "without a result" in run.summary and run.saw_init and iteration.kind != "retry"
         )
-        session_missing = resume and not run.saw_init and iteration.kind == "revise"
+        session_missing = resume and not run.saw_init and iteration.kind in ("revise", "answer")
         if session_missing:
             # the agent's session is gone: rebuild fresh with the revised spec
             # plus a pointer at the work already on the branch
@@ -553,26 +613,64 @@ class TaskBoard:
         if task.mode != "local" or not task.worktree or not Path(task.worktree).exists():
             raise DispatchError(f"task {task.id} has no local branch to revise")
         n = len(task.iterations) + 1
+        asked = task.current
+        if task.state == "needs_input" and asked is not None:
+            self._resolve(f"task:{task.id}:{asked.n}:question")  # feedback stands in for an answer
         # record the feedback in the spec (data copy + the branch's copy), commit
         pending = Iteration(n=n, kind="revise", feedback=feedback, started=self._now())
-        task.iterations.append(pending)
-        doc = self._spec_document(task)
-        task.iterations.pop()
-        (self._root / "data" / "specs" / f"{task.slug}.md").write_text(doc, encoding="utf-8")
-        worktree = Path(task.worktree)
-        (worktree / "docs" / "tasks" / f"{task.slug}.md").write_text(doc, encoding="utf-8")
-        await self._runner.commit_all(worktree, f"Task {task.id}: revision {n} feedback")
+        await self._record_iteration(task, pending, f"Task {task.id}: revision {n} feedback")
         prompt = _REVISE_PROMPT.format(
             feedback=feedback, spec_path=f"docs/tasks/{task.slug}.md", n=n
         )
         self._launch(task, "revise", prompt, task.session_id, state="revising", feedback=feedback)
         return task
 
+    async def answer(self, ref: Any, answer: str) -> Task:
+        """The agent stopped on a QUESTION; hand it the owner's decision and
+        let the same session continue."""
+        task = self.get(ref)
+        self._check(task, "answer")
+        answer = " ".join(str(answer).split())
+        if not answer:
+            raise DispatchError("an answer needs the owner's decision in a sentence")
+        if task.mode != "local" or not task.worktree or not Path(task.worktree).exists():
+            raise DispatchError(f"task {task.id} has no local branch to continue")
+        asked = task.current
+        question = asked.question if asked is not None else ""
+        n = len(task.iterations) + 1
+        pending = Iteration(n=n, kind="answer", feedback=answer, question=question, started=self._now())
+        await self._record_iteration(task, pending, f"Task {task.id}: answer {n}")
+        if asked is not None:
+            self._resolve(f"task:{task.id}:{asked.n}:question")
+        prompt = _ANSWER_PROMPT.format(
+            question=question or "(see the spec)",
+            answer=answer,
+            spec_path=f"docs/tasks/{task.slug}.md",
+            n=n,
+        )
+        iteration = self._launch(
+            task, "answer", prompt, task.session_id, state="revising", feedback=answer
+        )
+        iteration.question = question
+        self._save()
+        return task
+
+    async def _record_iteration(self, task: Task, pending: Iteration, message: str) -> None:
+        """Write the spec with this (not yet launched) iteration's section into
+        the data copy and the branch's copy, and commit the branch."""
+        task.iterations.append(pending)
+        doc = self._spec_document(task)
+        task.iterations.pop()
+        (self._root / "data" / "specs" / f"{task.slug}.md").write_text(doc, encoding="utf-8")
+        worktree = Path(task.worktree)
+        (worktree / "docs" / "tasks" / f"{task.slug}.md").write_text(doc, encoding="utf-8")
+        await self._runner.commit_all(worktree, message)
+
     async def _reattach(self, task: Task, iteration: Iteration) -> None:
         """After a restart: keep following a still-running agent, or read the
         log a dead one left behind."""
         run = AgentRun(session_id=iteration.session_id, pid=iteration.pid)
-        resume = iteration.session_id if iteration.kind in ("revise", "retry") else ""
+        resume = iteration.session_id if iteration.kind in ("revise", "retry", "answer") else ""
         try:
             log = Path(iteration.log) if iteration.log else self._root / "logs" / "tasks" / "missing.log"
             run = await self._runner.follow(
@@ -655,6 +753,7 @@ class TaskBoard:
         task.merged_at = self._now()
         task.cleanup_pending = task.mode == "local"
         self._log(task, "merged", merge_ref)
+        self._resolve(f"task:{task.id}:")  # "built, say approve" is moot now
         # main's venv must match the merged lockfile BEFORE anything restarts
         # into it: a crash-looping main is the one thing the watchdog can't
         # roll back from.
@@ -692,6 +791,7 @@ class TaskBoard:
         task.closed = True
         task.cleanup_pending = task.mode == "local"
         self._log(task, "abandoned")
+        self._resolve(f"task:{task.id}:")
         pointer = read_pointer(self._root)
         if pointer is not None and int(pointer.get("task_id", 0)) == task.id:
             clear_pointer(self._root)
@@ -753,6 +853,8 @@ class TaskBoard:
                 row["summary"] = it.summary[:240]
             elif it.progress:
                 row["currently"] = it.progress[-1]
+        if task.question:
+            row["question"] = task.question[:300]
         if task.last_error and task.state == "failed":
             row["error"] = task.last_error[:200]
         return row
@@ -776,6 +878,7 @@ class TaskBoard:
                     "kind": it.kind,
                     "status": it.status,
                     "feedback": it.feedback,
+                    **({"question": it.question} if it.question else {}),
                     "summary": it.summary[:800],
                     "cost_usd": round(it.cost_usd, 4),
                     "model": it.model or "cli default",
@@ -838,14 +941,19 @@ class TaskBoard:
         if not open_tasks:
             return "none open"
         now = self._now()
+        asking = sum(1 for t in self._tasks.values() if t.state == "needs_input")
         waiting = sum(1 for t in self._tasks.values() if t.state in ("built", "staged"))
-        parts = [f"{waiting} awaiting your approval"] if waiting else []
+        parts = ([f"{asking} waiting on your answer"] if asking else []) + (
+            [f"{waiting} awaiting your approval"] if waiting else []
+        )
         for t in open_tasks:
             where = f" in {t.repo}" if t.repo else ""
             if t.state == "building":
                 state = f"building since {_hours_ago(t.current.started if t.current else t.updated, now)}"
             elif t.state == "built":
                 state = f"built {_hours_ago(t.updated, now)}, awaiting your test/approval"
+            elif t.state == "needs_input":
+                state = f"needs your answer: {t.question[:100]}"
             else:
                 state = f"{t.state} {_hours_ago(t.updated, now)}"
             parts.append(f"task {t.id} '{t.title}'{where} — {state}")

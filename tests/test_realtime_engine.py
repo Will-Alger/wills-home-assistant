@@ -63,9 +63,11 @@ async def test_session_config_renders_jobs_and_repos(tmp_path) -> None:
     assert "side-project" in text  # she knows which other repos she can work on
     tool_names = {t["name"] for t in config["tools"]}
     assert {
-        "draft_task", "start_task", "list_tasks", "task_detail",
-        "search_tasks", "approve_task", "abandon_task", "switch_build", "revise_task",
+        "draft_task", "start_task", "list_tasks", "task_detail", "search_tasks",
+        "approve_task", "abandon_task", "switch_build", "revise_task", "answer_task",
     } <= tool_names
+    states = next(t for t in config["tools"] if t["name"] == "list_tasks")
+    assert "needs_input" in states["parameters"]["properties"]["states"]["items"]["enum"]
     assert "web_search" in tool_names
     assert "list_notifications" not in tool_names  # no announcer wired here
     assert "develop_feature" not in tool_names

@@ -135,7 +135,10 @@ can test it by talking to you; switch_build main brings you back, and \
 switching is free and reversible as often as he likes. When he reports a \
 problem with a build, restate it in one precise sentence and send it with \
 revise_task — the same agent iterates, you announce the revision, he \
-switches to it again. (3) When {owner} \
+switches to it again. When a task NEEDS YOUR INPUT (state needs_input: the \
+agent stopped on a decision only {owner} can make, and you announced the \
+question), tell him the question, then send his decision with answer_task, \
+restated precisely; he can also answer from his phone. (3) When {owner} \
 approves — his explicit yes for THIS task — approve_task merges it (gates \
 run lint and tests first) and you restart onto main; after coming back try \
 the new capability and report honestly. If it is hopeless, abandon_task. Board questions ("what's in \
@@ -567,8 +570,8 @@ TASK_TOOLS: list[dict[str, Any]] = [
                     "items": {
                         "type": "string",
                         "enum": [
-                            "drafting", "building", "built", "staged", "revising",
-                            "merged", "failed", "abandoned",
+                            "drafting", "building", "needs_input", "built", "staged",
+                            "revising", "merged", "failed", "abandoned",
                         ],
                     },
                 },
@@ -624,6 +627,25 @@ TASK_TOOLS: list[dict[str, Any]] = [
                 "feedback": {"type": "string", "description": "what is wrong, precisely, in the owner's terms"},
             },
             "required": ["id", "feedback"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "answer_task",
+        "description": (
+            "A task is in state needs_input: its coding agent stopped on a "
+            "decision only the owner can make (you announced the question). "
+            "Send his decision, restated in one precise sentence; the SAME "
+            "agent resumes and you announce when it is built. No confirmation "
+            "gate needed."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer"},
+                "answer": {"type": "string", "description": "the owner's decision, precisely"},
+            },
+            "required": ["id", "answer"],
         },
     },
     {
@@ -1089,6 +1111,12 @@ class RealtimeEngine:
                 return (
                     f"revision {len(task.iterations)} of task {task.id} is underway with the same "
                     "agent; you will announce when it is built — do not poll"
+                ), False
+            if name == "answer_task":
+                task = await board.answer(args.get("id"), str(args.get("answer", "")))
+                return (
+                    f"answer sent to task {task.id}'s agent, which is continuing; you will "
+                    "announce when it is built — do not poll"
                 ), False
             if name == "switch_build":
                 if (blocked := needs_yes("switching builds")) is not None:
