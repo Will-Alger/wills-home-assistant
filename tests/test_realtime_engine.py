@@ -92,6 +92,17 @@ async def test_session_config_renders_unread_and_no_stale_denial(tmp_path) -> No
     assert "announcement_history" not in names
 
 
+async def test_session_config_carries_the_ping_health_check() -> None:
+    """Saying "ping" and hearing "pong" is the owner's end-to-end check that a
+    build is live, so the rule must survive into the instructions we send."""
+    from assistant.engines.realtime_engine import RealtimeEngine
+    from assistant.home.fake import FakeHome
+
+    engine = RealtimeEngine(api_key="k", model="m", voice="v", home=FakeHome(), owner="Will")
+    text = (await engine._session_config(None))["instructions"]
+    assert 'the whole request is just "ping", say exactly "pong"' in text
+
+
 def test_command_tools_cover_home_actions_only() -> None:
     """COMMAND_TOOLS drives the engine's one-shot auto-close: action tools
     only — info/chat tools must not trigger it."""

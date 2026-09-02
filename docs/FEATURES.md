@@ -93,6 +93,7 @@ closest legitimate thing to "just pair it to Apple Home."
 | One-shot vs open conversation | one state machine, not two modes: the LLM ends each turn with an intent — `close` / `listen` / `confirm_close` ("anything else?" then waits) — deciding whether the mic re-opens without a wake word. Session = growing message history; tools available every turn. **Will's field feedback (2026-08-31)**: general chit-chat is a first-class use — prompt keeps flowing conversations on `listen` (only the speaker ends a live conversation); listen windows time out only until speech STARTS, then STT end-of-turn governs (no more mid-sentence cutoffs); `STT_EOT_THRESHOLD` tunes pause patience | 3–4 | in-session context growth, cache-absorbed | testing |
 | Wake-word interrupt | while SPEAKING, full STT is off (half-duplex) but the wake detector keeps running — wake phrase mid-reply cuts TTS and returns to LISTENING; TTS is never allowed to say the wake phrase | 4 | $0 | planned |
 | Barge-in (interrupt by just talking) | VAD-based open-mic interruption during playback — one extra transition in the M4 state machine, not a rewrite | 8 | $0 | idea |
+| "ping" → "pong" | health check by voice: say "ping" alone, hear the single word "pong", session closes. One instruction rule in the realtime engine, no tools — the cheapest way for Will to confirm which build he is actually talking to after a `switch_build` or a merge | 9 | ~0 | testing |
 
 ## Smart home & media
 
