@@ -13,7 +13,10 @@ better command box but a worse conversation partner is the wrong tradeoff.
 
 **Done:** the self-improvement loop (Phases 1–4: announcements, task board, staging +
 `switch_build`, revisions via `--resume`, detached builds that survive restarts), web
-search, Apple Music, calendar (read/create/delete), earcons, one-shot auto-close. She
+search, Apple Music, calendar (read/create/delete), earcons, one-shot auto-close.
+**Overnight 2026-09-02 (see `docs/OVERNIGHT-2026-09-02.md`):** Phase 5 polish, the brain
+layer (`think`), event reactivity (watches over HA's websocket), scheduling & routines
+(timers, alarms, scheduled actions, deterministic routines), and the morning briefing. She
 runs `main` via the watchdog. Board: task 1 (birth certificate) built and unmerged —
 the ideal `approve_task` test; task 5 (staging drill) built — the ideal `switch_build`
 test. **Not yet voice-tested by Will: Phases 2–4.** Quiet hours are disabled in `.env`
@@ -23,15 +26,9 @@ for late-night development — restore `ANNOUNCE_QUIET_HOURS=23:00-08:00`.
 0. Drive the loop end to end by voice with a real feature (greet-by-name, a timer):
    draft → build → "switch to task N" → revise → "ship it". First real use will
    surface friction no test can.
-1. Phase 5 polish: announcement history ("what did you tell me this morning?"), board
-   search ranking, cloud dispatch → watch-mode only, README/runbook, wake-time status
-   line mentions pending approvals.
-2. **Brain layer** (true-jarvis pattern): a `think(question)` tool → Opus via `claude -p`
-   (Max-billed) with memory + board context, answer injected mid-conversation after
-   "let me think about that". ~1 day now that injection exists; ideal first
-   self-commission.
-3. Event reactivity: HA event subscription → announcement queue ("when the door opens
-   after 11pm, tell me"); needs Eve Door/Motion sensors (Thread via the Apple TV).
+1. ~~Phase 5 polish~~ done overnight.
+2. ~~Brain layer~~ done overnight.
+3. ~~Event reactivity~~ done overnight (sensors still needed for door/motion watches).
 4. Satellites = Home Assistant Voice PE pucks + an audio-stream bridge (replaces the
    Pi plan; a June-2026 project proved gpt-realtime on Voice PE).
 5. Longer arcs: music stopwatch verdict on Apple Music, playlist authoring, YouTube
@@ -122,6 +119,7 @@ closest legitimate thing to "just pair it to Apple Home."
 | Brain layer (overnight 2026-09-02) | **BUILT**: `brain/thinker.py` + `think(question)` tool — the voice hands a hard question to Opus via `claude -p --model opus` (Max-billed, `BRAIN_MODEL`) with her preferences, facts, lessons, task board and the last 24 transcript lines as context; the tool returns at once ("thinking it over"), the answer is queued as an urgent `thought` announcement and delivered through the same system-item injection path — spoken mid-conversation when quiet, or at the next idle moment if the session ended. true-jarvis pattern: voice ↔ brain ↔ hands, one persona. Home tools stay on the voice | 9 | Max-billed | testing |
 | Event reactivity (overnight 2026-09-02) | **BUILT**: `events.py` — `EventWatcher` keeps HA's websocket open (auth → subscribe_events state_changed; verified live on HA 2026.8.3; reconnects with backoff) and evaluates standing `Watch` rules deterministically (entity or fragment, to/from state, HH:MM window with overnight wrap, days, once/keep, normal/urgent); hits become announcements (quiet hours apply unless urgent). Voice: watch_for / list_watches / cancel_watch — "tell me when the front door opens after 11pm". Persisted in data/watches.json | 6 | $0 | testing |
 | Scheduling & routines — NEW milestone (overnight 2026-09-02) | **BUILT**: `scheduler.py` — timers ("20 minute timer"), alarms (once or repeating on days; work/sleep; snooze; fire even in quiet hours), scheduled reminders and ACTIONS (any home tool at a time / after a delay / repeating: "porch light on at 6:30 every night"), persisted in data/schedule.json, 1 s tick loop in the app, results announced. `routines.py` — structured rules applied DETERMINISTICALLY in the tool executor: WHEN tool (+ match fields) AND time window/days THEN defaults (fill what the speaker left out) / overrides (always win): "after 5pm lights come on warm orange", "TV volume defaults to 65%"; listed in her instructions; tool results carry routines_applied. Voice: set_timer, set_alarm, schedule, list_schedule, cancel_schedule, snooze, add_routine, list_routines, remove_routine | 10 | $0 | testing |
+| Morning briefing (overnight 2026-09-02) | **BUILT**: scheduler kind `briefing` — "brief me weekdays at 07:30" — composed in the app from today's calendar, tasks awaiting approval, and what's scheduled today; owner-scheduled, so it speaks through quiet hours | 10 | $0 | testing |
 | Multi-repo dispatch | **BUILT 2026-08-31**: `develop_feature` takes an optional `repo`; each claude.ai/code routine pins ONE GitHub repo, so other repos need one routine each, registered in gitignored `data/routines.json` (`{"repo-name": {"routine_id": "trig_…", "token": "sk-ant-oat01-…"}}`). Spoken-name matching normalizes spaces/hyphens. Other-repo jobs are cloud-only, land as branch/PR, can NEVER be voice-merged (merge gate is local+done only). Setup per repo: claude.ai/code → Routines → new routine on that repo, API trigger, Opus, generic instructions ("task from Will via his assistant; branch + PR; never merge"), paste id+token into routines.json | 9 | Max-billed | built, needs routine setup |
 
 ## Assistant intelligence — architecture

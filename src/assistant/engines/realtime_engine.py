@@ -377,16 +377,17 @@ SCHEDULE_TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "name": "schedule",
         "description": (
-            "Schedule something for later: a spoken reminder, or a home action "
-            "(any of your home tools with its input) — at a local time, after a "
-            "delay, once or repeating on days. E.g. remind me at 18:00 to call "
-            "mom; turn on the porch light at 18:30 every day; in 20 minutes "
-            "pause the music. Read it back before setting."
+            "Schedule something for later: a spoken reminder, a home action "
+            "(any of your home tools with its input), or a morning BRIEFING "
+            "(today's calendar + tasks awaiting approval + what's scheduled) — "
+            "at a local time, after a delay, once or repeating on days. E.g. "
+            "remind me at 18:00 to call mom; turn on the porch light at 18:30 "
+            "every day; brief me weekdays at 07:30. Read it back before setting."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "kind": {"type": "string", "enum": ["reminder", "action"]},
+                "kind": {"type": "string", "enum": ["reminder", "action", "briefing"]},
                 "label": {"type": "string"},
                 "at": {"type": "string", "description": "HH:MM local (omit when using in_seconds)"},
                 "in_seconds": {"type": "number"},

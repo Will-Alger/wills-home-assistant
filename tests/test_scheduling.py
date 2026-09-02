@@ -178,3 +178,20 @@ def test_schedule_and_routine_tools_by_voice(tmp_path: Path) -> None:
     text, is_error = engine._execute_routine_tool("add_routine", {"description": "no effect"})
     assert is_error and "defaults or overrides" in text
     assert "removed" in engine._execute_routine_tool("remove_routine", {"id": 1})[0]
+
+
+async def test_briefing_kind_speaks_the_composed_summary(tmp_path: Path) -> None:
+    clock = Clock(wed(7, 25))
+    announcer = Announcer(tmp_path / "a.json", quiet_hours="23:00-08:00", now=clock)
+    sched = Scheduler(tmp_path / "schedule.json", announcer=announcer, now=clock)
+
+    async def compose() -> str:
+        return "Good morning, Will. Today: run club at 6:30 PM. Awaiting your approval: task 1."
+
+    sched.briefing = compose
+    item = sched.schedule(kind="briefing", label="morning briefing", at="07:30", repeat=True, days=["mon", "tue", "wed", "thu", "fri"])
+    clock.at = wed(7, 30) + 1
+    (said,) = await sched.tick()
+    assert said.startswith("Good morning, Will.") and "task 1" in said
+    assert item.active and announcer.due()  # inside quiet hours, but the owner scheduled it
+    assert announcer.pending()[0].kind == "briefing"

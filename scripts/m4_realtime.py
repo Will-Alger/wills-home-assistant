@@ -117,6 +117,42 @@ def build_calendar(settings, fake: bool):
     )
 
 
+def make_briefing(calendar, board, scheduler, owner: str):
+    """A spoken morning briefing: calendar, tasks awaiting approval, schedule."""
+
+    async def compose() -> str:
+        from datetime import datetime, timedelta
+
+        from assistant.calendar.base import local_tz, spoken_when
+
+        now = datetime.now(tz=local_tz())
+        parts = [f"Good morning, {owner}. It's {now.strftime('%A, %B %d').replace(' 0', ' ')}."]
+        if calendar is not None:
+            try:
+                end = now.replace(hour=23, minute=59, second=59)
+                events = await calendar.list_events(now, end)
+                if events:
+                    items = "; ".join(f"{e.summary} {spoken_when(e)}" for e in events[:5])
+                    parts.append(f"Today: {items}.")
+                else:
+                    parts.append("Nothing on the calendar today.")
+            except Exception as err:  # noqa: BLE001
+                parts.append(f"I couldn't read the calendar: {str(err)[:80]}.")
+        if board is not None:
+            waiting = [t for t in board.tasks() if t.state in ("built", "staged")]
+            if waiting:
+                names = ", ".join(f"task {t.id} {t.title}" for t in waiting[:3])
+                parts.append(f"Awaiting your approval: {names}.")
+        rows = [r for r in scheduler.describe() if r["kind"] != "briefing"]
+        soon = [r for r in rows if r["next"].startswith("today")]
+        if soon:
+            parts.append("Scheduled today: " + "; ".join(f"{r['label']} {r['next']}" for r in soon[:4]) + ".")
+        _ = timedelta  # keep the import honest if unused above
+        return " ".join(parts)
+
+    return compose
+
+
 def build_engine(fake: bool):
     settings = load_settings()
     settings.require("openai_api_key")
@@ -211,6 +247,7 @@ def build_engine(fake: bool):
         ),
     )
     scheduler._executor = engine._executor  # scheduled actions run through her tools
+    scheduler.briefing = make_briefing(calendar, board, scheduler, settings.owner_name)
     engine.scheduler = scheduler
     engine.event_watcher = (
         None

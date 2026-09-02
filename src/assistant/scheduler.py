@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 _DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
-KINDS = ("timer", "alarm", "reminder", "action")
+KINDS = ("timer", "alarm", "reminder", "action", "briefing")
 
 
 @dataclass
@@ -93,6 +93,7 @@ class Scheduler:
         self._path = path
         self._announcer = announcer
         self._executor = executor  # ToolExecutor for scheduled actions
+        self.briefing: Callable[[], Any] | None = None  # async () -> str, set by the app
         self._now = now
         self._next_id = 1
         self._items: list[Item] = []
@@ -164,8 +165,8 @@ class Scheduler:
     ) -> Item:
         """A reminder (spoken) or an action (a home tool call) at a time or
         after a delay, optionally repeating daily / on given days."""
-        if kind not in ("reminder", "action"):
-            raise ValueError("kind must be reminder or action")
+        if kind not in ("reminder", "action", "briefing"):
+            raise ValueError("kind must be reminder, action, or briefing")
         if kind == "action" and not (action and action.get("tool")):
             raise ValueError("an action needs a tool to call")
         if kind == "reminder" and not message:
@@ -188,7 +189,7 @@ class Scheduler:
             days=[str(d) for d in (days or [])],
             message=" ".join(str(message).split()),
             action=dict(action or {}),
-            priority="urgent" if kind == "reminder" else "normal",
+            priority="urgent" if kind in ("reminder", "briefing") else "normal",
             created=self._now(),
         )
         return self._add(item)
@@ -286,6 +287,8 @@ class Scheduler:
             )
         elif item.kind == "reminder":
             text = f"Reminder: {item.message}"
+        elif item.kind == "briefing":
+            text = await self._compose_briefing(item)
         else:
             text = await self._run_action(item)
         self._save()
@@ -299,6 +302,15 @@ class Scheduler:
                     expires_in_s=6 * 3600,
                 )
         return text
+
+    async def _compose_briefing(self, item: Item) -> str:
+        if self.briefing is None:
+            return "Good morning. I don't have a briefing source wired up yet."
+        try:
+            text = await self.briefing()
+        except Exception as err:  # noqa: BLE001 — a broken briefing still says something
+            return f"Good morning. I couldn't put your briefing together: {str(err) or type(err).__name__}."
+        return " ".join(str(text).split()) or "Good morning. Nothing on the books today."
 
     async def _run_action(self, item: Item) -> str:
         tool = str(item.action.get("tool", ""))
