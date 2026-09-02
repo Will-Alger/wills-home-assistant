@@ -67,6 +67,7 @@ async def test_session_config_renders_jobs_and_repos(tmp_path) -> None:
         "search_tasks", "approve_task", "abandon_task", "switch_build", "revise_task",
     } <= tool_names
     assert "web_search" in tool_names
+    assert "announcement_history" not in tool_names  # no announcer wired here
     assert "develop_feature" not in tool_names
 
 

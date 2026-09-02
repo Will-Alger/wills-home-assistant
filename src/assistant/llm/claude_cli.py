@@ -23,10 +23,6 @@ from assistant.llm.base import TurnResult, Usage
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0  # she runs windowless
 
 
-
-NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0  # she runs windowless
-
-
 class ClaudeCliError(RuntimeError):
     pass
 
@@ -41,8 +37,13 @@ def _extract_json(text: str) -> str:
 
 
 class ClaudeCli:
-    def __init__(self, timeout_s: float = 180.0) -> None:
+    def __init__(self, timeout_s: float = 180.0, *, model: str = "", effort: str = "") -> None:
         self._timeout_s = timeout_s
+        self.command = (
+            "claude -p --output-format json"
+            + (f" --model {model}" if model else "")
+            + (f" --effort {effort}" if effort else "")
+        )
 
     async def turn(
         self,
@@ -66,7 +67,7 @@ class ClaudeCli:
 
         started = time.perf_counter()
         process = await asyncio.create_subprocess_shell(
-            "claude -p --output-format json",
+            self.command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

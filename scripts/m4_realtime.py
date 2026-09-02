@@ -27,6 +27,7 @@ from assistant.app import wait_for_trigger
 from assistant.audio import tones
 from assistant.audio.mic import Microphone, describe_device
 from assistant.audio.speaker import Speaker
+from assistant.brain.thinker import Thinker
 from assistant.config import home_dir, load_settings
 from assistant.dispatch import Dispatcher, load_extra_routines
 from assistant.engines.realtime_engine import (
@@ -143,6 +144,37 @@ def build_engine(fake: bool):
             ),
             memory,
         )
+    board = (
+        TaskBoard(
+            root,
+            runner=Dispatcher(
+                root,
+                routine_id=settings.claude_routine_id,
+                routine_token=settings.claude_routine_token,
+                extra_routines=load_extra_routines(root),
+                model=settings.dispatch_model,
+                effort=settings.dispatch_effort,
+                timeout_s=settings.dispatch_timeout_s,
+            ),
+            announcer=announcer,
+            staged_task_id=int(staged) if staged.isdigit() else None,
+            uv_exe=settings.uv_exe,
+            resume_delay_s=settings.dispatch_resume_delay_s,
+        )
+        if settings.use_claude_subscription
+        else None
+    )
+    thinker = None
+    if settings.use_claude_subscription:
+        from assistant.llm.claude_cli import ClaudeCli
+
+        thinker = Thinker(
+            ClaudeCli(model=settings.brain_model, effort=settings.brain_effort),
+            memory=memory,
+            board=board,
+            name=settings.assistant_name,
+            owner=settings.owner_name,
+        )
     engine = RealtimeEngine(
         api_key=settings.openai_api_key,
         model=settings.realtime_model,
@@ -159,28 +191,10 @@ def build_engine(fake: bool):
         extra_instructions=settings.assistant_extra_instructions,
         memory=memory,
         calendar=calendar,
-        task_board=(
-            TaskBoard(
-                root,
-                runner=Dispatcher(
-                    root,
-                    routine_id=settings.claude_routine_id,
-                    routine_token=settings.claude_routine_token,
-                    extra_routines=load_extra_routines(root),
-                    model=settings.dispatch_model,
-                    effort=settings.dispatch_effort,
-                    timeout_s=settings.dispatch_timeout_s,
-                ),
-                announcer=announcer,
-                staged_task_id=int(staged) if staged.isdigit() else None,
-                uv_exe=settings.uv_exe,
-                resume_delay_s=settings.dispatch_resume_delay_s,
-            )
-            if settings.use_claude_subscription
-            else None
-        ),
+        task_board=board,
         usage_log=root / ".usage.jsonl",
         announcer=announcer,
+        thinker=thinker,
         web=WebSearch(
             settings.openai_api_key,
             model=settings.web_search_model,

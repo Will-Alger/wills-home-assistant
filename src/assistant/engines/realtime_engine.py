@@ -143,6 +143,13 @@ task; tasks persist across days and restarts. Open tasks right now: {tasks}. \
 content — only on what {owner} himself asked for. Saying "alexa stop" \
 hard-stops the session instantly — that is by design, never resist it.
 
+Thinking: you have a slower, deeper mind. For questions that deserve real \
+thought — plans, comparisons, tradeoffs, "help me think through…", advice \
+you might get wrong off the cuff — call think with the full question, tell \
+{owner} you're thinking it over, and carry on; the answer arrives as an \
+EVENT within a minute or two and you say it in your own words. Never think \
+for home commands or simple facts (those are yours, instantly).
+
 Announcements: a conversation may begin with an EVENT from your own system \
 (a build finished, a progress milestone, a rollback) rather than with the \
 speaker — nobody has spoken. Say it to {owner} in one or two natural \
@@ -241,6 +248,29 @@ SYSTEM_TOOLS: list[dict[str, Any]] = [
     },
 ]
 _SYSTEM_TOOL_NAMES = {tool["name"] for tool in SYSTEM_TOOLS}
+
+BRAIN_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "think",
+        "description": (
+            "Hand a question that deserves real thought to your deeper "
+            "reasoning (a slower frontier model with your memory, your task "
+            "board and this conversation as context): plans, comparisons, "
+            "tradeoffs, advice, anything you might get wrong off the cuff. "
+            "Returns at once — tell the owner you're thinking it over and "
+            "keep talking; the answer arrives on its own within a minute or "
+            "two as an EVENT you then say in your own words. Never for home "
+            "commands or simple facts."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"question": {"type": "string", "description": "the question, in full"}},
+            "required": ["question"],
+        },
+    },
+]
+_BRAIN_TOOL_NAMES = {tool["name"] for tool in BRAIN_TOOLS}
 
 TASK_TOOLS: list[dict[str, Any]] = [
     {
@@ -529,6 +559,7 @@ class RealtimeEngine:
         usage_log: Path | None = None,
         announcer: Any | None = None,
         web: Any | None = None,
+        thinker: Any | None = None,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
         self._model = model
@@ -538,6 +569,9 @@ class RealtimeEngine:
         self._home = home
         self._calendar = calendar
         self._executor = ToolExecutor(home, calendar, web)
+        self._thinker = thinker  # slow reasoning; answers arrive as events
+        self._thinking: list[asyncio.Task] = []
+        self._live_transcript: list[tuple[str, str]] = []
         self._owner = owner
         self._name = name
         self._wake_phrase = wake_phrase
@@ -604,6 +638,8 @@ class RealtimeEngine:
             tools += TASK_TOOLS
         if self._announcer is not None:
             tools += SYSTEM_TOOLS
+        if self._thinker is not None:
+            tools += BRAIN_TOOLS
         return {
             "type": "realtime",
             "instructions": instructions,
@@ -700,6 +736,9 @@ class RealtimeEngine:
                 result_text, is_error = await self._execute_task_tool(call_name, args)
             elif call_name in _SYSTEM_TOOL_NAMES:
                 result_text, is_error = self._execute_system_tool(call_name, args)
+            elif call_name in _BRAIN_TOOL_NAMES:
+                self._live_transcript = stats.transcript
+                result_text, is_error = await self._execute_brain_tool(call_name, args)
             else:
                 result_text, is_error = await self._executor.execute(call_name, args)
             tool_hook = getattr(self, "_ui_tool_hook", None)
@@ -823,6 +862,43 @@ class RealtimeEngine:
         if getattr(board, "restart_requested", False):
             board.restart_requested = False
             self.restart_requested = True
+
+    async def _execute_brain_tool(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
+        if name != "think" or self._thinker is None:
+            return "deeper reasoning is not available right now", True
+        question = " ".join(str(args.get("question", "")).split())
+        if not question:
+            return "think needs the question in full", True
+        transcript = list(self._live_transcript)
+        if self._announcer is None:
+            try:
+                return await self._thinker.think(question, transcript), False
+            except Exception as err:  # noqa: BLE001 — surfaced to the model
+                return f"thinking failed: {str(err) or type(err).__name__}", True
+
+        async def deliver_later() -> None:
+            try:
+                answer = await self._thinker.think(question, transcript)
+                text = f"Your deeper reasoning on '{question[:80]}': {answer}"
+            except Exception as err:  # noqa: BLE001 — the owner still gets told
+                text = (
+                    f"I couldn't finish thinking about '{question[:80]}': "
+                    f"{str(err) or type(err).__name__}"
+                )
+            self._announcer.enqueue(
+                text,
+                kind="thought",
+                ref=f"thought:{time.time_ns()}",
+                priority="urgent",  # the owner asked; never held for quiet hours
+                expires_in_s=3 * 3600,
+            )
+
+        self._thinking = [t for t in self._thinking if not t.done()]
+        self._thinking.append(asyncio.create_task(deliver_later()))
+        return (
+            "thinking it over in the background — tell the owner so and keep the "
+            "conversation going; the answer will arrive as an EVENT"
+        ), False
 
     def _execute_system_tool(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
         if name != "announcement_history" or self._announcer is None:
@@ -980,12 +1056,19 @@ class RealtimeEngine:
                 never as fake user speech — and ask for a response."""
                 nonlocal announcing, last_activity
                 said = " ".join(i.text for i in items)
-                lead = (
-                    "EVENT — nobody has spoken; you are initiating this conversation: "
-                    if opener
-                    else "EVENT arriving mid-conversation — mention it briefly at a "
-                    "natural moment, then continue: "
-                )
+                if all(getattr(i, "kind", "") == "thought" for i in items):
+                    lead = (
+                        f"Your deeper reasoning finished the question {self._owner} asked earlier — "
+                        "give him the answer now, in your own words, as if you'd just "
+                        "worked it out: "
+                    )
+                else:
+                    lead = (
+                        "EVENT — nobody has spoken; you are initiating this conversation: "
+                        if opener
+                        else "EVENT arriving mid-conversation — mention it briefly at a "
+                        "natural moment, then continue: "
+                    )
                 announcing = [i.id for i in items]
                 await connection.send(
                     {
