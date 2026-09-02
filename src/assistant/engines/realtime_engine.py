@@ -947,6 +947,30 @@ _END_TOOL = {
 }
 
 
+PANEL_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "open_settings_panel",
+        "description": (
+            "Put your Settings panel on the desktop screen — 'open the "
+            "settings panel', 'show me your settings'. It shows which "
+            "microphone you are on, whether you are listening right now, "
+            "your voice, your wake word, a status line and a live log, and "
+            "it has controls to change your voice or wake word and to "
+            "restart you. It never turns listening on or off."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "close_settings_panel",
+        "description": "Take the Settings panel off the screen — 'close the settings panel'.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+]
+_PANEL_TOOL_NAMES = {tool["name"] for tool in PANEL_TOOLS}
+
+
 def realtime_tools(*, calendar: bool = False) -> list[dict[str, Any]]:
     """Our Anthropic-shaped tool defs, converted to Realtime's function shape."""
     definitions = TOOL_DEFINITIONS + (CALENDAR_TOOLS if calendar else [])
@@ -1054,6 +1078,8 @@ class RealtimeEngine:
         presence: Any | None = None,
         followups: Any | None = None,
         delivery: Any | None = None,
+        cues: Any | None = None,
+        panel: Any | None = None,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
         self._journal = journal  # what she did and saw, by day
@@ -1089,9 +1115,17 @@ class RealtimeEngine:
         self._board = task_board  # her own Jira: specs, builds, approvals
         self._announcer = announcer  # queued things she says on her own
         self.announcer = announcer  # the runner's idle loop polls it too
+        self._cues = cues  # listening earcons: start / end / error
+        self._panel = panel  # the desktop Settings panel she opens by voice
+        self.last_response_followup = False  # a tool ran: more audio is coming
         self._instructions_stale = False  # a preference changed mid-session
         self._transcription_model: str | None = None  # what _configure settled on
         self._usage_log = usage_log
+
+    @property
+    def voice(self) -> str:
+        """The voice actually in use — a gated one falls back on connect."""
+        return self._voice
 
     async def _session_config(self, transcription_model: str | None) -> dict[str, Any]:
         extra = f"\n{self._extra_instructions}\n" if self._extra_instructions else ""
@@ -1163,6 +1197,8 @@ class RealtimeEngine:
             tools += FOLLOWUP_TOOLS
         if self._delivery is not None:
             tools += DELIVERY_TOOLS
+        if self._panel is not None:
+            tools += PANEL_TOOLS
         return {
             "type": "realtime",
             "instructions": instructions,
@@ -1273,6 +1309,8 @@ class RealtimeEngine:
                 result_text, is_error = self._execute_watch_tool(call_name, args)
             elif call_name in _JOURNAL_TOOL_NAMES:
                 result_text, is_error = self._execute_journal_tool(call_name, args)
+            elif call_name in _PANEL_TOOL_NAMES:
+                result_text, is_error = self._execute_panel_tool(call_name)
             elif call_name in _BRAIN_TOOL_NAMES:
                 self._live_transcript = stats.transcript
                 result_text, is_error = await self._execute_brain_tool(call_name, args)
@@ -1330,6 +1368,8 @@ class RealtimeEngine:
             )
         if outputs and not closing:
             await connection.send({"type": "response.create"})
+        # another response is on its way: the listening cue must wait for it
+        self.last_response_followup = bool(outputs) and not closing
         return closing
 
     async def _execute_task_tool(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
@@ -1711,6 +1751,17 @@ class RealtimeEngine:
             return "I haven't announced anything in that window", False
         return json.dumps(rows), False
 
+    def _execute_panel_tool(self, name: str) -> tuple[str, bool]:
+        if self._panel is None:
+            return "the settings panel isn't available in this session", True
+        try:
+            if name == "open_settings_panel":
+                return self._panel.open(), False
+            return self._panel.close(), False
+        except Exception as err:  # noqa: BLE001 — a window that won't open is a spoken sentence
+            verb = "open" if name == "open_settings_panel" else "close"
+            return f"couldn't {verb} the settings panel: {err}", True
+
     def _execute_journal_tool(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
         now = time.time()
         if name == "journal_search":
@@ -1965,17 +2016,24 @@ class RealtimeEngine:
 
             pending: list[asyncio.Task] = []
 
-            async def finish_playback(close_after: bool) -> None:
+            async def finish_playback(close_after: bool, listening: bool = True) -> None:
                 nonlocal speaking
                 await speaker.wait_idle()
-                speaking = False
-                mic.drain()
                 if close_after and not interrupted:
                     # (a barge-in during the audio keeps the session open: he
                     # wanted to say something)
+                    speaking = False
+                    mic.drain()
                     ended.set()
-                else:
-                    ui.listening()
+                    return
+                if listening and self._cues is not None:
+                    # The ding goes out BEFORE half-duplex lifts, so the mic
+                    # never feeds our own chime back to the model.
+                    self._cues.start(speaker)
+                    await speaker.wait_idle()
+                speaking = False
+                mic.drain()
+                ui.listening()
 
             # One-shot quick close: a single user utterance gets its answer,
             # then the ENGINE closes the session after a short silence — no
@@ -2037,6 +2095,9 @@ class RealtimeEngine:
                             speaking = False
                             ui.interrupted()
                         ui.user_speaking()
+                    elif kind == "input_audio_buffer.speech_stopped":
+                        if self._cues is not None:
+                            self._cues.end(speaker)
                     elif kind == "response.done":
                         response_active = False
                         closing = await self._handle_response_done(connection, event, stats)
@@ -2077,9 +2138,21 @@ class RealtimeEngine:
                                 # back to sleep as soon as the audio drains
                                 stats.ended_by = "announcement delivered"
                                 close_after = True
-                        pending.append(asyncio.create_task(finish_playback(close_after)))
+                        pending.append(
+                            asyncio.create_task(
+                                finish_playback(
+                                    close_after, listening=not self.last_response_followup
+                                )
+                            )
+                        )
                     elif kind == "error":
-                        ui.error(str(getattr(event, "error", event)))
+                        message = str(getattr(event, "error", event))
+                        if self._cues is not None and self._cues.listening:
+                            # Only when he was mid-turn: a stale response.cancel
+                            # after a barge-in is a protocol grumble, not a
+                            # failure worth a tone. The panel logs both.
+                            self._cues.error(message, speaker)
+                        ui.error(message)
 
             async def idle_watchdog() -> None:
                 while True:
@@ -2127,6 +2200,8 @@ class RealtimeEngine:
                         self._followups.mark_raised(self._raised_followups)
                     self._raised_followups = []
             finally:
+                if self._cues is not None:
+                    self._cues.reset()  # the runner's goodbye chime ends it
                 for task in [*tasks, *pending]:
                     task.cancel()
                 for task in [*tasks, *pending]:

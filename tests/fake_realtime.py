@@ -4,7 +4,9 @@
 records everything the engine sends and replies with scripted events. It
 answers the session handshake automatically and, for each `response.create`
 it receives, emits one audio delta and a `response.done` with no output —
-enough to exercise the engine's session lifecycle without a network.
+enough to exercise the engine's session lifecycle without a network. A
+scripted user turn is the real event order: speech_started, speech_stopped,
+then the finished transcription.
 """
 
 from __future__ import annotations
@@ -52,12 +54,24 @@ class FakeConnection:
             if self.say_after_response and not self._said:
                 self._said = True
                 self._events.put_nowait(SimpleNamespace(type="input_audio_buffer.speech_started"))
+                self._events.put_nowait(SimpleNamespace(type="input_audio_buffer.speech_stopped"))
                 self._events.put_nowait(
                     SimpleNamespace(
                         type="conversation.item.input_audio_transcription.completed",
                         transcript=self.say_after_response,
                     )
                 )
+
+    def user_says(self, text: str) -> None:
+        """Script a user turn at a moment the test chooses (say_after_response
+        fires one immediately instead, in the same batch as the reply)."""
+        self._events.put_nowait(SimpleNamespace(type="input_audio_buffer.speech_started"))
+        self._events.put_nowait(SimpleNamespace(type="input_audio_buffer.speech_stopped"))
+        self._events.put_nowait(
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed", transcript=text
+            )
+        )
 
     async def recv(self) -> Any:
         return await self._events.get()
