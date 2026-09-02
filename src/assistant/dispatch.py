@@ -20,13 +20,13 @@ touch .env/data or push/merge. Spoken confirmation is enforced upstream.
 from __future__ import annotations
 
 import asyncio
-import subprocess
-import sys
 import glob
 import json
 import os
 import re
 import shutil
+import subprocess
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field

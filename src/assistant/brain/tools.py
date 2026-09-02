@@ -8,10 +8,10 @@ is a full LLM round trip, so per-bulb tools would multiply dead air.
 from __future__ import annotations
 
 import asyncio
-import subprocess
-import sys
 import contextlib
 import json
+import subprocess
+import sys
 from datetime import datetime, timedelta
 from typing import Any
 
