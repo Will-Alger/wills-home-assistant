@@ -770,7 +770,7 @@ class TaskBoard:
             merge_ref, gates_dir = task.branch, Path(task.worktree)
         try:
             ok, message = await self._runner.merge_branch(
-                merge_ref=merge_ref, gates_dir=gates_dir, title=task.title
+                merge_ref=merge_ref, gates_dir=gates_dir, title=task.title, uv_exe=self._uv_exe
             )
         finally:
             if cleanup is not None:

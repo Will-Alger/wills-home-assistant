@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
@@ -95,6 +96,93 @@ async def test_merge_gates_and_success(tmp_path: Path) -> None:
     assert (repo / "GREETING.md").exists()  # landed on main
     assert await runner.remove_worktree(worktree)
     assert not worktree.exists()
+
+
+async def test_gate_runner_prefers_uv_then_the_branch_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gates used to shell out to a bare "uv", so every merge failed on a
+    machine where uv is installed but not on PATH (hers)."""
+    repo = make_repo(tmp_path)
+    runner = fake_runner(repo)
+
+    configured_uv = tmp_path / "uv.exe"  # UV_EXE, as staging already resolves it
+    configured_uv.write_text("", encoding="utf-8")
+    prefix, note = await runner.resolve_gate_runner(repo, str(configured_uv))
+    assert prefix == [str(configured_uv), "run"] and note == ""
+
+    monkeypatch.setattr(Dispatcher, "resolve_uv", staticmethod(lambda configured="": None))
+
+    async def has_the_tools(self, python: str, cwd: Path) -> bool:
+        return True
+
+    monkeypatch.setattr(Dispatcher, "_runs_the_gate_tools", has_the_tools)
+    venv = "Scripts/python.exe" if sys.platform == "win32" else "bin/python"
+    venv_python = repo / ".venv" / venv
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text("", encoding="utf-8")
+    prefix, note = await runner.resolve_gate_runner(repo)
+    assert prefix == [str(venv_python), "-m"]
+    assert "uv was not found" in note and "branch's own virtual environment" in note
+
+
+async def test_merge_gates_fall_back_to_a_plain_python_without_uv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No uv anywhere: the gates really run `python -m ruff` / `python -m
+    pytest` on the branch, and the spoken result says the fallback ran."""
+    if importlib.util.find_spec("ruff") is None:  # pragma: no cover - dev deps missing
+        pytest.skip("this interpreter has no ruff to fall back to")
+    repo = make_repo(tmp_path)
+    runner = fake_runner(repo)
+    worktree, branch = await runner.create_worktree("5-fallback")
+    (worktree / "pyproject.toml").write_text(  # armed: the gates only run with one
+        """[project]
+name = "gate-demo"
+version = "0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+""",
+        encoding="utf-8",
+    )
+    for folder in ("src", "scripts"):
+        (worktree / folder).mkdir()
+        (worktree / folder / "thing.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (worktree / "tests").mkdir()
+    (worktree / "tests" / "test_thing.py").write_text(
+        "def test_thing() -> None:\n    assert True\n", encoding="utf-8"
+    )
+    assert await runner.commit_all(worktree, "a branch with checks to run")
+
+    monkeypatch.setattr(Dispatcher, "resolve_uv", staticmethod(lambda configured="": None))
+    ok, message = await runner.merge_branch(merge_ref=branch, gates_dir=worktree, title="fallback")
+    assert ok, message
+    assert "uv was not found" in message and "checks passed" in message
+    assert (repo / "tests" / "test_thing.py").exists()  # landed on main
+
+
+async def test_merge_says_what_to_install_when_no_runner_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = make_repo(tmp_path)
+    runner = fake_runner(repo)
+    worktree, branch = await runner.create_worktree("6-no-runner")
+    (worktree / "pyproject.toml").write_text('[project]\nname = "x"\n', encoding="utf-8")
+    assert await runner.commit_all(worktree, "add pyproject")
+
+    monkeypatch.setattr(Dispatcher, "resolve_uv", staticmethod(lambda configured="": None))
+
+    async def has_nothing(self, python: str, cwd: Path) -> bool:
+        return False
+
+    monkeypatch.setattr(Dispatcher, "_runs_the_gate_tools", has_nothing)
+    with pytest.raises(DispatchError, match="Install uv"):
+        await runner.resolve_gate_runner(worktree)
+    ok, message = await runner.merge_branch(merge_ref=branch, gates_dir=worktree, title="no runner")
+    assert not ok and "merge blocked" in message
+    assert "Install uv" in message and "ruff and pytest" in message
+    assert not (repo / "pyproject.toml").exists()  # nothing merged behind a dead gate
 
 
 async def test_cloud_branch_is_fetched_gated_and_merged(tmp_path: Path) -> None:

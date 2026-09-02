@@ -86,7 +86,7 @@ She develops herself by voice. Everything below is one conversation away.
 | *(later, on her own)* | "Progress on task 7: tests are passing." … "Task 7 is built and ready for your test. Say 'switch to task seven' to try it." |
 | "Switch to task seven" | She restarts **into that branch** (`data/active_checkout.json` tells the watchdog which checkout to run; `.env`, `data/`, `logs/` stay on main via `ALEXA_HOME`). Free and reversible: "go back to main", "switch to task four". |
 | "It should only do that once a day" | `revise_task`: the feedback is recorded in the spec and handed to the **same** agent, which resumes with its context. She announces the revision; switch again. |
-| "Ship it" | `approve_task`: lint + tests + clean-main gates, `merge --no-ff`, push, `uv sync` on main, restart onto main. |
+| "Ship it" | `approve_task`: lint + tests + clean-main gates, `merge --no-ff`, push, `uv sync` on main, restart onto main. The gates run behind `uv run` (found at `UV_EXE`, on PATH, or in uv's WinGet folder); with no uv anywhere they fall back to `python -m ruff` / `python -m pytest` from the branch's `.venv` or hers and she says so out loud. If neither can run them she blocks the merge and names what to install. |
 | "What's in flight?" / "What did you finish today?" / "Did we ever build X?" | `list_tasks` / `search_tasks` / `task_detail`. |
 | *(the agent hits a decision only you can make)* | It writes a `QUESTION:` line and stops; she announces "task 7 needs your call: …" and waits for you. "Answer task 7: use the first name" → `answer_task` resumes the same agent. Or tap **Answer** on the phone card. |
 | "What did you tell me this morning?" | `list_notifications` (scope=all). |
