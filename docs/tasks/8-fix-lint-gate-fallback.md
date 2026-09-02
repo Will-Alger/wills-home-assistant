@@ -16,3 +16,7 @@ Voice test plan
 Out of scope
 - Changing lint rules or test suites.
 - Adding new dependencies beyond what is needed for the fallback mechanism.
+
+## Revision 2 — 2026-09-02
+
+Merge approval still fails when 'uv' is missing; the approval lint/test gate invoked 'uv' directly and did not use the fallback, so the fix did not apply to the merge approval path.
