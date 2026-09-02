@@ -23,7 +23,7 @@ from pathlib import Path
 from rich.console import Console
 
 from assistant.announce import Announcer
-from assistant.app import wait_for_trigger
+from assistant.app import record_session, wait_for_trigger
 from assistant.audio import tones
 from assistant.audio.mic import Microphone, describe_device
 from assistant.audio.speaker import Speaker
@@ -38,11 +38,13 @@ from assistant.engines.realtime_engine import (
 from assistant.events import EventWatcher, WatchStore
 from assistant.home import HomeAssistantClient
 from assistant.home.fake import FakeHome
+from assistant.journal import Journal
 from assistant.learning import Reflector
 from assistant.llm.anthropic_provider import AnthropicProvider
 from assistant.memory import MemoryStore
 from assistant.routines import RoutineStore
 from assistant.scheduler import Scheduler
+from assistant.sessions import SessionLog
 from assistant.tasks import TaskBoard
 from assistant.wake.detector import WakeDetector
 from assistant.web import WebSearch
@@ -162,10 +164,21 @@ def build_engine(fake: bool):
     root = home_dir()  # .env, data/, logs/: the MAIN repo even when staged
     staged = os.environ.get("ALEXA_STAGED_TASK", "").strip()
     memory = MemoryStore(root / "data" / "memory.json")
+    journal = Journal(root / "data" / "journal", keep_days=settings.journal_keep_days)
+    sessions = SessionLog(root / "data" / "sessions.json")
     announcer = Announcer(
         root / "data" / "announcements.json",
         quiet_hours=settings.announce_quiet_hours,
         max_attempts=settings.announce_max_attempts,
+    )
+    announcer.subscribe(
+        lambda item, event: (
+            journal.write(
+                "notification", f"{event}: {item.text[:120]}", source=item.kind, data={"id": item.id}
+            )
+            if event != "grouped"
+            else None
+        )
     )
     calendar = build_calendar(settings, fake)
     reflector = None
@@ -202,13 +215,14 @@ def build_engine(fake: bool):
             staged_task_id=int(staged) if staged.isdigit() else None,
             uv_exe=settings.uv_exe,
             resume_delay_s=settings.dispatch_resume_delay_s,
+            journal=journal,
         )
         if settings.use_claude_subscription
         else None
     )
     watches = WatchStore(root / "data" / "watches.json")
     routines = RoutineStore(root / "data" / "routines.json")
-    scheduler = Scheduler(root / "data" / "schedule.json", announcer=announcer)
+    scheduler = Scheduler(root / "data" / "schedule.json", announcer=announcer, journal=journal)
     thinker = None
     if settings.use_claude_subscription:
         from assistant.llm.claude_cli import ClaudeCli
@@ -243,6 +257,8 @@ def build_engine(fake: bool):
         watches=watches,
         scheduler=scheduler,
         routines=routines,
+        journal=journal,
+        sessions=sessions,
         web=WebSearch(
             settings.openai_api_key,
             model=settings.web_search_model,
@@ -252,12 +268,15 @@ def build_engine(fake: bool):
     scheduler._executor = engine._executor  # scheduled actions run through her tools
     scheduler.briefing = make_briefing(calendar, board, scheduler, settings.owner_name)
     engine.scheduler = scheduler
+    engine.journal = journal
+    engine.sessions = sessions
     engine.event_watcher = (
         None
         if fake
         else EventWatcher(
             settings.ha_url, settings.ha_token, watches, announcer,
             log=lambda m: console.print(f"[dim]{m}[/dim]"),
+            journal=journal,
         )
     )
     return settings, home, engine, reflector
@@ -381,6 +400,11 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
                 speaker.enqueue(tones.pcm("announce", REALTIME_RATE))
         else:
             console.print("[green]● connected — talk[/green]")
+        sessions = getattr(engine, "sessions", None)
+        row = None
+        if sessions is not None:
+            with contextlib.suppress(Exception):
+                row = sessions.start("announce" if announcing else "wake")
         stats = await engine.run_conversation(
             mic24, speaker, session_wake, ConsoleUi(settings.assistant_name), announce=announcing
         )
@@ -407,13 +431,14 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
         f"tools: {stats.tool_calls or 'none'} · ${stats.cost_usd:.4f} "
         f"(${total_cost:.4f} session)"
     )
-    if reflector is not None and stats.transcript:
-        with contextlib.suppress(Exception):  # learning must never break the loop
-            reflection = await reflector.reflect(stats.transcript)
-            for lesson in reflection.lessons:
-                console.print(f"[magenta]✎ learned:[/magenta] {lesson}")
-            for obs in reflection.observations:
-                console.print(f"[magenta]✎ noticed (will ask):[/magenta] {obs}")
+    reflection = await record_session(
+        sessions, getattr(engine, "journal", None), stats, row, reflector
+    )
+    if reflection is not None:
+        for lesson in reflection.lessons:
+            console.print(f"[magenta]✎ learned:[/magenta] {lesson}")
+        for obs in reflection.observations:
+            console.print(f"[magenta]✎ noticed (will ask):[/magenta] {obs}")
     return total_cost
 
 

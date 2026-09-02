@@ -210,11 +210,13 @@ class EventWatcher:
         *,
         connector: Callable[..., Any] | None = None,
         log: Callable[[str], None] | None = None,
+        journal: Any | None = None,
     ) -> None:
         self._url = url.rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
         self._token = token
         self._store = store
         self._announcer = announcer
+        self._journal = journal
         self._connector = connector
         self._log = log or (lambda _m: None)
         self._stop = asyncio.Event()
@@ -278,13 +280,21 @@ class EventWatcher:
         self.events_seen += 1
         said: list[str] = []
         for watch, text in self._store.evaluate(entity_id, old, new):
+            if self._journal is not None:
+                with contextlib.suppress(Exception):
+                    self._journal.write(
+                        "watch", text, source=entity_id,
+                        data={"watch": watch.id, "old": old, "new": new},
+                    )
             with contextlib.suppress(Exception):
                 self._announcer.enqueue(
                     text,
                     kind="watch",
-                    ref=f"watch:{watch.id}:{int(time.time())}",
+                    ref=f"watch:{watch.id}:{time.time_ns()}",  # unique; grouping does the merging
+                    group=f"watch:{watch.id}",  # a flapping sensor is one row with a count
                     priority=watch.priority,
                     expires_in_s=12 * 3600,
+                    context={"entity": entity_id, "watch": watch.id},
                 )
             said.append(text)
         return said

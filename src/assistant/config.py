@@ -77,6 +77,9 @@ class Settings(BaseSettings):
     # CLI (Max-billed); the voice model stays in charge of the conversation.
     brain_model: str = "opus"
     brain_effort: str = ""
+    # Her journal (what she did and saw, one small file per day) is pruned
+    # after this many days.
+    journal_keep_days: int = 90
     # Announcements (a build finished, a milestone, a rollback): she speaks up
     # on her own while idle. Normal ones wait out quiet hours ("23:00-08:00";
     # "" = never quiet); urgent ones don't. Each is retried with backoff up to

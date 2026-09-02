@@ -89,9 +89,11 @@ class Scheduler:
         announcer: Any | None = None,
         executor: Any | None = None,
         now: Callable[[], float] = time.time,
+        journal: Any | None = None,
     ) -> None:
         self._path = path
         self._announcer = announcer
+        self._journal = journal
         self._executor = executor  # ToolExecutor for scheduled actions
         self.briefing: Callable[[], Any] | None = None  # async () -> str, set by the app
         self._now = now
@@ -292,6 +294,9 @@ class Scheduler:
         else:
             text = await self._run_action(item)
         self._save()
+        if self._journal is not None:
+            with contextlib.suppress(Exception):
+                self._journal.write("schedule", text, source=item.kind, data={"id": item.id})
         if self._announcer is not None:
             with contextlib.suppress(Exception):
                 self._announcer.enqueue(

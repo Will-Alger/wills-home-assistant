@@ -120,6 +120,16 @@ Things they ask you to keep for later go in remember(kind="fact"); answer \
 checking ids. Store only what the speaker deliberately tells you — never \
 ambient chatter.
 {calendar}
+Recent conversations — so you can pick up where you left off; refer to them \
+naturally ("about that thermostat thing from earlier"), never read them out \
+as a list: {recent}. "What did we talk about this morning?" → \
+recent_conversations. Your journal records what YOU did and saw: tool \
+actions, watches that fired, scheduled things, your notifications, comings \
+and goings. "Did the porch light come on last night?", "what did you do \
+while I was gone?", "when did I leave today?" → journal_search. It knows only \
+what you did or watched — not every device change in the house; say so when \
+it comes up empty.
+
 Your own development — the build loop, all by voice. You are an evolving open \
 project: project_status shows your recent code changes, read_roadmap your \
 backlog; {owner} may discuss your development with you — engage with \
@@ -302,6 +312,55 @@ SYSTEM_TOOLS: list[dict[str, Any]] = [
     },
 ]
 _SYSTEM_TOOL_NAMES = {tool["name"] for tool in SYSTEM_TOOLS}
+
+JOURNAL_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "journal_search",
+        "description": (
+            "Search your journal of what you did and saw: tool actions, "
+            "scheduled things that ran, watches that fired, notifications, "
+            "presence, conversations. since: today | yesterday | week | a "
+            "number of hours | an ISO date (default: the last 48 hours). "
+            "kinds filters (tool, schedule, watch, notification, session, "
+            "presence, task). Best matches first, then newest."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "words to look for; empty = everything"},
+                "since": {"type": "string"},
+                "kinds": {"type": "array", "items": {"type": "string"}},
+                "limit": {"type": "integer"},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "name": "recent_conversations",
+        "description": (
+            "Recent conversations with when they happened and what they were "
+            "about — 'what did we talk about this morning / yesterday?'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"since_hours": {"type": "number", "description": "default 24"}},
+        },
+    },
+]
+_JOURNAL_TOOL_NAMES = {tool["name"] for tool in JOURNAL_TOOLS}
+
+# Read-only lookups are not journaled — the journal is what she DID, not
+# every glance she took.
+_QUIET_TOOLS = frozenset(
+    {
+        "get_lights", "search_entities", "get_entity", "browse_music", "list_memories",
+        "list_tasks", "task_detail", "search_tasks", "web_search", "list_notifications",
+        "announcement_history", "journal_search", "recent_conversations", "read_roadmap",
+        "read_history", "project_status", "show_me", "think", "list_watches",
+        "list_schedule", "list_routines", "list_calendar_events",
+    }
+)
 
 # Mid-session announcements: how long the room must be quiet, and how old the
 # session must be, before an EVENT is slipped in. Module-level so tests can
@@ -766,6 +825,30 @@ class SessionStats:
     replied: bool = False  # the owner said something in this session
 
 
+def _spec_window(spec: str, now: float) -> tuple[float, float | None] | str:
+    """today | yesterday | week | <hours> | ISO date -> (since, until); or an
+    error sentence."""
+    text = (spec or "today").strip().lower()
+    local_now = datetime.fromtimestamp(now).astimezone()
+    midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if text == "today":
+        return midnight.timestamp(), None
+    if text == "yesterday":
+        return (midnight - timedelta(days=1)).timestamp(), midnight.timestamp()
+    if text in ("week", "this week", "last 7 days"):
+        return (midnight - timedelta(days=7)).timestamp(), None
+    try:
+        return now - float(text) * 3600, None
+    except ValueError:
+        pass
+    try:
+        day = datetime.fromisoformat(text).replace(tzinfo=local_now.tzinfo)
+    except ValueError:
+        return "since must be today, yesterday, week, a number of hours, or an ISO date"
+    start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start.timestamp(), (start + timedelta(days=1)).timestamp()
+
+
 def _usage_cost(usage: Any) -> float:
     def n(obj: Any, name: str) -> int:
         return int(getattr(obj, name, 0) or 0)
@@ -818,8 +901,12 @@ class RealtimeEngine:
         watches: Any | None = None,
         scheduler: Any | None = None,
         routines: Any | None = None,
+        journal: Any | None = None,
+        sessions: Any | None = None,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
+        self._journal = journal  # what she did and saw, by day
+        self._sessions = sessions  # recent conversations, for continuity
         self._model = model
         self._voice = voice  # may be swapped to FALLBACK_VOICE during _configure
         self.voice_note: str | None = None
@@ -886,6 +973,7 @@ class RealtimeEngine:
             routines=self._routines.text() if self._routines else "(none)",
             staged=self._board.staged_paragraph() if self._board else "",
             unread=self._announcer.unread_summary() if self._announcer is not None else "none",
+            recent=self._sessions.recent_text() if self._sessions is not None else "none",
             extra=extra,
         )
         audio_in: dict[str, Any] = {
@@ -909,6 +997,8 @@ class RealtimeEngine:
             tools += SCHEDULE_TOOLS
         if self._routines is not None:
             tools += ROUTINE_TOOLS
+        if self._journal is not None or self._sessions is not None:
+            tools += JOURNAL_TOOLS
         return {
             "type": "realtime",
             "instructions": instructions,
@@ -1011,6 +1101,8 @@ class RealtimeEngine:
                 result_text, is_error = self._execute_routine_tool(call_name, args)
             elif call_name in _WATCH_TOOL_NAMES:
                 result_text, is_error = self._execute_watch_tool(call_name, args)
+            elif call_name in _JOURNAL_TOOL_NAMES:
+                result_text, is_error = self._execute_journal_tool(call_name, args)
             elif call_name in _BRAIN_TOOL_NAMES:
                 self._live_transcript = stats.transcript
                 result_text, is_error = await self._execute_brain_tool(call_name, args)
@@ -1023,6 +1115,18 @@ class RealtimeEngine:
             stats.transcript.append((f"tool {call_name}", outcome + result_text[:200]))
             payload: dict[str, Any] = {"error" if is_error else "result": result_text}
             applied = getattr(self._executor, "last_routines", [])
+            if self._journal is not None and call_name not in _QUIET_TOOLS:
+                with contextlib.suppress(Exception):
+                    self._journal.write(
+                        "tool",
+                        f"{call_name}: {outcome}{result_text[:160]}",
+                        source="voice",
+                        data={
+                            "args": args,
+                            "ok": not is_error,
+                            **({"routines": applied} if applied and not is_error else {}),
+                        },
+                    )
             if applied and not is_error:
                 payload["routines_applied"] = applied
             if call_name in COMMAND_TOOLS and not is_error:
@@ -1341,23 +1445,48 @@ class RealtimeEngine:
             return json.dumps(out), False
         if scope != "all":
             return "scope must be unread, all, or last", True
-        spec = str(args.get("since", "today") or "today").strip().lower()
-        now = time.time()
-        local_now = datetime.fromtimestamp(now).astimezone()
-        midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
-        if spec == "today":
-            since, until = midnight.timestamp(), None
-        elif spec == "yesterday":
-            since, until = (midnight - timedelta(days=1)).timestamp(), midnight.timestamp()
-        else:
-            try:
-                since, until = now - float(spec) * 3600, None
-            except ValueError:
-                return "since must be today, yesterday, or a number of hours", True
+        window = _spec_window(str(args.get("since", "today") or "today"), time.time())
+        if isinstance(window, str):
+            return window, True
+        since, until = window
         rows = ann.items(since, until, kinds=kinds, limit=20)
         if not rows:
             return "I haven't announced anything in that window", False
         return json.dumps(rows), False
+
+    def _execute_journal_tool(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
+        now = time.time()
+        if name == "journal_search":
+            if self._journal is None:
+                return "the journal isn't enabled", True
+            window = _spec_window(str(args.get("since", "") or "48"), now)
+            if isinstance(window, str):
+                return window, True
+            since, until = window
+            kinds = [str(k) for k in (args.get("kinds") or []) if str(k)]
+            try:
+                limit = int(args.get("limit") or 20)
+            except (TypeError, ValueError):
+                limit = 20
+            entries = self._journal.query(
+                str(args.get("query", "") or ""), since=since, until=until,
+                kinds=kinds or None, limit=max(1, min(limit, 40)),
+            )
+            if not entries:
+                return "nothing in the journal for that", False
+            return json.dumps([self._journal.spoken(e) for e in entries]), False
+        if name == "recent_conversations":
+            if self._sessions is None:
+                return "the session log isn't enabled", True
+            try:
+                hours = float(args.get("since_hours") or 24)
+            except (TypeError, ValueError):
+                hours = 24.0
+            rows = self._sessions.rows(now - hours * 3600)
+            if not rows:
+                return "no conversations in that window", False
+            return json.dumps(rows), False
+        return f"unknown journal tool {name}", True
 
     def _execute_memory(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
         if self._memory is None:

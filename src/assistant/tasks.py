@@ -18,6 +18,7 @@ import of the older data/jobs.json.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -208,10 +209,12 @@ class TaskBoard:
         staged_task_id: int | None = None,
         uv_exe: str = "",
         resume_delay_s: float = 300.0,
+        journal: Any | None = None,
     ) -> None:
         self._root = root
         self._runner = runner
         self._announcer = announcer
+        self._journal = journal
         self._now = now
         self._staged_task_id = staged_task_id  # this PROCESS runs that task's build
         self._uv_exe = uv_exe
@@ -309,6 +312,12 @@ class TaskBoard:
     def _log(self, task: Task, event: str, detail: str = "") -> None:
         task.updated = self._now()
         task.history.append({"ts": task.updated, "event": event, "detail": detail})
+        if self._journal is not None:
+            with contextlib.suppress(Exception):
+                self._journal.write(
+                    "task", f"task {task.id} '{task.title}' {event}" + (f": {detail}" if detail else ""),
+                    source=f"task:{task.id}", data={"task_id": task.id, "event": event},
+                )
 
     def _announce(
         self,
