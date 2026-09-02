@@ -38,6 +38,7 @@ from assistant.home.fake import FakeHome
 from assistant.learning import Reflector
 from assistant.llm.anthropic_provider import AnthropicProvider
 from assistant.memory import MemoryStore
+from assistant.tasks import TaskBoard
 from assistant.wake.detector import WakeDetector
 
 console = Console()
@@ -155,15 +156,18 @@ def build_engine(fake: bool):
         extra_instructions=settings.assistant_extra_instructions,
         memory=memory,
         calendar=calendar,
-        dispatcher=(
-            Dispatcher(
+        task_board=(
+            TaskBoard(
                 root,
-                routine_id=settings.claude_routine_id,
-                routine_token=settings.claude_routine_token,
-                extra_routines=load_extra_routines(root),
+                runner=Dispatcher(
+                    root,
+                    routine_id=settings.claude_routine_id,
+                    routine_token=settings.claude_routine_token,
+                    extra_routines=load_extra_routines(root),
+                    model=settings.dispatch_model,
+                    effort=settings.dispatch_effort,
+                ),
                 announcer=announcer,
-                model=settings.dispatch_model,
-                effort=settings.dispatch_effort,
             )
             if settings.use_claude_subscription
             else None

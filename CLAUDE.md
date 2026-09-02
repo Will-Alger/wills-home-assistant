@@ -17,8 +17,13 @@ design notes: `docs/FEATURES.md` — it is the source of truth for scope.
   IP not .local) and FakeHome for tests.
 - `src/assistant/memory.py` + `learning.py` — preferences/facts/lessons/
   episodes; session-end reflection writes lessons.
-- `src/assistant/dispatch.py` — how you got here: worktree jobs via
-  `claude -p`, billed to the Max subscription.
+- `src/assistant/tasks.py` + `dispatch.py` — how you got here: her task
+  board commissions a worktree run via `claude -p` (Max subscription). Your
+  task's spec is committed at `docs/tasks/<slug>.md` in this worktree — read
+  it first; it says how the owner will test the result BY VOICE. You may be
+  resumed later with the owner's feedback (a "Revision" section in the spec).
+- `src/assistant/announce.py` — she speaks up on her own when you finish or
+  print a `MILESTONE:` line (max three), so keep those short and plain.
 
 ## Rules of the house
 
@@ -26,7 +31,7 @@ design notes: `docs/FEATURES.md` — it is the source of truth for scope.
   changes; both must pass. Tests use FakeHome/stubs — never require live
   services or spend API money without being asked.
 - Never read or modify `.env`, `data/`, `logs/`. Never push or merge —
-  commit to your branch; Will reviews at a keyboard.
+  commit to your branch; Will tests it by voice and approves the merge.
 - Conversation quality is co-equal with command execution (the north star).
   Don't trade one for the other.
 - Verify external API shapes against live docs or installed SDK source —

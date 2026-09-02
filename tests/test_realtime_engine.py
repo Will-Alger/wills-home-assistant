@@ -38,13 +38,15 @@ async def test_session_config_renders_jobs_and_repos(tmp_path) -> None:
     from assistant.dispatch import Dispatcher
     from assistant.engines.realtime_engine import RealtimeEngine
     from assistant.home.fake import FakeHome
+    from assistant.tasks import TaskBoard
 
-    dispatcher = Dispatcher(
+    runner = Dispatcher(
         tmp_path,
         routine_id="trig_x",
         routine_token="tok_x",
         extra_routines={"side-project": {"routine_id": "trig_s", "token": "tok_s"}},
     )
+    board = TaskBoard(tmp_path, runner=runner)
     engine = RealtimeEngine(
         api_key="test-key",
         model="m",
@@ -53,14 +55,18 @@ async def test_session_config_renders_jobs_and_repos(tmp_path) -> None:
         owner="Will",
         name="Alexa",
         wake_phrase="alexa",
-        dispatcher=dispatcher,
+        task_board=board,
     )
     config = await engine._session_config(None)
     text = config["instructions"]
-    assert "Open jobs right now: none open" in text
+    assert "Open tasks right now: none open" in text
     assert "side-project" in text  # she knows which other repos she can work on
     tool_names = {t["name"] for t in config["tools"]}
-    assert {"develop_feature", "check_work", "close_work", "merge_work"} <= tool_names
+    assert {
+        "draft_task", "start_task", "list_tasks", "task_detail",
+        "search_tasks", "approve_task", "abandon_task",
+    } <= tool_names
+    assert "develop_feature" not in tool_names
 
 
 def test_command_tools_cover_home_actions_only() -> None:

@@ -3,15 +3,15 @@ one, the engine opens a session by speaking it, and marks it delivered."""
 
 from __future__ import annotations
 
-import sys
+import asyncio
 from pathlib import Path
 
 from assistant.announce import Announcer
-from assistant.dispatch import Dispatcher
 from assistant.engines.realtime_engine import RealtimeEngine
 from assistant.home.fake import FakeHome
+from assistant.tasks import TaskBoard
 from tests.fake_realtime import FakeClient, InstantSpeaker, NeverMic, QuietUi
-from tests.test_dispatch import FAKE_CLAUDE, make_repo, wait_done
+from tests.test_dispatch import fake_runner, make_repo
 
 
 def make_engine(announcer: Announcer) -> tuple[RealtimeEngine, FakeClient]:
@@ -30,24 +30,19 @@ def make_engine(announcer: Announcer) -> tuple[RealtimeEngine, FakeClient]:
     return engine, client
 
 
-async def test_finished_job_queues_a_spoken_announcement(tmp_path: Path) -> None:
+async def test_finished_build_queues_a_spoken_announcement(tmp_path: Path) -> None:
     repo = make_repo(tmp_path)
     announcer = Announcer(repo / "data" / "announcements.json")
-    dispatcher = Dispatcher(
-        repo,
-        claude_cmd=f'"{sys.executable}" "{FAKE_CLAUDE}"',
-        timeout_s=20.0,
-        announcer=announcer,
-        model="opus",
-    )
-    assert "--model opus" in dispatcher._claude_cmd  # Opus rides the command line
-    job = await dispatcher.start("add a greeting file", "greeting file")
-    await wait_done(dispatcher, job.id)
+    board = TaskBoard(repo, runner=fake_runner(repo, model="opus"), announcer=announcer)
+    task = board.draft("greeting file", "add a greeting file")
+    await board.start(task.id)
+    async with asyncio.timeout(15):
+        while board.get(task.id).state == "building":
+            await asyncio.sleep(0.1)
 
     texts = [a.text for a in announcer.pending()]
-    assert any(t.startswith("Progress on 'greeting file': tests are passing") for t in texts)
-    assert any("'greeting file' is built and ready for your test" in t for t in texts)
-    assert dispatcher.jobs()[0].milestones == 1
+    assert any(t.startswith("Progress on task 1, 'greeting file': tests are passing") for t in texts)
+    assert any("Task 1, 'greeting file', is built and ready for your test" in t for t in texts)
     assert announcer.due()
 
 

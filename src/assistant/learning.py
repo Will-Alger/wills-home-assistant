@@ -35,7 +35,8 @@ teach nothing and empty lists are the normal result.
   to X", "deleting is not supported") — the assistant is actively developed
   and its toolset grows between sessions, so such lessons rot into false
   limitations that make it deny abilities it has gained. The same goes for
-  transient state (which jobs are running, what is currently broken).
+  transient state (which development tasks are building, built, or staged;
+  what is currently broken).
 - observations (max 1): a behavioral pattern of the user worth ASKING about
   before making it a standing preference ("has asked for lower volume at
   night twice"). Only patterns, never one-offs.

@@ -1,32 +1,31 @@
-"""Stage 2 of the endgame: Alexa commissions work on her own codebase.
+"""The runner beneath the task board (see tasks.py): git worktrees, headless
+Claude Code runs billed to the Max subscription, merge gates, cloud routines.
 
-Each job = a sandboxed git worktree (branched from main) + a headless Claude
-Code run (`claude -p`, billed to the Max subscription) executing the request,
-running checks, and committing to its branch. Jobs run in the background of
-the always-on app; `check_work` reports progress. Nothing is ever pushed or
-merged by the machine — Will reviews the branch at a keyboard.
+This module knows nothing about tasks or announcements — it does one unit of
+mechanical work at a time and reports back:
 
-Safety: worktrees only (no access intended outside them), hard timeout,
-spoken confirmation required before dispatch (enforced upstream), and the
-instructions forbid commissioning based on third-party/web content.
+- `create_worktree` / `remove_worktree` / `commit_all` — git plumbing.
+- `run_agent` — one `claude -p` run streamed as stream-json into an `AgentRun`
+  (session id, model, progress lines, MILESTONE: lines, result, cost). Pass
+  `resume_session_id` to continue an earlier run with new instructions.
+- `merge_branch` — the voice-merge gates: clean main, ruff + pytest on the
+  branch, `git merge --no-ff`, push. `fetch_remote_branch` prepares a cloud
+  session's pushed branch for the same gates.
+- `fire_cloud` / `refresh_cloud` — claude.ai/code routines (one per repo).
 
-Beyond her own repo: cloud routines (claude.ai/code) each pin one GitHub
-repository, so dispatching to Will's OTHER repos means one routine per repo,
-registered in data/routines.json (gitignored — tokens live there). Those jobs
-are cloud-only and can never be merged by voice; they end as branches/PRs.
+Safety unchanged: worktrees only, hard timeout, the agent is told never to
+touch .env/data or push/merge. Spoken confirmation is enforced upstream.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import re
 import time
-import uuid
-from dataclasses import asdict, dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 
 def _is_own_repo(repo: str) -> bool:
@@ -53,29 +52,52 @@ def load_extra_routines(root: Path) -> dict[str, dict]:
         return {}
 
 
-_TASK_PROMPT = """\
-You are working on the codebase of "Alexa", a voice home assistant, in a git
-worktree on its own branch. The assistant itself commissioned this work at
-its owner's spoken request.
-
-TASK: {request}
-
+_RULES = """\
 Rules:
 - Work only inside this directory. Never read or modify .env files, data/,
-  or anything outside this worktree.
-- Keep scope tight: do the task, nothing speculative.
+  logs/, or anything outside this worktree.
+- Keep scope tight: do the task, nothing speculative. One feature per task.
 - If you changed code, run `uv run ruff check src scripts tests` and
-  `uv run pytest -q` and fix what they surface.
+  `uv run pytest -q` and fix what they surface. Tests use fakes — never
+  require live services or spend API money.
 - Do not push. Do not merge. When finished: `git add -A` and commit with a
   clear message.
-- End your reply with a short plain-language summary of what you did, the
-  state of tests, and anything the reviewer should look at.
 - Progress: when you reach a meaningful milestone (plan settled, core code
   in place, tests passing, committed), write one line on its own starting
   with `MILESTONE:` followed by one short plain sentence — at most three per
   task. The owner hears these read aloud.
+- End your reply with a short plain-language summary of what you did, the
+  state of tests, and how the owner should test it by voice.
 """
 
+_TASK_PROMPT = (
+    """\
+You are working on the codebase of "Alexa", a voice home assistant, in a git
+worktree on its own branch. The assistant herself commissioned this work at
+her owner's spoken request. The spec is committed at {spec_path} — it says
+how the owner will test the result by voice; build to that.
+
+TASK {task_id}: {title}
+
+{spec}
+
+"""
+    + _RULES
+)
+
+_REVISE_PROMPT = (
+    """\
+You are continuing your own earlier work on this branch of "Alexa", a voice
+home assistant. The owner tested it by voice and reports:
+
+{feedback}
+
+The spec at {spec_path} now carries this as "Revision {n}". Fix it on this
+branch, keeping what already works.
+
+"""
+    + _RULES
+)
 
 _REFRESH_PROMPT = """\
 STATUS CHECK (automated, sent by the voice assistant that commissioned this \
@@ -88,25 +110,17 @@ message.
 
 
 @dataclass
-class Job:
-    id: str
-    title: str
-    request: str
-    status: str  # running | done | failed | interrupted
-    branch: str
-    worktree: str
-    started: float
-    finished: float | None = None
-    summary: str = ""
+class AgentRun:
+    """Live state of one headless agent process."""
+
+    status: str = "running"  # running | done | failed
+    session_id: str = ""
     model: str = ""
-    session_id: str = ""  # `claude --resume <id>` opens the full transcript
+    summary: str = ""
     cost_usd: float = 0.0
-    last_activity: str = ""  # latest agent utterance, for live progress
-    mode: str = "local"  # "local" (worktree) or "cloud" (claude.ai/code session)
-    session_url: str = ""  # cloud jobs: open/continue at this claude.ai/code URL
-    repo: str = ""  # which repository the job targets ("" = the assistant's own)
-    closed: bool = False  # owner considers it dealt with — hidden from reports
-    milestones: int = 0  # MILESTONE: lines announced so far
+    progress: list[str] = field(default_factory=list)  # recent agent utterances
+    milestones: list[str] = field(default_factory=list)  # MILESTONE: lines seen
+    returncode: int | None = None
 
 
 class DispatchError(RuntimeError):
@@ -127,11 +141,10 @@ class Dispatcher:
         extra_routines: dict[str, dict] | None = None,
         cloud_status_cmd: str = "claude -p --cloud {session_id}",
         refresh_timeout_s: float = 180.0,
-        announcer: Any | None = None,
         model: str = "",
         effort: str = "",
     ) -> None:
-        self._root = root
+        self.root = root
         # the coding agent's model/effort ride on the command line (Opus by
         # default from settings; the CLI default otherwise)
         self._claude_cmd = (
@@ -139,7 +152,6 @@ class Dispatcher:
             + (f" --model {model}" if model else "")
             + (f" --effort {effort}" if effort else "")
         )
-        self._announcer = announcer  # she speaks up when a job finishes
         self._timeout_s = timeout_s
         self._routine_id = routine_id
         self._routine_token = routine_token
@@ -149,56 +161,222 @@ class Dispatcher:
         self._extra_routines = dict(extra_routines or {})
         self._cloud_status_cmd = cloud_status_cmd  # a message INTO the session
         self._refresh_timeout_s = refresh_timeout_s
-        self._jobs_path = root / "data" / "jobs.json"
-        self._jobs: dict[str, Job] = {}
-        self._tasks: list[asyncio.Task] = []
-        self._load()
 
-    def _load(self) -> None:
-        if not self._jobs_path.exists():
-            return
-        for row in json.loads(self._jobs_path.read_text(encoding="utf-8")):
-            job = Job(**row)
-            # Local jobs die with the app; cloud sessions keep running remotely.
-            if job.status == "running" and job.mode == "local":
-                job.status = "interrupted"
-            self._jobs[job.id] = job
+    # ── git plumbing ────────────────────────────────────────────────────────
 
-    def _save(self) -> None:
-        self._jobs_path.parent.mkdir(parents=True, exist_ok=True)
-        self._jobs_path.write_text(
-            json.dumps([asdict(j) for j in self._jobs.values()], indent=2), encoding="utf-8"
+    async def create_worktree(self, slug: str) -> tuple[Path, str]:
+        """A fresh branch alexa/<slug> checked out under .worktrees/<slug>."""
+        worktree = self.root / ".worktrees" / slug
+        branch = f"alexa/{slug}"
+        code, out = await self._cmd(
+            ["git", "worktree", "add", "-b", branch, str(worktree), "main"], self.root
         )
+        if code != 0:
+            raise DispatchError(f"could not create worktree: {out[-300:]}")
+        return worktree, branch
 
-    def jobs(self) -> list[Job]:
-        return sorted(self._jobs.values(), key=lambda j: j.started, reverse=True)
+    async def remove_worktree(self, path: Path | str) -> bool:
+        code, _ = await self._cmd(["git", "worktree", "remove", "--force", str(path)], self.root)
+        await self._cmd(["git", "worktree", "prune"], self.root)
+        return code == 0
+
+    async def commit_all(self, cwd: Path, message: str) -> bool:
+        await self._cmd(["git", "add", "-A"], cwd)
+        code, _ = await self._cmd(["git", "commit", "-q", "-m", message], cwd)
+        return code == 0
+
+    async def _cmd(
+        self, cmd: list[str] | str, cwd: Path, timeout: float = 300.0
+    ) -> tuple[int, str]:
+        if isinstance(cmd, str):
+            proc = await asyncio.create_subprocess_shell(
+                cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+            )
+        else:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+            )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except TimeoutError:
+            proc.kill()
+            return 1, "timed out"
+        return proc.returncode or 0, out.decode(errors="replace")
+
+    # ── the coding agent ────────────────────────────────────────────────────
+
+    async def run_agent(
+        self,
+        *,
+        cwd: Path,
+        prompt: str,
+        log_path: Path,
+        resume_session_id: str = "",
+        on_update: Callable[[AgentRun, str], None] | None = None,
+    ) -> AgentRun:
+        """Run `claude -p` in `cwd`, streaming events into an AgentRun. Calls
+        on_update(run, kind) after each event (kind: init|progress|milestone|
+        result) so the caller can persist and announce as it goes."""
+        run = AgentRun()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        cmd = self._claude_cmd + (f" --resume {resume_session_id}" if resume_session_id else "")
+        proc = None
+        try:
+            with log_path.open("ab") as errlog:
+                proc = await asyncio.create_subprocess_shell(
+                    cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=errlog,
+                    cwd=cwd,
+                )
+            assert proc.stdin is not None and proc.stdout is not None
+            try:
+                proc.stdin.write(prompt.encode("utf-8"))
+                await proc.stdin.drain()
+                proc.stdin.close()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass  # agent exited before reading the prompt; reported below
+
+            deadline = time.monotonic() + self._timeout_s
+            with log_path.open("a", encoding="utf-8", errors="replace") as log:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        proc.kill()
+                        run.status = "failed"
+                        run.summary = f"timed out after {self._timeout_s:.0f}s"
+                        return run
+                    try:
+                        raw = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+                    except TimeoutError:
+                        continue
+                    if not raw:
+                        break
+                    line = raw.decode("utf-8", errors="replace").rstrip()
+                    log.write(line + "\n")
+                    log.flush()
+                    kind = self._ingest(run, line)
+                    if kind and on_update is not None:
+                        on_update(run, kind)
+            await proc.wait()
+            run.returncode = proc.returncode
+            if run.status == "running":
+                run.status = "failed"
+                run.summary = (
+                    f"agent ended (exit {proc.returncode}) without a result — see {log_path.name}"
+                )
+        except asyncio.CancelledError:
+            # the app is shutting down or restarting: never leave an agent
+            # process orphaned on its stdin pipe
+            if proc is not None and proc.returncode is None:
+                proc.kill()
+            raise
+        except Exception as err:  # noqa: BLE001 — a run may never crash the app
+            run.status = "failed"
+            run.summary = f"{type(err).__name__}: {err}"
+        return run
+
+    @staticmethod
+    def _ingest(run: AgentRun, line: str) -> str:
+        """Parse one stream-json line into the run; returns the event kind."""
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return ""
+        kind = event.get("type")
+        if kind == "system" and event.get("subtype") == "init":
+            run.session_id = str(event.get("session_id", "")) or run.session_id
+            run.model = str(event.get("model", "")) or run.model
+            return "init"
+        if kind == "assistant":
+            blocks = (event.get("message") or {}).get("content") or []
+            texts = [
+                b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"
+            ]
+            if not any(texts):
+                return ""
+            joined = " ".join(texts)
+            run.progress = (run.progress + [joined[-200:]])[-10:]
+            result = "progress"
+            for raw in joined.splitlines():
+                said = raw.strip()
+                if said.upper().startswith("MILESTONE:"):
+                    run.milestones.append(said[10:].strip())
+                    result = "milestone"
+            return result
+        if kind == "result":
+            run.summary = str(event.get("result", ""))[:2000]
+            run.session_id = str(event.get("session_id", "")) or run.session_id
+            run.cost_usd = float(event.get("total_cost_usd") or 0.0)
+            run.status = "failed" if event.get("is_error") else "done"
+            return "result"
+        return ""
+
+    # ── merge gates ─────────────────────────────────────────────────────────
+
+    async def merge_branch(
+        self, *, merge_ref: str, gates_dir: Path, title: str
+    ) -> tuple[bool, str]:
+        """Clean main, lint + tests on the branch, merge --no-ff, push."""
+        code, out = await self._cmd(
+            ["git", "status", "--porcelain", "--untracked-files=no"], self.root
+        )
+        if out.strip():
+            return False, "the main checkout has uncommitted changes — merge blocked until it's clean"
+        if (gates_dir / "pyproject.toml").exists():
+            for label, check in (
+                ("lint", "uv run ruff check src scripts tests"),
+                ("tests", "uv run pytest -q"),
+            ):
+                code, out = await self._cmd(check, gates_dir, timeout=600.0)
+                if code != 0:
+                    return False, f"merge blocked: {label} failed on {merge_ref}:\n{out[-500:]}"
+        code, out = await self._cmd(
+            ["git", "merge", "--no-ff", merge_ref, "-m",
+             f"Merge {merge_ref}: {title} (voice-approved by owner)"],
+            self.root,
+        )
+        if code != 0:
+            await self._cmd(["git", "merge", "--abort"], self.root)
+            return False, f"merge conflict — aborted cleanly; a human needs to look:\n{out[-400:]}"
+        push_code, push_out = await self._cmd(["git", "push"], self.root)
+        push_note = "" if push_code == 0 else f" (push failed: {push_out[-120:]})"
+        return True, f"merged {merge_ref} into main and pushed{push_note} — checks passed."
+
+    async def fetch_remote_branch(self, branch: str, slug: str) -> tuple[str, Path]:
+        """A cloud session pushed `branch`: fetch it and check it out detached
+        under .worktrees/merge-<slug> so the gates can run on it."""
+        code, out = await self._cmd(["git", "fetch", "origin", branch], self.root)
+        if code != 0:
+            raise DispatchError(f"could not fetch branch {branch!r} from origin: {out[-300:]}")
+        ref = f"origin/{branch}"
+        path = self.root / ".worktrees" / f"merge-{slug}"
+        code, out = await self._cmd(
+            ["git", "worktree", "add", "--detach", str(path), ref], self.root
+        )
+        if code != 0:
+            raise DispatchError(f"could not check out {ref} for verification: {out[-300:]}")
+        return ref, path
+
+    # ── cloud routines ──────────────────────────────────────────────────────
 
     @property
     def cloud_enabled(self) -> bool:
         return bool(self._routine_id and self._routine_token)
 
+    @property
+    def own_routine(self) -> tuple[str, str]:
+        return self._routine_id, self._routine_token
+
     def extra_repo_names(self) -> list[str]:
         """Other repositories with a dispatch routine configured."""
         return sorted(self._extra_routines)
 
-    async def start(self, request: str, title: str, repo: str = "", mode: str = "") -> Job:
-        if repo and not _is_own_repo(repo):
-            entry = self._resolve_repo(repo)
-            return await self._start_cloud(
-                request, title, entry["routine_id"], entry["token"], repo=repo
-            )
-        # Own repo: LOCAL by default — the full loop (voice merge, restart,
-        # self-test) only works on a local worktree. Cloud on request, for
-        # sessions Will wants to watch live or continue from his phone.
-        if mode == "cloud":
-            if not self.cloud_enabled:
-                raise DispatchError("cloud dispatch is not configured (routine id/token missing)")
-            return await self._start_cloud(request, title, self._routine_id, self._routine_token)
-        return await self._start_local(request, title)
+    def resolve_repo(self, repo: str) -> dict:
+        """Spoken names arrive with spaces ("my side project"); compare
+        alphanumerics only so they match hyphenated repo names."""
 
-    def _resolve_repo(self, repo: str) -> dict:
-        # spoken names arrive with spaces ("my side project"); compare
-        # alphanumerics only so they match hyphenated repo names
         def norm(s: str) -> str:
             return re.sub(r"[^a-z0-9]+", "", s.lower())
 
@@ -212,11 +390,11 @@ class Dispatcher:
             "Add one in data/routines.json (see README)."
         )
 
-    async def _start_cloud(
-        self, request: str, title: str, routine_id: str, token: str, repo: str = ""
-    ) -> Job:
-        """Fire a dispatch routine: a claude.ai/code cloud session Will can
-        open, watch live, and continue in any Claude Code surface."""
+    async def fire_cloud(
+        self, *, request: str, title: str, routine_id: str, token: str
+    ) -> dict[str, str]:
+        """Fire a routine: a claude.ai/code session Will can open, watch live,
+        and continue in any Claude Code surface."""
         import httpx
 
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -233,306 +411,21 @@ class Dispatcher:
         if resp.status_code >= 400:
             raise DispatchError(f"routine fire failed ({resp.status_code}): {resp.text[:300]}")
         payload = resp.json()
-        job = Job(
-            id=f"cloud-{uuid.uuid4().hex[:6]}",
-            title=title,
-            request=request,
-            status="running",
-            branch="(cloud session — lands as a GitHub branch/PR)",
-            worktree="",
-            started=time.time(),
-            mode="cloud",
-            session_id=str(payload.get("claude_code_session_id", "")),
-            session_url=str(payload.get("claude_code_session_url", "")),
-            summary="running in the cloud — open the session URL to watch or continue",
-            repo=repo,
-        )
-        self._jobs[job.id] = job
-        self._save()
-        return job
+        return {
+            "session_id": str(payload.get("claude_code_session_id", "")),
+            "session_url": str(payload.get("claude_code_session_url", "")),
+        }
 
-    async def _start_local(self, request: str, title: str) -> Job:
-        slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:32] or "task"
-        slug = f"{slug}-{uuid.uuid4().hex[:6]}"
-        worktree = self._root / ".worktrees" / slug
-        branch = f"alexa/{slug}"
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "worktree",
-            "add",
-            "-b",
-            branch,
-            str(worktree),
-            "main",
-            cwd=self._root,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, err = await proc.communicate()
-        if proc.returncode != 0:
-            raise DispatchError(f"could not create worktree: {err.decode(errors='replace')[:200]}")
-        job = Job(
-            id=slug,
-            title=title,
-            request=request,
-            status="running",
-            branch=branch,
-            worktree=str(worktree),
-            started=time.time(),
-        )
-        self._jobs[job.id] = job
-        self._save()
-        self._tasks.append(asyncio.create_task(self._run(job)))
-        return job
-
-    async def _run(self, job: Job) -> None:
-        job_log = self._root / "logs" / "jobs" / f"{job.id}.log"
-        job_log.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            prompt = _TASK_PROMPT.format(request=job.request)
-            with job_log.open("ab") as errlog:
-                proc = await asyncio.create_subprocess_shell(
-                    self._claude_cmd,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=errlog,
-                    cwd=job.worktree,
-                )
-            assert proc.stdin is not None and proc.stdout is not None
-            try:
-                proc.stdin.write(prompt.encode("utf-8"))
-                await proc.stdin.drain()
-                proc.stdin.close()
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                pass  # agent exited before reading the prompt; the exit-code
-                # path below reports that honestly instead of a pipe error
-
-            deadline = time.monotonic() + self._timeout_s
-            got_result = False
-            with job_log.open("a", encoding="utf-8", errors="replace") as log:
-                while True:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        proc.kill()
-                        job.status = "failed"
-                        job.summary = f"timed out after {self._timeout_s:.0f}s"
-                        return
-                    try:
-                        raw = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
-                    except TimeoutError:
-                        continue
-                    if not raw:
-                        break
-                    line = raw.decode("utf-8", errors="replace").rstrip()
-                    log.write(line + "\n")
-                    log.flush()
-                    self._ingest_event(job, line)
-                    if job.status != "running":
-                        got_result = True
-            await proc.wait()
-            if not got_result:
-                job.status = "failed"
-                job.summary = f"agent ended (exit {proc.returncode}) without a result — see {job_log.name}"
-        except Exception as err:  # noqa: BLE001 — a job may never crash the app
-            job.status = "failed"
-            job.summary = f"{type(err).__name__}: {err}"
-        finally:
-            job.finished = time.time()
-            self._save()
-            self._announce_outcome(job)
-
-    def _ingest_event(self, job: Job, line: str) -> None:
-        """Parse one stream-json line into live job state."""
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            return
-        kind = event.get("type")
-        if kind == "system" and event.get("subtype") == "init":
-            job.session_id = str(event.get("session_id", "")) or job.session_id
-            job.model = str(event.get("model", "")) or job.model
-            self._save()
-        elif kind == "assistant":
-            blocks = (event.get("message") or {}).get("content") or []
-            texts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
-            if any(texts):
-                job.last_activity = " ".join(texts)[-200:]
-                for raw_line in " \n".join(texts).splitlines():
-                    said = raw_line.strip()
-                    if said.upper().startswith("MILESTONE:") and job.milestones < 3:
-                        job.milestones += 1
-                        self._announce(
-                            f"Progress on '{job.title}': {said[10:].strip()}",
-                            kind="milestone",
-                            ref=f"job:{job.id}:milestone:{job.milestones}",
-                        )
-                self._save()
-        elif kind == "result":
-            job.summary = str(event.get("result", ""))[:2000]
-            job.session_id = str(event.get("session_id", "")) or job.session_id
-            job.cost_usd = float(event.get("total_cost_usd") or 0.0)
-            job.finished = time.time()
-            job.status = "failed" if event.get("is_error") else "done"
-            self._save()  # persist atomically with the status flip (readers race us)
-
-    def _announce(self, text: str, *, kind: str, ref: str, priority: str = "normal") -> None:
-        if self._announcer is None:
-            return
-        with contextlib.suppress(Exception):  # an announcement must never break a job
-            self._announcer.enqueue(text, kind=kind, ref=ref, priority=priority)
-
-    def _announce_outcome(self, job: Job) -> None:
-        """Queue the spoken result of a finished job (idempotent per status)."""
-        if job.status == "done":
-            gist = job.summary.strip().split(". ")[0][:160]
-            text = (
-                f"'{job.title}' is built and ready for your test. "
-                + (f"The agent says: {gist}. " if gist else "")
-                + "When you're ready, ask me to check on that job, or to merge it."
-            )
-        elif job.status == "failed":
-            text = (
-                f"'{job.title}' stopped without finishing: {job.summary[:140]}. "
-                "Ask for its details when you want to look."
-            )
-        else:
-            return
-        self._announce(text, kind="task", ref=f"job:{job.id}:{job.status}")
-
-    async def _cmd(self, cmd: list[str] | str, cwd: Path, timeout: float = 300.0) -> tuple[int, str]:
-        if isinstance(cmd, str):
-            proc = await asyncio.create_subprocess_shell(
-                cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
-            )
-        else:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
-            )
-        try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except TimeoutError:
-            proc.kill()
-            return 1, "timed out"
-        return proc.returncode or 0, out.decode(errors="replace")
-
-    async def merge(self, job_id: str, branch: str = "") -> str:
-        """Voice-approved merge with gates: done job, clean main, independent
-        lint+tests on the branch. Local jobs merge their worktree branch; a
-        DONE cloud job merges the remote branch its session pushed (fetched
-        and gated here first). Pushes on success."""
-        job = self._jobs.get(job_id)
-        if job is None:
-            return f"no job {job_id!r} — see check_work for ids"
-        if job.status == "merged":
-            return f"{job.id} is already merged"
-        if job.status != "done":
-            hint = " — refresh its live status first (check_work refresh=true)" if job.mode == "cloud" else ""
-            return f"{job.id} is {job.status} — only finished jobs can be merged{hint}"
-
-        merge_worktree: Path | None = None
-        if job.mode == "cloud":
-            if not branch:
-                return (
-                    "a cloud job merges by its remote branch — ask its status for "
-                    "where the work landed, then merge_work with branch=<exact name>"
-                )
-            code, out = await self._cmd(["git", "fetch", "origin", branch], self._root)
-            if code != 0:
-                return f"could not fetch branch {branch!r} from origin: {out[-300:]}"
-            merge_ref = f"origin/{branch}"
-            merge_worktree = self._root / ".worktrees" / f"merge-{job.id}"
-            code, out = await self._cmd(
-                ["git", "worktree", "add", "--detach", str(merge_worktree), merge_ref],
-                self._root,
-            )
-            if code != 0:
-                return f"could not check out {merge_ref} for verification: {out[-300:]}"
-            gates_dir = merge_worktree
-        else:
-            merge_ref = job.branch
-            gates_dir = Path(job.worktree)
-
-        code, out = await self._cmd(
-            ["git", "status", "--porcelain", "--untracked-files=no"], self._root
-        )
-        if out.strip():
-            await self._drop_worktree(merge_worktree)
-            return "the main checkout has uncommitted changes — merge blocked until it's clean"
-
-        if (gates_dir / "pyproject.toml").exists():
-            for label, check in (
-                ("lint", "uv run ruff check src scripts tests"),
-                ("tests", "uv run pytest -q"),
-            ):
-                code, out = await self._cmd(check, gates_dir, timeout=600.0)
-                if code != 0:
-                    await self._drop_worktree(merge_worktree)
-                    return f"merge blocked: {label} failed on {merge_ref}:\n{out[-500:]}"
-        await self._drop_worktree(merge_worktree)
-
-        code, out = await self._cmd(
-            ["git", "merge", "--no-ff", merge_ref, "-m",
-             f"Merge {merge_ref}: {job.title} (voice-approved by owner)"],
-            self._root,
-        )
-        if code != 0:
-            await self._cmd(["git", "merge", "--abort"], self._root)
-            return f"merge conflict — aborted cleanly; a human needs to look:\n{out[-400:]}"
-
-        push_code, push_out = await self._cmd(["git", "push"], self._root)
-        job.status = "merged"
-        job.closed = True  # merging IS the close — nothing left to track
-        self._save()
-        push_note = "" if push_code == 0 else f" (push failed: {push_out[-120:]})"
-        return (
-            f"merged {merge_ref} into main and pushed{push_note} — checks passed. "
-            "Offer to restart yourself so the change takes effect."
-        )
-
-    async def _drop_worktree(self, path: Path | None) -> None:
-        if path is not None:
-            await self._cmd(["git", "worktree", "remove", "--force", str(path)], self._root)
-
-    def close(self, job_id: str) -> str:
-        """The owner considers this job dealt with — archive it."""
-        job = self._jobs.get(job_id)
-        if job is None:
-            return f"no job {job_id!r} — see check_work for ids"
-        if job.closed:
-            return f"{job.id} was already closed"
-        job.closed = True
-        self._save()
-        return f"closed {job.id} ({job.title}) — it will no longer appear in job reports"
-
-    def refresh_running_cloud(self, job_id: str | None = None) -> list[str]:
-        """Kick off live status checks in the background; returns the ids pinged."""
-        if job_id:
-            targets = [j for j in (self._jobs.get(job_id),) if j is not None]
-        else:
-            targets = [j for j in self.jobs() if j.status == "running" and not j.closed]
-        pinged = []
-        for job in targets:
-            if job.mode == "cloud" and job.session_id:
-                self._tasks.append(asyncio.create_task(self.refresh(job.id)))
-                pinged.append(job.id)
-        return pinged
-
-    async def refresh(self, job_id: str) -> str:
-        """Message a cloud job's live session and ask for its real status —
-        the only way to learn how a fire-and-forget session is doing. Runs
-        `claude -p --cloud <session_id>` (Max-billed follow-up, verified to
-        work headless); the reply updates the stored job record."""
-        job = self._jobs.get(job_id)
-        if job is None:
-            return f"no job {job_id!r}"
-        if job.mode != "cloud" or not job.session_id:
-            return f"{job.id} is a local job — its status is already live"
+    async def refresh_cloud(self, session_id: str) -> str:
+        """Message a cloud session and ask for its real status — the only way
+        to learn how a fire-and-forget session is doing. Returns one line
+        starting WORKING/DONE/BLOCKED (or an honest failure sentence)."""
         proc = await asyncio.create_subprocess_shell(
-            self._cloud_status_cmd.format(session_id=job.session_id),
+            self._cloud_status_cmd.format(session_id=session_id),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=self._root,
+            cwd=self.root,
         )
         try:
             out, err = await asyncio.wait_for(
@@ -544,96 +437,16 @@ class Dispatcher:
             raise
         except TimeoutError:
             proc.kill()
-            job.last_activity = f"live check timed out at {time.strftime('%H:%M')}"
-            self._save()
             return (
-                f"{job.id}: the cloud session didn't answer within "
+                f"BLOCKED: the cloud session didn't answer within "
                 f"{self._refresh_timeout_s:.0f}s — open it live instead"
             )
         text = out.decode("utf-8", errors="replace").strip()
         if proc.returncode != 0 or not text:
             note = err.decode(errors="replace").strip()[-200:] or "no output"
-            job.last_activity = f"live check failed at {time.strftime('%H:%M')}: {note}"
-            self._save()
-            return f"{job.id}: status check failed ({note})"
-        line = next(
-            (
-                s
-                for s in (ln.strip() for ln in text.splitlines())
-                if s.upper().startswith(("WORKING", "DONE", "BLOCKED"))
-            ),
-            next((ln.strip() for ln in text.splitlines() if ln.strip()), ""),
+            return f"BLOCKED: status check failed ({note})"
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        return next(
+            (ln for ln in lines if ln.upper().startswith(("WORKING", "DONE", "BLOCKED"))),
+            lines[0] if lines else "BLOCKED: empty reply",
         )
-        job.last_activity = f"live check at {time.strftime('%H:%M')}: {line[:300]}"
-        if line.upper().startswith("DONE"):
-            job.status = "done"
-            job.finished = job.finished or time.time()
-            self._announce_outcome(job)
-        if line.upper().startswith(("DONE", "BLOCKED")):
-            job.summary = line[:600]
-        self._save()
-        return f"{job.id}: {line[:400]}"
-
-    def status_line(self) -> str:
-        """One line for the session instructions: what's open right now, so
-        the assistant knows at wake what happened while the owner was away."""
-        open_jobs = [j for j in self.jobs() if not j.closed][:5]
-        if not open_jobs:
-            return "none open"
-        now = time.time()
-        parts = []
-        for j in open_jobs:
-            where = f" in {j.repo}" if j.repo else ""
-            if j.status == "running":
-                age = (now - j.started) / 3600
-                state = f"running since {age:.1f}h ago"
-            else:
-                age = (now - (j.finished or j.started)) / 3600
-                state = f"{j.status} {age:.1f}h ago, not yet closed"
-            parts.append(f"'{j.title}'{where} — {state} [id {j.id}]")
-        return "; ".join(parts)
-
-    def report(self, job_id: str | None = None, include_closed: bool = False) -> str:
-        if job_id and job_id in self._jobs:
-            jobs = [self._jobs[job_id]]  # asked for by id: closed or not
-        elif include_closed:
-            jobs = self.jobs()[:8]
-        else:
-            jobs = [j for j in self.jobs() if not j.closed][:5]
-        if not jobs:
-            if self._jobs:
-                return (
-                    "no open jobs — everything so far is closed "
-                    "(include_closed=true lists the archive)"
-                )
-            return "no development jobs yet"
-        out = []
-        for j in jobs:
-            elapsed = (j.finished or time.time()) - j.started
-            entry = {
-                "id": j.id,
-                "title": j.title,
-                "repo": j.repo or "own repo",
-                "status": j.status,
-                "closed": j.closed,
-                "branch": j.branch,
-                "model": j.model or "cli default",
-                "minutes": round(elapsed / 60, 1),
-                "hours_ago_finished": (
-                    round((time.time() - j.finished) / 3600, 1) if j.finished else None
-                ),
-                "summary": j.summary[:600],
-            }
-            if j.status == "running" and j.last_activity:
-                entry["currently"] = j.last_activity
-            if j.mode == "cloud" and j.status == "running":
-                entry["note"] = (
-                    "cloud progress is not visible from here — "
-                    "check_work refresh=true asks the live session"
-                )
-            if j.mode == "cloud" and j.session_url:
-                entry["open_live"] = j.session_url  # web, desktop app, or phone
-            elif j.session_id:
-                entry["full_transcript"] = f"claude --resume {j.session_id} (run in a terminal)"
-            out.append(entry)
-        return json.dumps(out)
