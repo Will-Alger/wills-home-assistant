@@ -128,7 +128,10 @@ background and you will ANNOUNCE milestones and completion on your own — \
 never poll or guess; if asked meanwhile, use task_detail. (2) When a task is \
 built, offer switch_build: with his yes you restart INTO that branch so he \
 can test it by talking to you; switch_build main brings you back, and \
-switching is free and reversible as often as he likes. (3) When {owner} \
+switching is free and reversible as often as he likes. When he reports a \
+problem with a build, restate it in one precise sentence and send it with \
+revise_task — the same agent iterates, you announce the revision, he \
+switches to it again. (3) When {owner} \
 approves — his explicit yes for THIS task — approve_task merges it (gates \
 run lint and tests first) and you restart onto main; after coming back try \
 the new capability and report honestly. If it is hopeless, abandon_task. Board questions ("what's in \
@@ -319,6 +322,25 @@ TASK_TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {"query": {"type": "string"}},
             "required": ["query"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "revise_task",
+        "description": (
+            "The owner tested a built (or staged) task and found a problem: "
+            "send his feedback — restated in one precise sentence — to the "
+            "SAME coding agent, which resumes with its full context and "
+            "iterates on the branch. You announce when the revision is built; "
+            "then he can switch to it again. No confirmation gate needed."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer"},
+                "feedback": {"type": "string", "description": "what is wrong, precisely, in the owner's terms"},
+            },
+            "required": ["id", "feedback"],
         },
     },
     {
@@ -741,6 +763,12 @@ class RealtimeEngine:
                 return note + board.detail(args.get("id"), log_tail=bool(args.get("log_tail"))), False
             if name == "search_tasks":
                 return board.search(str(args.get("query", ""))), False
+            if name == "revise_task":
+                task = await board.revise(args.get("id"), str(args.get("feedback", "")))
+                return (
+                    f"revision {len(task.iterations)} of task {task.id} is underway with the same "
+                    "agent; you will announce when it is built — do not poll"
+                ), False
             if name == "switch_build":
                 if (blocked := needs_yes("switching builds")) is not None:
                     return blocked

@@ -169,10 +169,12 @@ def build_engine(fake: bool):
                     extra_routines=load_extra_routines(root),
                     model=settings.dispatch_model,
                     effort=settings.dispatch_effort,
+                    timeout_s=settings.dispatch_timeout_s,
                 ),
                 announcer=announcer,
                 staged_task_id=int(staged) if staged.isdigit() else None,
                 uv_exe=settings.uv_exe,
+                resume_delay_s=settings.dispatch_resume_delay_s,
             )
             if settings.use_claude_subscription
             else None

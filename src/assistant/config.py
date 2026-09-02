@@ -69,6 +69,10 @@ class Settings(BaseSettings):
     # Coding agents she commissions: which Claude model (alias) and effort.
     dispatch_model: str = "opus"
     dispatch_effort: str = ""
+    # A build is killed after this long; a build that dies without a result
+    # (the Max usage window) is resumed once after this delay.
+    dispatch_timeout_s: float = 3600.0
+    dispatch_resume_delay_s: float = 300.0
     # Announcements (a build finished, a milestone, a rollback): she speaks up
     # on her own while idle. Normal ones wait out quiet hours ("23:00-08:00";
     # "" = never quiet); urgent ones don't. Each is retried with backoff up to

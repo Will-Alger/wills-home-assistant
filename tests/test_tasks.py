@@ -115,7 +115,7 @@ async def test_failed_build_can_be_retried_and_abandoned(tmp_path: Path) -> None
     await board.start(task.id)
     await wait_state(board, task.id)
     task = board.get(task.id)
-    assert task.state == "failed" and "exit 3" in task.last_error
+    assert task.state == "failed" and "without a result" in task.last_error
     assert any("stopped without finishing" in a.text for a in announcer.pending())
 
     # a retry reuses the worktree (and would resume the session if one existed)
@@ -192,7 +192,7 @@ def test_jobs_json_is_imported_once(tmp_path: Path) -> None:
     assert TaskBoard(repo, runner=fake_runner(repo)).get(2).title == "Weather feature"
 
 
-def test_interrupted_local_build_is_marked_failed_on_reload(tmp_path: Path) -> None:
+async def test_a_build_left_running_is_reconciled_at_startup(tmp_path: Path) -> None:
     repo = make_repo(tmp_path)
     (repo / "data").mkdir()
     (repo / "data" / "tasks.json").write_text(
@@ -212,10 +212,13 @@ def test_interrupted_local_build_is_marked_failed_on_reload(tmp_path: Path) -> N
         ),
         encoding="utf-8",
     )
-    board = TaskBoard(repo, runner=fake_runner(repo))
+    board = TaskBoard(repo, runner=fake_runner(repo), resume_delay_s=0)
+    assert board.get(1).state == "building"  # loading alone never gives up on a build
+    await board.startup_maintenance()  # no live pid, no log: it is over
+    await wait_state(board, 1)
     task = board.get(1)
-    assert task.state == "failed" and task.current.status == "interrupted"
-    assert "interrupted" in task.last_error
+    assert task.state == "failed" and "without a result" in task.last_error
+    assert any(h["event"] == "restart" for h in task.history)
 
 
 def test_stale_running_records_on_closed_tasks_do_not_count(tmp_path: Path) -> None:

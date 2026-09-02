@@ -65,7 +65,7 @@ async def test_run_agent_streams_the_session_into_an_agent_run(tmp_path: Path) -
     assert run.session_id == "sess-fake" and run.model == "claude-fake-1"
     assert run.milestones == ["tests are passing."]
     assert "Moving on to the commit" in run.progress[-1]
-    assert kinds == ["init", "progress", "milestone", "result"]
+    assert kinds == ["spawn", "init", "progress", "milestone", "result"]
     assert (repo / "logs" / "tasks" / "1-greeting-1.log").exists()
 
 
@@ -75,7 +75,7 @@ async def test_agent_without_a_result_is_reported_honestly(tmp_path: Path) -> No
         repo, claude_cmd=f'"{sys.executable}" -c "import sys; sys.exit(3)"', timeout_s=20.0
     )
     run = await runner.run_agent(cwd=repo, prompt="doomed", log_path=repo / "logs" / "x.log")
-    assert run.status == "failed" and "exit 3" in run.summary
+    assert run.status == "failed" and "never started a session" in run.summary
 
 
 async def test_merge_gates_and_success(tmp_path: Path) -> None:

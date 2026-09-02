@@ -10,8 +10,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import subprocess
-import sys
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -26,6 +24,7 @@ from assistant.calendar.base import (
     spoken_when,
 )
 from assistant.config import code_root, home_dir
+from assistant.dispatch import NO_WINDOW
 from assistant.home.base import HomeApi, Light, LightCommand
 
 # Her own codebase: the checkout this code runs from (main or a staged
@@ -366,8 +365,6 @@ _CALENDAR_TOOL_NAMES = frozenset(tool["name"] for tool in CALENDAR_TOOLS)
 _DEFAULT_EVENT_MINUTES = 60
 _DEFAULT_WINDOW_DAYS = 7
 _MAX_EVENTS_REPORTED = 40
-
-NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0  # she runs windowless
 
 
 

@@ -24,6 +24,9 @@ NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0  # she
 
 
 
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0  # she runs windowless
+
+
 class ClaudeCliError(RuntimeError):
     pass
 

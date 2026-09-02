@@ -32,9 +32,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0  # she runs windowless
-
-
 
 def _is_own_repo(repo: str) -> bool:
     """Names the model might use for the assistant's own repository."""
@@ -129,10 +126,74 @@ class AgentRun:
     progress: list[str] = field(default_factory=list)  # recent agent utterances
     milestones: list[str] = field(default_factory=list)  # MILESTONE: lines seen
     returncode: int | None = None
+    pid: int = 0  # the detached process, so a restarted app can re-attach
+    saw_init: bool = False  # the CLI came up and reported a session
 
 
 class DispatchError(RuntimeError):
     pass
+
+
+def pid_alive(pid: int) -> bool:
+    """Is that process still running? (Windows has no kill(pid, 0).)"""
+    if not pid:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+
+
+def kill_tree(pid: int) -> None:
+    """Stop a detached agent and its children (the shell wrapper + node)."""
+    if not pid:
+        return
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            check=False,
+            creationflags=NO_WINDOW,
+        )
+    else:
+        import signal
+
+        with contextlib_suppress(OSError):
+            os.kill(int(pid), signal.SIGTERM)
+
+
+def contextlib_suppress(*exc):
+    import contextlib
+
+    return contextlib.suppress(*exc)
+
+
+# She runs with no console (the watchdog hides it); a console child spawned
+# without this flag pops up a visible terminal window on Windows.
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+_DETACH_FLAGS = (
+    # NOT DETACHED_PROCESS: a console-less parent makes Windows open a VISIBLE
+    # console for every child it starts. CREATE_NO_WINDOW gives the agent its own
+    # hidden console, and a child outlives its parent on Windows anyway.
+    subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    if sys.platform == "win32"
+    else 0
+)
 
 
 class Dispatcher:
@@ -222,71 +283,115 @@ class Dispatcher:
         prompt: str,
         log_path: Path,
         resume_session_id: str = "",
+        session_id: str = "",
         on_update: Callable[[AgentRun, str], None] | None = None,
+        init_timeout_s: float = 90.0,
     ) -> AgentRun:
-        """Run `claude -p` in `cwd`, streaming events into an AgentRun. Calls
-        on_update(run, kind) after each event (kind: init|progress|milestone|
-        result) so the caller can persist and announce as it goes."""
-        run = AgentRun()
+        """Launch `claude -p` DETACHED in `cwd` (it outlives this app, so a
+        staging restart doesn't kill a build) with its output going to
+        `log_path`, then follow that log. `resume_session_id` continues an
+        earlier run; `session_id` pre-assigns the id of a fresh one. Calls
+        on_update(run, kind) per event (spawn|init|progress|milestone|result)."""
+        run = AgentRun(session_id=resume_session_id or session_id)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        cmd = self._claude_cmd + (f" --resume {resume_session_id}" if resume_session_id else "")
-        proc = None
+        cmd = self._claude_cmd
+        if resume_session_id:
+            cmd += f" --resume {resume_session_id}"
+        elif session_id:
+            cmd += f" --session-id {session_id}"
+        offset = log_path.stat().st_size if log_path.exists() else 0
         try:
-            with log_path.open("ab") as errlog:
-                proc = await asyncio.create_subprocess_shell(
+            with log_path.open("ab") as out:
+                out.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] $ {cmd}\n".encode())
+                out.flush()
+                offset = out.tell()
+                proc = subprocess.Popen(  # noqa: ASYNC220 — a detached launch; returns at once
                     cmd,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=errlog,
+                    shell=True,
+                    stdin=subprocess.PIPE,
+                    stdout=out,
+                    stderr=out,
                     cwd=cwd,
-                creationflags=NO_WINDOW,
-            )
-            assert proc.stdin is not None and proc.stdout is not None
+                    creationflags=_DETACH_FLAGS,
+                )
+            run.pid = proc.pid
             try:
+                assert proc.stdin is not None
                 proc.stdin.write(prompt.encode("utf-8"))
-                await proc.stdin.drain()
                 proc.stdin.close()
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass  # agent exited before reading the prompt; reported below
-
-            deadline = time.monotonic() + self._timeout_s
-            with log_path.open("a", encoding="utf-8", errors="replace") as log:
-                while True:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        proc.kill()
-                        run.status = "failed"
-                        run.summary = f"timed out after {self._timeout_s:.0f}s"
-                        return run
-                    try:
-                        raw = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
-                    except TimeoutError:
-                        continue
-                    if not raw:
-                        break
-                    line = raw.decode("utf-8", errors="replace").rstrip()
-                    log.write(line + "\n")
-                    log.flush()
-                    kind = self._ingest(run, line)
-                    if kind and on_update is not None:
-                        on_update(run, kind)
-            await proc.wait()
-            run.returncode = proc.returncode
-            if run.status == "running":
-                run.status = "failed"
-                run.summary = (
-                    f"agent ended (exit {proc.returncode}) without a result — see {log_path.name}"
-                )
-        except asyncio.CancelledError:
-            # the app is shutting down or restarting: never leave an agent
-            # process orphaned on its stdin pipe
-            if proc is not None and proc.returncode is None:
-                proc.kill()
-            raise
-        except Exception as err:  # noqa: BLE001 — a run may never crash the app
+            if on_update is not None:
+                on_update(run, "spawn")
+        except Exception as err:  # noqa: BLE001 — a launch failure is a failed run
             run.status = "failed"
-            run.summary = f"{type(err).__name__}: {err}"
-        return run
+            run.summary = f"could not start the coding agent: {type(err).__name__}: {err}"
+            return run
+        return await self.follow(
+            run, log_path, offset=offset, on_update=on_update, init_timeout_s=init_timeout_s
+        )
+
+    async def follow(
+        self,
+        run: AgentRun,
+        log_path: Path,
+        *,
+        offset: int = 0,
+        on_update: Callable[[AgentRun, str], None] | None = None,
+        init_timeout_s: float = 90.0,
+    ) -> AgentRun:
+        """Tail a running (or finished) agent's log until it reports a result
+        or its process is gone. Also how a restarted app re-attaches."""
+        deadline = time.monotonic() + self._timeout_s
+        init_deadline = time.monotonic() + init_timeout_s
+        buffer = b""
+        try:
+            while True:
+                try:
+                    with log_path.open("rb") as fh:
+                        fh.seek(offset)
+                        chunk = fh.read()
+                except OSError:
+                    chunk = b""
+                if chunk:
+                    offset += len(chunk)
+                    buffer += chunk
+                    *lines, buffer = buffer.split(b"\n")
+                    for raw in lines:
+                        kind = self._ingest(run, raw.decode("utf-8", errors="replace").rstrip())
+                        if kind == "init":
+                            run.saw_init = True
+                        if kind and on_update is not None:
+                            on_update(run, kind)
+                        if run.status != "running":
+                            return run
+                    continue  # drain everything available before checking liveness
+                if not pid_alive(run.pid):
+                    run.status = "failed"
+                    run.summary = (
+                        "the coding agent ended without a result"
+                        + ("" if run.saw_init else " (it never started a session)")
+                        + f" — see {log_path.name}"
+                    )
+                    return run
+                now = time.monotonic()
+                if not run.saw_init and now > init_deadline:
+                    kill_tree(run.pid)
+                    run.status = "failed"
+                    run.summary = (
+                        f"the coding agent didn't start within {init_timeout_s:.0f}s — "
+                        "is the Claude CLI installed and logged in?"
+                    )
+                    return run
+                if now > deadline:
+                    kill_tree(run.pid)
+                    run.status = "failed"
+                    run.summary = f"timed out after {self._timeout_s:.0f}s"
+                    return run
+                await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            run.status = "running"  # the agent keeps going detached; re-attach later
+            raise
 
     @staticmethod
     def _ingest(run: AgentRun, line: str) -> str:
@@ -462,8 +567,8 @@ class Dispatcher:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self.root,
-                creationflags=NO_WINDOW,
-            )
+            creationflags=NO_WINDOW,
+        )
         try:
             out, err = await asyncio.wait_for(
                 proc.communicate(_REFRESH_PROMPT.encode("utf-8")),

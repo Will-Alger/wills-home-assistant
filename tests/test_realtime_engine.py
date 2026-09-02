@@ -64,7 +64,7 @@ async def test_session_config_renders_jobs_and_repos(tmp_path) -> None:
     tool_names = {t["name"] for t in config["tools"]}
     assert {
         "draft_task", "start_task", "list_tasks", "task_detail",
-        "search_tasks", "approve_task", "abandon_task", "switch_build",
+        "search_tasks", "approve_task", "abandon_task", "switch_build", "revise_task",
     } <= tool_names
     assert "web_search" in tool_names
     assert "develop_feature" not in tool_names

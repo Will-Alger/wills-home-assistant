@@ -22,6 +22,7 @@ import json
 import os
 import re
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
@@ -31,8 +32,10 @@ from typing import Any
 from assistant.dispatch import (
     _REVISE_PROMPT,
     _TASK_PROMPT,
+    AgentRun,
     DispatchError,
     _is_own_repo,
+    pid_alive,
 )
 
 STATES = ("drafting", "building", "built", "staged", "revising", "merged", "failed", "abandoned")
@@ -93,6 +96,7 @@ class Iteration:
     progress: list[str] = field(default_factory=list)
     milestones: int = 0
     log: str = ""
+    pid: int = 0  # detached agent process (re-attachable after a restart)
 
 
 @dataclass
@@ -192,6 +196,7 @@ class TaskBoard:
         now: Callable[[], float] = time.time,
         staged_task_id: int | None = None,
         uv_exe: str = "",
+        resume_delay_s: float = 300.0,
     ) -> None:
         self._root = root
         self._runner = runner
@@ -199,6 +204,7 @@ class TaskBoard:
         self._now = now
         self._staged_task_id = staged_task_id  # this PROCESS runs that task's build
         self._uv_exe = uv_exe
+        self._resume_delay_s = resume_delay_s  # Max window: wait, then resume once
         self.restart_requested = False  # a switch/approve/abandon wants a restart
         self._path = root / "data" / "tasks.json"
         self._next_id = 1
@@ -218,13 +224,8 @@ class TaskBoard:
             for row in data.get("tasks", []):
                 if isinstance(row, dict) and "id" in row:
                     task = _load_task(row)
-                    # a local build dies with the app; nobody will finish it
-                    if task.running and task.mode == "local":
-                        task.current.status = "interrupted"
-                        task.current.finished = self._now()
-                        task.state = "failed"
-                        task.last_error = "the build was interrupted by a restart"
-                        self._log(task, "interrupted", "restart while building")
+                    # a build that was running when we last saved may still be
+                    # alive (agents run detached): startup_maintenance re-attaches
                     self._tasks[task.id] = task
         else:
             self._import_jobs()
@@ -399,88 +400,189 @@ class TaskBoard:
         spec_path.parent.mkdir(parents=True, exist_ok=True)
         spec_path.write_text(self._spec_document(task), encoding="utf-8")
         await self._runner.commit_all(worktree, f"Task {task.id}: spec — {task.title}")
-        n = len(task.iterations) + 1
-        iteration = Iteration(
-            n=n,
-            kind="retry" if resume else "build",
-            started=self._now(),
-            log=str(self._root / "logs" / "tasks" / f"{task.slug}-{n}.log"),
-        )
-        task.iterations.append(iteration)
-        task.mode = "local"
-        task.state = "building"
-        task.last_error = ""
-        self._log(task, "building", f"iteration {n} ({iteration.kind}) on {task.branch}")
-        self._save()
         prompt = (
             _REVISE_PROMPT.format(
                 feedback="Continue where you left off; the previous run ended without a result.",
                 spec_path=f"docs/tasks/{task.slug}.md",
-                n=n,
+                n=len(task.iterations) + 1,
             )
             if resume
-            else _TASK_PROMPT.format(
-                spec_path=f"docs/tasks/{task.slug}.md",
-                task_id=task.id,
-                title=task.title,
-                spec=task.spec,
-            )
+            else self._build_prompt(task)
         )
-        self._bg.append(asyncio.create_task(self._run_iteration(task, iteration, prompt, resume)))
+        self._launch(task, "retry" if resume else "build", prompt, resume, state="building")
 
-    async def _run_iteration(self, task: Task, iteration: Iteration, prompt: str, resume: str) -> None:
+    def _build_prompt(self, task: Task) -> str:
+        return _TASK_PROMPT.format(
+            spec_path=f"docs/tasks/{task.slug}.md",
+            task_id=task.id,
+            title=task.title,
+            spec=task.spec,
+        )
+
+    def _launch(
+        self, task: Task, kind: str, prompt: str, resume: str, *, state: str, feedback: str = ""
+    ) -> Iteration:
+        n = len(task.iterations) + 1
+        iteration = Iteration(
+            n=n,
+            kind=kind,
+            feedback=feedback,
+            started=self._now(),
+            session_id=resume or str(uuid.uuid4()),  # known before the run starts
+            log=str(self._root / "logs" / "tasks" / f"{task.slug}-{n}.log"),
+        )
+        task.iterations.append(iteration)
+        task.mode = "local"
+        task.state = state
+        task.last_error = ""
+        self._log(task, state, f"iteration {n} ({kind}) on {task.branch}")
+        self._save()
+        self._bg.append(asyncio.create_task(self._run_iteration(task, iteration, prompt, resume)))
+        return iteration
+
+    def _updater(self, task: Task, iteration: Iteration) -> Callable[[Any, str], None]:
+        """Persist live agent state; announce milestones (replay-safe)."""
+
         def on_update(run: Any, kind: str) -> None:
-            iteration.session_id = run.session_id or iteration.session_id
+            if run.pid:
+                iteration.pid = run.pid
+            if run.session_id and run.saw_init:
+                iteration.session_id = run.session_id
+                task.session_id = run.session_id  # confirmed: this is the resume handle
             iteration.model = run.model or iteration.model
             iteration.progress = list(run.progress)
-            task.session_id = iteration.session_id or task.session_id
-            if kind == "milestone" and iteration.milestones < _MAX_MILESTONES:
+            total = min(len(run.milestones), _MAX_MILESTONES)
+            while iteration.milestones < total:
                 iteration.milestones += 1
                 self._announce(
-                    f"Progress on task {task.id}, '{task.title}': {run.milestones[-1]}",
+                    f"Progress on task {task.id}, '{task.title}': "
+                    f"{run.milestones[iteration.milestones - 1]}",
                     kind="milestone",
                     ref=f"task:{task.id}:{iteration.n}:milestone:{iteration.milestones}",
                 )
             self._save()
 
+        return on_update
+
+    async def _run_iteration(self, task: Task, iteration: Iteration, prompt: str, resume: str) -> None:
         try:
             run = await self._runner.run_agent(
                 cwd=Path(task.worktree),
                 prompt=prompt,
                 log_path=Path(iteration.log),
                 resume_session_id=resume,
-                on_update=on_update,
+                session_id="" if resume else iteration.session_id,
+                on_update=self._updater(task, iteration),
             )
-            on_update(run, "result")
-            iteration.summary = run.summary
-            iteration.cost_usd = run.cost_usd
-            iteration.status = run.status
+        except asyncio.CancelledError:
+            raise
         except Exception as err:  # noqa: BLE001 — a build may never crash the app
-            iteration.status = "failed"
-            iteration.summary = f"{type(err).__name__}: {err}"
+            run = AgentRun(status="failed", summary=f"{type(err).__name__}: {err}")
+        await self._finish_iteration(task, iteration, run, resume)
+
+    async def _finish_iteration(self, task: Task, iteration: Iteration, run: Any, resume: str) -> None:
+        iteration.summary = run.summary
+        iteration.cost_usd = run.cost_usd
+        iteration.status = run.status
         iteration.finished = self._now()
-        if iteration.status == "done":
+        if run.status == "done":
             task.state = "built"
             self._log(task, "built", iteration.summary[:200])
             gist = iteration.summary.strip().split(". ")[0][:160]
+            what = (
+                f"Revision {iteration.n} of task {task.id}, '{task.title}', is built"
+                if iteration.kind == "revise"
+                else f"Task {task.id}, '{task.title}', is built and ready for your test"
+            )
             self._announce(
-                f"Task {task.id}, '{task.title}', is built and ready for your test."
+                f"{what}."
                 + (f" The agent says: {gist}." if gist else "")
                 + f" Say 'switch to task {task.id}' to try it, or 'approve task {task.id}' to merge it.",
                 kind="task",
                 ref=f"task:{task.id}:{iteration.n}:built",
             )
-        else:
-            task.state = "failed"
-            task.last_error = iteration.summary[:300]
-            self._log(task, "failed", iteration.summary[:200])
-            self._announce(
-                f"Task {task.id}, '{task.title}', stopped without finishing: "
-                f"{iteration.summary[:140]}. Say 'retry task {task.id}' to pick it back up.",
-                kind="task",
-                ref=f"task:{task.id}:{iteration.n}:failed",
+            self._save()
+            return
+
+        died_quietly = (
+            "without a result" in run.summary and run.saw_init and iteration.kind != "retry"
+        )
+        session_missing = resume and not run.saw_init and iteration.kind == "revise"
+        if session_missing:
+            # the agent's session is gone: rebuild fresh with the revised spec
+            # plus a pointer at the work already on the branch
+            self._log(task, "session missing", "rebuilding fresh with the revised spec")
+            self._save()
+            prompt = self._build_prompt(task) + (
+                "\nNOTE: earlier work already exists on this branch (see `git log main..HEAD`);"
+                " build on it rather than starting over.\n"
             )
+            self._launch(task, "build", prompt, "", state="revising")
+            return
+        if died_quietly and iteration.session_id:
+            # likely the Max usage window: wait it out, then resume once
+            self._log(task, "resuming", f"retry in {self._resume_delay_s:.0f}s")
+            self._save()
+            await asyncio.sleep(self._resume_delay_s)
+            prompt = _REVISE_PROMPT.format(
+                feedback="Continue where you left off; the previous run ended without a result.",
+                spec_path=f"docs/tasks/{task.slug}.md",
+                n=len(task.iterations) + 1,
+            )
+            self._launch(task, "retry", prompt, iteration.session_id, state=task.state)
+            return
+        task.state = "failed"
+        task.last_error = iteration.summary[:300]
+        self._log(task, "failed", iteration.summary[:200])
+        self._announce(
+            f"Task {task.id}, '{task.title}', stopped without finishing: "
+            f"{iteration.summary[:140]}. Say 'retry task {task.id}' to pick it back up.",
+            kind="task",
+            ref=f"task:{task.id}:{iteration.n}:failed",
+        )
         self._save()
+
+    async def revise(self, ref: Any, feedback: str) -> Task:
+        """The owner tested it and reports a problem: hand the feedback to the
+        SAME agent (its session resumes with full context) on the same branch."""
+        task = self.get(ref)
+        self._check(task, "revise")
+        feedback = " ".join(str(feedback).split())
+        if not feedback:
+            raise DispatchError("a revision needs the owner's feedback in a sentence")
+        if task.mode != "local" or not task.worktree or not Path(task.worktree).exists():
+            raise DispatchError(f"task {task.id} has no local branch to revise")
+        n = len(task.iterations) + 1
+        # record the feedback in the spec (data copy + the branch's copy), commit
+        pending = Iteration(n=n, kind="revise", feedback=feedback, started=self._now())
+        task.iterations.append(pending)
+        doc = self._spec_document(task)
+        task.iterations.pop()
+        (self._root / "data" / "specs" / f"{task.slug}.md").write_text(doc, encoding="utf-8")
+        worktree = Path(task.worktree)
+        (worktree / "docs" / "tasks" / f"{task.slug}.md").write_text(doc, encoding="utf-8")
+        await self._runner.commit_all(worktree, f"Task {task.id}: revision {n} feedback")
+        prompt = _REVISE_PROMPT.format(
+            feedback=feedback, spec_path=f"docs/tasks/{task.slug}.md", n=n
+        )
+        self._launch(task, "revise", prompt, task.session_id, state="revising", feedback=feedback)
+        return task
+
+    async def _reattach(self, task: Task, iteration: Iteration) -> None:
+        """After a restart: keep following a still-running agent, or read the
+        log a dead one left behind."""
+        run = AgentRun(session_id=iteration.session_id, pid=iteration.pid)
+        resume = iteration.session_id if iteration.kind in ("revise", "retry") else ""
+        try:
+            log = Path(iteration.log) if iteration.log else self._root / "logs" / "tasks" / "missing.log"
+            run = await self._runner.follow(
+                run, log, offset=0, on_update=self._updater(task, iteration)
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001
+            run = AgentRun(status="failed", summary=f"{type(err).__name__}: {err}")
+        await self._finish_iteration(task, iteration, run, resume)
 
     async def _start_cloud(self, task: Task, routine_id: str, token: str) -> None:
         info = await self._runner.fire_cloud(
@@ -750,8 +852,8 @@ class TaskBoard:
             f"IMPORTANT: you are running the STAGED build of task {task.id} '{task.title}' "
             f"(iteration {it.n if it else '?'}, not merged). What the agent built: {gist} "
             "When it fits, ask how the test is going. 'ship it' → approve_task after a yes; "
-            "'go back to main' → switch_build main; problems → note them precisely for a "
-            "revision. "
+            "'go back to main' → switch_build main; a problem → revise_task with it restated "
+            "precisely, then switch again when the revision is announced. "
         )
 
     async def switch_build(self, target: Any) -> str:
@@ -774,8 +876,6 @@ class TaskBoard:
         self._check(task, "stage")
         if task.mode != "local" or not task.worktree or not Path(task.worktree).exists():
             raise DispatchError(f"task {task.id} has no local build to run (cloud tasks merge by branch)")
-        if any(t.running for t in self._tasks.values()):
-            raise DispatchError("a build is still running — switching would kill it; wait for it to finish")
         synced, note = await self._runner.uv_sync(Path(task.worktree), self._uv_exe)
         warning = "" if synced else f" (dependency sync skipped: {note})"
         it = task.current
@@ -807,6 +907,12 @@ class TaskBoard:
     async def startup_maintenance(self) -> None:
         """Run once at app start: absorb a rollback, confirm a staged start,
         and remove worktrees that are no longer needed."""
+        for task in list(self._tasks.values()):
+            it = task.current
+            if task.running and it is not None:
+                note = "re-attaching to the running agent" if pid_alive(it.pid) else "reading its log"
+                self._log(task, "restart", note)
+                self._bg.append(asyncio.create_task(self._reattach(task, it)))
         failed = pointer_path(self._root).with_name("active_checkout.failed.json")
         if failed.exists():
             try:
