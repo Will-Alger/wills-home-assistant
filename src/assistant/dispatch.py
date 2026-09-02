@@ -9,8 +9,9 @@ mechanical work at a time and reports back:
   (session id, model, progress lines, MILESTONE: lines, result, cost). Pass
   `resume_session_id` to continue an earlier run with new instructions.
 - `merge_branch` — the voice-merge gates: clean main, ruff + pytest on the
-  branch, `git merge --no-ff`, push. `fetch_remote_branch` prepares a cloud
-  session's pushed branch for the same gates.
+  branch (`uv run`, falling back to `python -m` when uv is missing — see
+  `resolve_gate_runner`), `git merge --no-ff`, push. `fetch_remote_branch`
+  prepares a cloud session's pushed branch for the same gates.
 - `fire_cloud` / `refresh_cloud` — claude.ai/code routines (one per repo).
 
 Safety unchanged: worktrees only, hard timeout, the agent is told never to
@@ -40,6 +41,13 @@ def _is_own_repo(repo: str) -> bool:
         return True
     return "home-assistant" in needle and "wills" in needle
 
+
+# Asked of a fallback interpreter before the merge gates trust it with ruff and
+# pytest: importing them would be slower and could fail for unrelated reasons.
+GATE_TOOLS_PROBE = (
+    "import importlib.util as u, sys; "
+    "sys.exit(0 if u.find_spec('ruff') and u.find_spec('pytest') else 1)"
+)
 
 CLOUD_ROUTINES_FILE = "cloud_routines.json"
 
@@ -157,6 +165,18 @@ sentence a voice assistant can read aloud. If DONE, say where the work landed \
 (branch / PR number). Do not do any additional work in response to this \
 message.
 """
+
+
+@dataclass
+class GateRunner:
+    """How the merge gates run ruff and pytest on a checkout."""
+
+    prefix: list[str]  # [uv, "run"] or [python, "-m"]
+    env: dict[str, str] | None = None  # set on the fallback path only
+    note: str = ""  # "" behind uv; names the fallback otherwise, to be spoken
+
+    def command(self, *args: str) -> list[str]:
+        return [*self.prefix, *args]
 
 
 @dataclass
@@ -301,17 +321,21 @@ class Dispatcher:
         return code == 0
 
     async def _cmd(
-        self, cmd: list[str] | str, cwd: Path, timeout: float = 300.0
+        self,
+        cmd: list[str] | str,
+        cwd: Path,
+        timeout: float = 300.0,
+        env: dict[str, str] | None = None,
     ) -> tuple[int, str]:
         if isinstance(cmd, str):
             proc = await asyncio.create_subprocess_shell(
                 cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                creationflags=NO_WINDOW,
+                creationflags=NO_WINDOW, env=env,
             )
         else:
             proc = await asyncio.create_subprocess_exec(
                 *cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                creationflags=NO_WINDOW,
+                creationflags=NO_WINDOW, env=env,
             )
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -507,10 +531,63 @@ class Dispatcher:
         code, out = await self._cmd([uv, "sync", "--quiet"], cwd, timeout=600.0)
         return code == 0, out[-300:].strip()
 
+    @staticmethod
+    def _venv_python(cwd: Path) -> str | None:
+        """A checkout's own interpreter, if it has one."""
+        for rel in (Path("Scripts") / "python.exe", Path("bin") / "python"):
+            candidate = cwd / ".venv" / rel
+            if candidate.exists():
+                return str(candidate)
+        return None
+
+    async def _runs_the_gate_tools(self, python: str, cwd: Path) -> bool:
+        """Can this interpreter run ruff and pytest as modules?"""
+        code, _ = await self._cmd([python, "-c", GATE_TOOLS_PROBE], cwd, timeout=60.0)
+        return code == 0
+
+    async def resolve_gate_runner(self, gates_dir: Path, uv_exe: str = "") -> GateRunner:
+        """How to run ruff and pytest on a checkout.
+
+        `uv run` first, found the way uv_sync finds it (UV_EXE, PATH, then the
+        WinGet folder) — a bare "uv" in a shell fails whenever her service
+        starts without uv on PATH, and that blocked every merge with a lint
+        error that had nothing to do with the branch. When uv is nowhere, fall
+        back to an interpreter that already has both tools — the branch's own
+        .venv, else the one she is running in — as `python -m ruff` /
+        `python -m pytest`, with the branch's own `src` pinned on PYTHONPATH:
+        her interpreter's editable install points at MAIN's src, so without the
+        pin the gates would happily check code the branch never changed (the
+        same trick alexa_service uses to run a staged build). Raises
+        DispatchError when nothing here can run the checks at all."""
+        uv = self.resolve_uv(uv_exe)
+        if uv is not None:
+            return GateRunner([uv, "run"])
+        prior = os.environ.get("PYTHONPATH", "")
+        env = {
+            **os.environ,
+            "PYTHONPATH": str(gates_dir / "src") + (os.pathsep + prior if prior else ""),
+        }
+        for python, where in (
+            (self._venv_python(gates_dir), "the branch's own virtual environment"),
+            (sys.executable, "her own Python"),
+        ):
+            if python and await self._runs_the_gate_tools(python, gates_dir):
+                return GateRunner(
+                    [python, "-m"],
+                    env=env,
+                    note=f"uv was not found, so the checks ran with {where}",
+                )
+        raise DispatchError(
+            "the checks could not run at all: uv was not found on PATH, at UV_EXE, or in "
+            "its WinGet folder, and no Python here has both ruff and pytest. Install uv "
+            "and set UV_EXE in .env, or install ruff and pytest into the branch's "
+            "virtual environment."
+        )
+
     # ── merge gates ─────────────────────────────────────────────────────────
 
     async def merge_branch(
-        self, *, merge_ref: str, gates_dir: Path, title: str
+        self, *, merge_ref: str, gates_dir: Path, title: str, uv_exe: str = ""
     ) -> tuple[bool, str]:
         """Clean main, lint + tests on the branch, merge --no-ff, push."""
         code, out = await self._cmd(
@@ -518,14 +595,25 @@ class Dispatcher:
         )
         if out.strip():
             return False, "the main checkout has uncommitted changes — merge blocked until it's clean"
+        note = ""  # how the checks ran, when it wasn't the usual `uv run`
         if (gates_dir / "pyproject.toml").exists():
+            try:
+                gate = await self.resolve_gate_runner(gates_dir, uv_exe)
+            except DispatchError as exc:
+                return False, f"merge blocked on {merge_ref}: {exc}"
+            note = gate.note
             for label, check in (
-                ("lint", "uv run ruff check src scripts tests"),
-                ("tests", "uv run pytest -q"),
+                ("lint", ["ruff", "check", "src", "scripts", "tests"]),
+                ("tests", ["pytest", "-q"]),
             ):
-                code, out = await self._cmd(check, gates_dir, timeout=600.0)
+                code, out = await self._cmd(
+                    gate.command(*check), gates_dir, timeout=600.0, env=gate.env
+                )
                 if code != 0:
-                    return False, f"merge blocked: {label} failed on {merge_ref}:\n{out[-500:]}"
+                    aside = f" ({note})" if note else ""
+                    return False, (
+                        f"merge blocked: {label} failed on {merge_ref}{aside}:\n{out[-500:]}"
+                    )
         code, out = await self._cmd(
             ["git", "merge", "--no-ff", merge_ref, "-m",
              f"Merge {merge_ref}: {title} (voice-approved by owner)"],
@@ -536,7 +624,8 @@ class Dispatcher:
             return False, f"merge conflict — aborted cleanly; a human needs to look:\n{out[-400:]}"
         push_code, push_out = await self._cmd(["git", "push"], self.root)
         push_note = "" if push_code == 0 else f" (push failed: {push_out[-120:]})"
-        return True, f"merged {merge_ref} into main and pushed{push_note} — checks passed."
+        aside = f" ({note})" if note else ""
+        return True, f"merged {merge_ref} into main and pushed{push_note} — checks passed{aside}."
 
     async def fetch_remote_branch(self, branch: str, slug: str) -> tuple[str, Path]:
         """A cloud session pushed `branch`: fetch it and check it out detached

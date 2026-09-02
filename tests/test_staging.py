@@ -106,6 +106,30 @@ async def test_approve_from_the_staged_process_syncs_main_and_restarts(tmp_path:
     assert staged_board.get(tid).state == "merged" and staged_board.get(tid).cleanup_pending
 
 
+async def test_approve_without_uv_still_merges_and_says_deps_were_not_synced(
+    tmp_path: Path,
+) -> None:
+    """A missing uv must not block the merge — the gates fall back — but main's
+    packages were left alone and he should hear it."""
+    repo = make_repo(tmp_path)
+    board, _, runner = board_with_built_task(repo)
+    tid = await build(board)
+    await board.switch_build(tid)
+    (Path(board.get(tid).worktree) / "DUCK.md").write_text("duck", encoding="utf-8")
+    await runner.commit_all(Path(board.get(tid).worktree), "duck")
+
+    async def no_uv(cwd: Path, uv_exe: str = ""):
+        return False, "uv was not found (set UV_EXE in .env)"
+
+    staged_board = TaskBoard(repo, runner=runner, staged_task_id=tid)
+    runner.uv_sync = no_uv  # type: ignore[method-assign]
+    result = await staged_board.approve(tid)
+    assert "merged" in result and "restarting onto main" in result
+    assert "dependencies were not synced" in result and "uv was not found" in result
+    assert (repo / "DUCK.md").exists()  # the merge itself went through
+    assert staged_board.get(tid).state == "merged"
+
+
 async def test_abandon_while_staged_returns_to_main(tmp_path: Path) -> None:
     repo = make_repo(tmp_path)
     board, _, runner = board_with_built_task(repo)
