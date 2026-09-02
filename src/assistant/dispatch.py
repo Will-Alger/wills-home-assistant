@@ -41,9 +41,13 @@ def _is_own_repo(repo: str) -> bool:
     return "home-assistant" in needle and "wills" in needle
 
 
+CLOUD_ROUTINES_FILE = "cloud_routines.json"
+
+
 def load_extra_routines(root: Path) -> dict[str, dict]:
-    """data/routines.json: {"repo-name": {"routine_id": "trig_...", "token": "..."}}"""
-    path = root / "data" / "routines.json"
+    """data/cloud_routines.json: {"repo-name": {"routine_id": "trig_...", "token": "..."}}
+    (renamed from routines.json, which the behavior RoutineStore now owns)."""
+    path = root / "data" / CLOUD_ROUTINES_FILE
     if not path.exists():
         return {}
     try:
@@ -55,6 +59,26 @@ def load_extra_routines(root: Path) -> dict[str, dict]:
         }
     except (json.JSONDecodeError, OSError):
         return {}
+
+
+def migrate_cloud_routines(root: Path) -> str:
+    """One-time move: an old data/routines.json holding cloud-routine
+    credentials becomes data/cloud_routines.json. A behavior-routine file
+    (next_id/routines keys) is left alone. Returns a note, or ''."""
+    old = root / "data" / "routines.json"
+    new = root / "data" / CLOUD_ROUTINES_FILE
+    if not old.exists() or new.exists():
+        return ""
+    try:
+        data = json.loads(old.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return ""
+    if not isinstance(data, dict) or not data or "routines" in data or "next_id" in data:
+        return ""
+    if not all(isinstance(v, dict) and v.get("routine_id") for v in data.values()):
+        return ""
+    os.replace(old, new)
+    return f"moved cloud routine credentials to data/{CLOUD_ROUTINES_FILE}"
 
 
 _RULES = """\
@@ -225,8 +249,8 @@ class Dispatcher:
         self._routine_id = routine_id
         self._routine_token = routine_token
         # repo name -> {"routine_id": ..., "token": ...} for OTHER repositories
-        # (each claude.ai/code routine pins one repo). data/routines.json feeds
-        # this; the assistant's own repo uses routine_id/token above.
+        # (each claude.ai/code routine pins one repo). data/cloud_routines.json
+        # feeds this; the assistant's own repo uses routine_id/token above.
         self._extra_routines = dict(extra_routines or {})
         self._cloud_status_cmd = cloud_status_cmd  # a message INTO the session
         self._refresh_timeout_s = refresh_timeout_s
@@ -528,7 +552,7 @@ class Dispatcher:
         known = ", ".join(sorted(self._extra_routines)) or "(none configured)"
         raise DispatchError(
             f"no dispatch routine configured for repo {repo!r}; configured repos: {known}. "
-            "Add one in data/routines.json (see README)."
+            f"Add one in data/{CLOUD_ROUTINES_FILE} (see README)."
         )
 
     async def fire_cloud(

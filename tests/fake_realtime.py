@@ -20,6 +20,10 @@ class FakeConnection:
     def __init__(self) -> None:
         self.sent: list[dict[str, Any]] = []
         self._events: asyncio.Queue[Any] = asyncio.Queue()
+        # When set, the "owner" says this right after the FIRST response ends
+        # (a scripted user turn: speech_started + a finished transcription).
+        self.say_after_response: str | None = None
+        self._said = False
 
     async def send(self, event: dict[str, Any]) -> None:
         self.sent.append(event)
@@ -45,6 +49,15 @@ class FakeConnection:
                     response=SimpleNamespace(output=[], usage=None),
                 )
             )
+            if self.say_after_response and not self._said:
+                self._said = True
+                self._events.put_nowait(SimpleNamespace(type="input_audio_buffer.speech_started"))
+                self._events.put_nowait(
+                    SimpleNamespace(
+                        type="conversation.item.input_audio_transcription.completed",
+                        transcript=self.say_after_response,
+                    )
+                )
 
     async def recv(self) -> Any:
         return await self._events.get()

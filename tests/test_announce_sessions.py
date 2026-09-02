@@ -14,7 +14,7 @@ from tests.fake_realtime import FakeClient, InstantSpeaker, NeverMic, QuietUi
 from tests.test_dispatch import fake_runner, make_repo
 
 
-def make_engine(announcer: Announcer) -> tuple[RealtimeEngine, FakeClient]:
+def make_engine(announcer: Announcer, **kw) -> tuple[RealtimeEngine, FakeClient]:
     engine = RealtimeEngine(
         api_key="test-key",
         model="m",
@@ -24,6 +24,7 @@ def make_engine(announcer: Announcer) -> tuple[RealtimeEngine, FakeClient]:
         name="Alexa",
         wake_phrase="alexa",
         announcer=announcer,
+        **kw,
     )
     client = FakeClient()
     engine._client = client  # no network: scripted Realtime connection
@@ -84,3 +85,51 @@ def test_announce_chime_exists() -> None:
 
     assert "announce" in _SOUNDS
     assert len(pcm("announce", 24_000)) > 10_000
+
+
+# ── milestone 11: spoken is not read ───────────────────────────────────────
+
+
+async def test_opener_without_reply_stays_unread(tmp_path: Path) -> None:
+    announcer = Announcer(tmp_path / "a.json")
+    item = announcer.enqueue("Task 7 is built.", ref="task:7:1:built")
+    engine, _client = make_engine(announcer)
+    stats = await engine.run_conversation(NeverMic(), InstantSpeaker(), None, QuietUi(), announce=True)
+    assert stats.ended_by == "announcement delivered" and not stats.replied
+    assert stats.announced == [item.id]
+    assert item.state == "spoken" and item.unread  # she said it; nobody proved they heard it
+    assert announcer.unread_summary().startswith("1 unread since")
+
+
+async def test_opener_with_a_reply_is_read(tmp_path: Path) -> None:
+    announcer = Announcer(tmp_path / "a.json")
+    item = announcer.enqueue("Task 7 is built.", ref="task:7:1:built")
+    engine, client = make_engine(announcer)
+    client.connection.say_after_response = "nice, thanks"
+    stats = await engine.run_conversation(NeverMic(), InstantSpeaker(), None, QuietUi(), announce=True)
+    assert stats.replied and ("you", "nice, thanks") in stats.transcript
+    assert item.state == "read" and announcer.unread() == []
+
+
+async def test_mid_session_injection_is_read_at_once(tmp_path: Path, monkeypatch) -> None:
+    from assistant.engines import realtime_engine as mod
+
+    monkeypatch.setattr(mod, "_INJECT_QUIET_S", 0.05)
+    monkeypatch.setattr(mod, "_INJECT_MIN_AGE_S", 0.05)
+    announcer = Announcer(tmp_path / "a.json")
+    engine, client = make_engine(announcer, idle_timeout_s=1.0)
+
+    async def later() -> None:
+        await asyncio.sleep(0.2)
+        announcer.enqueue("The porch light came on.", kind="watch")
+
+    side = asyncio.create_task(later())
+    stats = await engine.run_conversation(NeverMic(), InstantSpeaker(), None, QuietUi())
+    await side
+    assert stats.ended_by == "idle timeout"
+    item = announcer.get(1)
+    assert item is not None and item.state == "read" and announcer.unread() == []
+    lead = next(
+        e for e in client.connection.sent if e["type"] == "conversation.item.create"
+    )["item"]["content"][0]["text"]
+    assert "mid-conversation" in lead and stats.announced == [1]

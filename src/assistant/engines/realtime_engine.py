@@ -118,8 +118,7 @@ first and store the new — never keep both versions. \
 Things they ask you to keep for later go in remember(kind="fact"); answer \
 "what do you remember?" via list_memories, and delete with forget after \
 checking ids. Store only what the speaker deliberately tells you — never \
-ambient chatter. You cannot yet react to events ("when the sun sets…") — \
-only to what is said to you; say so honestly if asked.
+ambient chatter.
 {calendar}
 Your own development — the build loop, all by voice. You are an evolving open \
 project: project_status shows your recent code changes, read_roadmap your \
@@ -178,6 +177,17 @@ sentences: lead with the news, keep any suggested next command, then STOP — \
 no question, no tools; the session closes by itself. An EVENT can also \
 arrive mid-conversation: mention it briefly at a natural moment, then carry \
 on. Never attribute an event to the speaker.
+
+Notifications: things you announced that {owner} has not acknowledged, plus \
+anything held back for him, are UNREAD. Right now: {unread}. When a \
+conversation starts with unread items, lead with the count in a few words \
+("two things while you were out — want them?") once the current request is \
+handled — but not when it was a one-shot command that closes. Read them out \
+only via list_notifications when he asks; listing them counts as him having \
+heard them, so never call it just to look. Never re-read what he has heard. \
+"What did you just say?" → list_notifications scope=last. "What did you \
+tell me this morning?" → scope=all with since. "Mark that unread" → \
+mark_notifications.
 
 Ending — two distinct modes, get this right: \
 (1) ONE-SHOT COMMAND: the speaker woke you and gave a single order (set \
@@ -255,20 +265,46 @@ _MEMORY_TOOL_NAMES = {tool["name"] for tool in MEMORY_TOOLS}
 SYSTEM_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
-        "name": "announcement_history",
+        "name": "list_notifications",
         "description": (
-            "What you announced on your own recently (builds finished, "
-            "milestones, rollbacks, timers) with times — for 'what did you "
-            "tell me this morning / while I was out?'. since: today | "
-            "yesterday | a number of hours ('6')."
+            "Your notifications with ids and times. scope=unread (default): "
+            "what the owner has not heard yet — returning them MARKS THEM READ, "
+            "so call it only when he asks for them. scope=last: the last thing "
+            "you announced ('what did you just say?'). scope=all: history for "
+            "a window ('what did you tell me this morning / while I was "
+            "out?'), since: today | yesterday | a number of hours ('6'); marks "
+            "nothing. kind filters (task, watch, question, ...)."
         ),
         "parameters": {
             "type": "object",
-            "properties": {"since": {"type": "string"}},
+            "properties": {
+                "scope": {"type": "string", "enum": ["unread", "all", "last"]},
+                "since": {"type": "string"},
+                "kind": {"type": "string"},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "name": "mark_notifications",
+        "description": "Mark notifications read or unread by id ('mark that unread, remind me later').",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ids": {"type": "array", "items": {"type": "integer"}},
+                "state": {"type": "string", "enum": ["read", "unread"]},
+            },
+            "required": ["ids", "state"],
         },
     },
 ]
 _SYSTEM_TOOL_NAMES = {tool["name"] for tool in SYSTEM_TOOLS}
+
+# Mid-session announcements: how long the room must be quiet, and how old the
+# session must be, before an EVENT is slipped in. Module-level so tests can
+# shrink them.
+_INJECT_QUIET_S = 2.0
+_INJECT_MIN_AGE_S = 3.0
 
 BRAIN_TOOLS: list[dict[str, Any]] = [
     {
@@ -704,6 +740,8 @@ class SessionStats:
     tool_calls: list[str] = field(default_factory=list)
     ended_by: str = "unknown"
     transcript: list[tuple[str, str]] = field(default_factory=list)  # for reflection
+    announced: list[int] = field(default_factory=list)  # notification ids she spoke
+    replied: bool = False  # the owner said something in this session
 
 
 def _usage_cost(usage: Any) -> float:
@@ -825,6 +863,7 @@ class RealtimeEngine:
             tasks=self._board.status_line() if self._board else "(task board not enabled)",
             routines=self._routines.text() if self._routines else "(none)",
             staged=self._board.staged_paragraph() if self._board else "",
+            unread=self._announcer.unread_summary() if self._announcer is not None else "none",
             extra=extra,
         )
         audio_in: dict[str, Any] = {
@@ -1238,8 +1277,42 @@ class RealtimeEngine:
             return f"watch error: {err}", True
 
     def _execute_system_tool(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
-        if name != "announcement_history" or self._announcer is None:
+        ann = self._announcer
+        if ann is None or (name not in _SYSTEM_TOOL_NAMES and name != "announcement_history"):
             return f"unknown system tool {name}", True
+        if name == "mark_notifications":
+            try:
+                ids = [int(i) for i in (args.get("ids") or [])]
+            except (TypeError, ValueError):
+                return "ids must be integers", True
+            state = "unread" if str(args.get("state", "read")).lower() == "unread" else "read"
+            changed = ann.mark_read(ids) if state == "read" else ann.mark_unread(ids)
+            if not changed:
+                return "no notifications matched those ids", True
+            self._instructions_stale = True
+            return f"{changed} marked {state}", False
+        # announcement_history is the pre-M11 name; it lives on as scope=all
+        scope = "all" if name == "announcement_history" else str(args.get("scope", "") or "unread").lower()
+        kind = str(args.get("kind", "") or "").strip()
+        kinds = [kind] if kind else None
+        if scope == "last":
+            item = ann.last_spoken()
+            if item is None:
+                return "I haven't announced anything yet", False
+            row = ann.to_row(item)
+            if ann.mark_read([item.id]):
+                self._instructions_stale = True
+            return json.dumps([row]), False
+        if scope == "unread":
+            rows = ann.unread(kinds=kinds)
+            if not rows:
+                return "nothing unread", False
+            out = [ann.to_row(a) for a in rows[-20:]]  # as they were: he is hearing them now
+            ann.mark_read([a.id for a in rows])  # listing them = he has heard them
+            self._instructions_stale = True
+            return json.dumps(out), False
+        if scope != "all":
+            return "scope must be unread, all, or last", True
         spec = str(args.get("since", "today") or "today").strip().lower()
         now = time.time()
         local_now = datetime.fromtimestamp(now).astimezone()
@@ -1253,22 +1326,10 @@ class RealtimeEngine:
                 since, until = now - float(spec) * 3600, None
             except ValueError:
                 return "since must be today, yesterday, or a number of hours", True
-        rows = [
-            r for r in self._announcer.history(since)
-            if until is None or (r.get("delivered") or 0) < until
-        ]
+        rows = ann.items(since, until, kinds=kinds, limit=20)
         if not rows:
             return "I haven't announced anything in that window", False
-        return json.dumps(
-            [
-                {
-                    "when": datetime.fromtimestamp(r["delivered"]).astimezone().strftime("%a %I:%M %p").lstrip("0"),
-                    "kind": r.get("kind", ""),
-                    "said": r["text"][:240],
-                }
-                for r in rows[-20:]
-            ]
-        ), False
+        return json.dumps(rows), False
 
     def _execute_memory(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
         if self._memory is None:
@@ -1385,19 +1446,38 @@ class RealtimeEngine:
                     self.voice_note = None
 
             announcing: list[int] = []  # announcement ids being spoken now
+            announcing_opener = False  # ...and they opened this session (nobody spoke)
+            waits_for_reply = False  # ...and they ask him something (question / arrival)
+            opener_ids: list[int] = []  # everything spoken as an opener: read only if he replies
             interrupted = False  # wake-word barge-in happened
             session_started = time.monotonic()
 
             async def deliver(items: list[Any], *, opener: bool) -> None:
                 """Hand queued announcements to the model as a SYSTEM item —
                 never as fake user speech — and ask for a response."""
-                nonlocal announcing, last_activity
+                nonlocal announcing, announcing_opener, waits_for_reply, last_activity
+                items = sorted(items, key=lambda i: 0 if getattr(i, "kind", "") == "presence" else 1)
                 said = " ".join(i.text for i in items)
-                if all(getattr(i, "kind", "") == "thought" for i in items):
+                kinds = {getattr(i, "kind", "") for i in items}
+                if kinds == {"thought"}:
                     lead = (
                         f"Your deeper reasoning finished the question {self._owner} asked earlier — "
                         "give him the answer now, in your own words, as if you'd just "
                         "worked it out: "
+                    )
+                elif "presence" in kinds:
+                    lead = (
+                        f"EVENT — {self._owner} just walked in; nobody has spoken. Welcome him "
+                        "in a few words, then tell him what happened while he was out, most "
+                        "important first. If he replies, carry on; if not, stop: "
+                    )
+                elif "question" in kinds:
+                    lead = (
+                        f"EVENT — something needs {self._owner}'s decision; nobody has spoken. "
+                        "Say the question in your own words, ASK him, and wait for his answer. "
+                        "For a task, send his answer with answer_task, restated precisely; for "
+                        "a scheduled action, call confirm_action with the id in the event text "
+                        "(never read ids aloud). If he says later, stop: "
                     )
                 else:
                     lead = (
@@ -1407,6 +1487,10 @@ class RealtimeEngine:
                         "natural moment, then continue: "
                     )
                 announcing = [i.id for i in items]
+                announcing_opener = opener
+                waits_for_reply = bool(kinds & {"presence", "question"})
+                if opener:
+                    opener_ids.extend(announcing)
                 await connection.send(
                     {
                         "type": "conversation.item.create",
@@ -1433,6 +1517,7 @@ class RealtimeEngine:
 
             async def pump_mic() -> None:
                 nonlocal speaking, interrupted
+                nonlocal quick_close_armed, quick_close_window, quick_close_reason
                 while True:
                     frame = await mic.get_frame()
                     if speaking and not self._talk_over:
@@ -1446,6 +1531,13 @@ class RealtimeEngine:
                             speaking = False
                             mic.drain()
                             ui.interrupted()
+                            if speech_segments == 0:
+                                # he cut into an announcement: give him the
+                                # question window to say something, then close —
+                                # never hover for the full idle timeout
+                                quick_close_armed = True
+                                quick_close_window = self._info_close_s
+                                quick_close_reason = "interrupted announcement"
                         continue
                     await connection.send(
                         {
@@ -1461,7 +1553,9 @@ class RealtimeEngine:
                 await speaker.wait_idle()
                 speaking = False
                 mic.drain()
-                if close_after:
+                if close_after and not interrupted:
+                    # (a barge-in during the audio keeps the session open: he
+                    # wanted to say something)
                     ended.set()
                 else:
                     ui.listening()
@@ -1480,7 +1574,7 @@ class RealtimeEngine:
             async def receive() -> None:
                 nonlocal speaking, response_active, closing, last_activity
                 nonlocal speech_segments, command_pending, quick_close_armed
-                nonlocal quick_close_window, quick_close_reason, announcing
+                nonlocal quick_close_window, quick_close_reason, announcing, announcing_opener
                 heard = ""  # live accumulation of the user's words
                 while True:
                     event = await connection.recv()
@@ -1502,6 +1596,7 @@ class RealtimeEngine:
                         heard = ""
                         said = getattr(event, "transcript", "")
                         stats.transcript.append(("you", said))
+                        stats.replied = True
                         ui.user_said(said)
                         if is_stop_command(said):
                             # Instant hard stop: no model round-trip, works even
@@ -1532,7 +1627,12 @@ class RealtimeEngine:
                         if announced_now:
                             if self._announcer is not None:
                                 self._announcer.mark_delivered(announcing)
+                                if not announcing_opener:
+                                    # slipped into a live conversation: he heard it
+                                    self._announcer.mark_read(announcing)
+                            stats.announced.extend(announcing)
                             announcing = []
+                            announcing_opener = False
                         ran = self.last_response_tools
                         if any(t in COMMAND_TOOLS for t in ran):
                             command_pending = True
@@ -1549,10 +1649,17 @@ class RealtimeEngine:
                                 quick_close_reason = "question answered"
                         close_after = closing
                         if announced_now and announce and speech_segments == 0 and not interrupted:
-                            # she initiated, said her piece, nobody replied:
-                            # back to sleep as soon as the audio drains
-                            stats.ended_by = "announcement delivered"
-                            close_after = True
+                            if waits_for_reply:
+                                # she asked him something (or welcomed him home):
+                                # hold the question window open, then close
+                                quick_close_armed = True
+                                quick_close_window = self._info_close_s
+                                quick_close_reason = "no reply"
+                            else:
+                                # she initiated, said her piece, nobody replied:
+                                # back to sleep as soon as the audio drains
+                                stats.ended_by = "announcement delivered"
+                                close_after = True
                         pending.append(asyncio.create_task(finish_playback(close_after)))
                     elif kind == "error":
                         ui.error(str(getattr(event, "error", event)))
@@ -1567,8 +1674,8 @@ class RealtimeEngine:
                         and not speaking
                         and not response_active
                         and not closing
-                        and quiet > 2.0
-                        and time.monotonic() - session_started > 3.0
+                        and quiet > _INJECT_QUIET_S
+                        and time.monotonic() - session_started > _INJECT_MIN_AGE_S
                         and self._announcer.due()
                     ):
                         items = self._announcer.take_due()
@@ -1594,6 +1701,9 @@ class RealtimeEngine:
                 await ended.wait()
                 if stats.ended_by == "unknown":
                     stats.ended_by = "end_conversation"
+                if stats.replied and opener_ids and self._announcer is not None:
+                    # she opened with news and he answered: he heard it
+                    self._announcer.mark_read(opener_ids)
             finally:
                 for task in [*tasks, *pending]:
                     task.cancel()

@@ -13,25 +13,37 @@ from assistant.tasks import TaskBoard
 from tests.test_dispatch import fake_runner, make_repo
 
 
-def test_announcement_history_by_window(tmp_path: Path) -> None:
+def test_list_notifications_windows_and_marks_read(tmp_path: Path) -> None:
     announcer = Announcer(tmp_path / "a.json")
     engine = RealtimeEngine(
         api_key="k", model="m", voice="v", home=FakeHome(), owner="Will", announcer=announcer
     )
-    text, is_error = engine._execute_system_tool("announcement_history", {"since": "today"})
+    text, is_error = engine._execute_system_tool("list_notifications", {"scope": "all", "since": "today"})
     assert not is_error and "haven't announced" in text
+    text, is_error = engine._execute_system_tool("list_notifications", {})
+    assert not is_error and text == "nothing unread"
 
     item = announcer.enqueue("Task 7 is built.", kind="task")
     announcer.take_due()
     announcer.mark_delivered([item.id])
-    text, is_error = engine._execute_system_tool("announcement_history", {"since": "today"})
+    text, is_error = engine._execute_system_tool("list_notifications", {"scope": "unread"})
     assert not is_error
     rows = json.loads(text)
-    assert rows[0]["said"] == "Task 7 is built." and rows[0]["kind"] == "task" and rows[0]["when"]
-    text, _ = engine._execute_system_tool("announcement_history", {"since": "2"})
-    assert json.loads(text)[0]["said"] == "Task 7 is built."
-    text, is_error = engine._execute_system_tool("announcement_history", {"since": "whenever"})
+    assert rows[0]["text"] == "Task 7 is built." and rows[0]["kind"] == "task" and rows[0]["when"]
+    assert rows[0]["state"] == "spoken"
+    assert announcer.get(item.id).read is not None and engine._instructions_stale  # listing = heard
+    text, _ = engine._execute_system_tool("list_notifications", {"scope": "all", "since": "2"})
+    assert json.loads(text)[0]["state"] == "read"
+    text, _ = engine._execute_system_tool("list_notifications", {"scope": "last"})
+    assert json.loads(text)[0]["id"] == item.id
+    text, is_error = engine._execute_system_tool("list_notifications", {"scope": "all", "since": "whenever"})
     assert is_error
+    text, is_error = engine._execute_system_tool("mark_notifications", {"ids": [item.id], "state": "unread"})
+    assert not is_error and announcer.get(item.id).unread
+    text, is_error = engine._execute_system_tool("mark_notifications", {"ids": [99], "state": "read"})
+    assert is_error
+    text, is_error = engine._execute_system_tool("announcement_history", {"since": "today"})  # legacy name
+    assert not is_error and json.loads(text)[0]["id"] == item.id
 
 
 def test_search_ranks_title_matches_first(tmp_path: Path) -> None:

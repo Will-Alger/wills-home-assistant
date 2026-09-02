@@ -26,6 +26,9 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# tests import each other as `tests.<module>`; plain `uv run pytest` (the
+# merge gate, CLAUDE.md) needs the repo root on the path for that.
+pythonpath = ["."]
 
 [tool.uv]
 # openwakeword 0.6 hard-depends on tflite-runtime for Linux, which ships no

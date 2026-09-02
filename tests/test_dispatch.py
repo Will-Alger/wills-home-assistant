@@ -126,11 +126,34 @@ def test_repo_routing_and_registry(tmp_path: Path) -> None:
 
     assert load_extra_routines(tmp_path) == {}
     (tmp_path / "data").mkdir(exist_ok=True)
-    (tmp_path / "data" / "routines.json").write_text(
+    (tmp_path / "data" / "cloud_routines.json").write_text(
         '{"good-repo": {"routine_id": "trig_a", "token": "tok_a"}, "missing-token": {"routine_id": "trig_b"}}',
         encoding="utf-8",
     )
     assert list(load_extra_routines(tmp_path)) == ["good-repo"]
+
+
+def test_cloud_routines_are_migrated_and_loaded(tmp_path: Path) -> None:
+    from assistant.dispatch import migrate_cloud_routines
+    from assistant.routines import RoutineStore
+
+    behavior = tmp_path / "behavior"
+    (behavior / "data").mkdir(parents=True)
+    RoutineStore(behavior / "data" / "routines.json").add(
+        "TV volume defaults to 65%", tool="media_control", defaults={"volume_pct": 65}
+    )
+    assert migrate_cloud_routines(behavior) == ""  # a behavior-routine file is left alone
+    assert (behavior / "data" / "routines.json").exists()
+    assert not (behavior / "data" / "cloud_routines.json").exists()
+
+    legacy = tmp_path / "legacy"
+    (legacy / "data").mkdir(parents=True)
+    assert migrate_cloud_routines(legacy) == ""  # nothing there
+    old = legacy / "data" / "routines.json"
+    old.write_text('{"side-project": {"routine_id": "trig_s", "token": "tok_s"}}', encoding="utf-8")
+    assert "cloud_routines" in migrate_cloud_routines(legacy)
+    assert not old.exists() and list(load_extra_routines(legacy)) == ["side-project"]
+    assert migrate_cloud_routines(legacy) == ""  # idempotent
 
 
 async def test_cloud_refresh_returns_the_status_line(tmp_path: Path) -> None:

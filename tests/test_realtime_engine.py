@@ -67,8 +67,27 @@ async def test_session_config_renders_jobs_and_repos(tmp_path) -> None:
         "search_tasks", "approve_task", "abandon_task", "switch_build", "revise_task",
     } <= tool_names
     assert "web_search" in tool_names
-    assert "announcement_history" not in tool_names  # no announcer wired here
+    assert "list_notifications" not in tool_names  # no announcer wired here
     assert "develop_feature" not in tool_names
+
+
+async def test_session_config_renders_unread_and_no_stale_denial(tmp_path) -> None:
+    from assistant.announce import Announcer
+    from assistant.engines.realtime_engine import RealtimeEngine
+    from assistant.home.fake import FakeHome
+
+    announcer = Announcer(tmp_path / "a.json", quiet_hours="00:00-24:00")  # always held → unread
+    announcer.enqueue("Task 7 is built.", kind="task")
+    engine = RealtimeEngine(
+        api_key="k", model="m", voice="v", home=FakeHome(), owner="Will", announcer=announcer
+    )
+    config = await engine._session_config(None)
+    text = config["instructions"]
+    assert "Right now: 1 unread since" in text and "Task 7 is built." in text
+    assert "cannot yet react to events" not in text  # she can, since M3
+    names = {t["name"] for t in config["tools"]}
+    assert {"list_notifications", "mark_notifications"} <= names
+    assert "announcement_history" not in names
 
 
 def test_command_tools_cover_home_actions_only() -> None:

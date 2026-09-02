@@ -29,7 +29,7 @@ from assistant.audio.mic import Microphone, describe_device
 from assistant.audio.speaker import Speaker
 from assistant.brain.thinker import Thinker
 from assistant.config import home_dir, load_settings
-from assistant.dispatch import Dispatcher, load_extra_routines
+from assistant.dispatch import Dispatcher, load_extra_routines, migrate_cloud_routines
 from assistant.engines.realtime_engine import (
     FRAME_SAMPLES_24K,
     REALTIME_RATE,
@@ -183,6 +183,9 @@ def build_engine(fake: bool):
             ),
             memory,
         )
+    moved = migrate_cloud_routines(root)  # pre-M11 layout: cloud creds in routines.json
+    if moved:
+        console.print(f"[dim]{moved}[/dim]")
     board = (
         TaskBoard(
             root,
@@ -382,6 +385,8 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
         "question answered": "question answered — closed after quiet",
         "announcement delivered": "announced, back to sleep",
         "nothing to announce": "announcement was already handled",
+        "no reply": "asked, no reply — back to sleep",
+        "interrupted announcement": "you cut in — closed after quiet",
     }.get(stats.ended_by, stats.ended_by)
     console.print(
         f"[bold]conversation closed[/bold] ({reason}) · {stats.responses} replies · "
