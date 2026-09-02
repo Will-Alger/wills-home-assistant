@@ -23,6 +23,7 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -223,6 +224,24 @@ MEMORY_TOOLS: list[dict[str, Any]] = [
 ]
 _MEMORY_TOOL_NAMES = {tool["name"] for tool in MEMORY_TOOLS}
 
+SYSTEM_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "announcement_history",
+        "description": (
+            "What you announced on your own recently (builds finished, "
+            "milestones, rollbacks, timers) with times — for 'what did you "
+            "tell me this morning / while I was out?'. since: today | "
+            "yesterday | a number of hours ('6')."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"since": {"type": "string"}},
+        },
+    },
+]
+_SYSTEM_TOOL_NAMES = {tool["name"] for tool in SYSTEM_TOOLS}
+
 TASK_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -249,9 +268,12 @@ TASK_TOOLS: list[dict[str, Any]] = [
             "Send a drafted (or failed) task to an Opus coding agent on a "
             "sandboxed branch — ONLY after reading the spec's gist aloud and "
             "getting an explicit yes (confirmed=true then). You will announce "
-            "milestones and completion on your own; never poll. mode=cloud "
-            "runs it as a live claude.ai/code session instead; repo targets "
-            "one of the owner's other configured repositories (always cloud)."
+            "milestones and completion on your own; never poll. mode=cloud is "
+            "WATCH MODE only — a live claude.ai/code session the owner can "
+            "watch on his phone — use it only when he asks to watch; local is "
+            "the default because only local builds can be switched into and "
+            "merged by voice. repo targets one of the owner's other "
+            "configured repositories (always cloud)."
         ),
         "parameters": {
             "type": "object",
@@ -580,6 +602,8 @@ class RealtimeEngine:
         )
         if self._board is not None:
             tools += TASK_TOOLS
+        if self._announcer is not None:
+            tools += SYSTEM_TOOLS
         return {
             "type": "realtime",
             "instructions": instructions,
@@ -674,6 +698,8 @@ class RealtimeEngine:
                 result_text, is_error = self._execute_memory(call_name, args)
             elif call_name in _TASK_TOOL_NAMES:
                 result_text, is_error = await self._execute_task_tool(call_name, args)
+            elif call_name in _SYSTEM_TOOL_NAMES:
+                result_text, is_error = self._execute_system_tool(call_name, args)
             else:
                 result_text, is_error = await self._executor.execute(call_name, args)
             tool_hook = getattr(self, "_ui_tool_hook", None)
@@ -797,6 +823,39 @@ class RealtimeEngine:
         if getattr(board, "restart_requested", False):
             board.restart_requested = False
             self.restart_requested = True
+
+    def _execute_system_tool(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
+        if name != "announcement_history" or self._announcer is None:
+            return f"unknown system tool {name}", True
+        spec = str(args.get("since", "today") or "today").strip().lower()
+        now = time.time()
+        local_now = datetime.fromtimestamp(now).astimezone()
+        midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        if spec == "today":
+            since, until = midnight.timestamp(), None
+        elif spec == "yesterday":
+            since, until = (midnight - timedelta(days=1)).timestamp(), midnight.timestamp()
+        else:
+            try:
+                since, until = now - float(spec) * 3600, None
+            except ValueError:
+                return "since must be today, yesterday, or a number of hours", True
+        rows = [
+            r for r in self._announcer.history(since)
+            if until is None or (r.get("delivered") or 0) < until
+        ]
+        if not rows:
+            return "I haven't announced anything in that window", False
+        return json.dumps(
+            [
+                {
+                    "when": datetime.fromtimestamp(r["delivered"]).astimezone().strftime("%a %I:%M %p").lstrip("0"),
+                    "kind": r.get("kind", ""),
+                    "said": r["text"][:240],
+                }
+                for r in rows[-20:]
+            ]
+        ), False
 
     def _execute_memory(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
         if self._memory is None:

@@ -814,23 +814,32 @@ class TaskBoard:
         if not words:
             return "give me a word or two to search for"
         now = self._now()
-        hits = []
+        scored: list[tuple[float, Task]] = []
         for task in self.tasks():
-            haystack = " ".join(
-                [task.title, task.spec, task.state]
+            title = task.title.lower()
+            body = " ".join(
+                [task.spec, task.state]
                 + [it.summary + " " + it.feedback for it in task.iterations]
                 + [str(h.get("detail", "")) for h in task.history]
             ).lower()
-            if all(w in haystack for w in words):
-                hits.append(self._row(task, now))
-        return json.dumps(hits[:10]) if hits else "no past tasks match that"
+            if not all(w in title or w in body for w in words):
+                continue
+            # title hits outrank body hits; ties go to the more recent task
+            score = sum(3.0 if w in title else 1.0 for w in words)
+            if all(w in title for w in words):
+                score += 2.0
+            scored.append((score + task.updated / 1e12, task))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        hits = [self._row(task, now) for _, task in scored[:10]]
+        return json.dumps(hits) if hits else "no past tasks match that"
 
     def status_line(self) -> str:
         open_tasks = [t for t in self.tasks() if not t.closed][:_STATUS_LINE_LIMIT]
         if not open_tasks:
             return "none open"
         now = self._now()
-        parts = []
+        waiting = sum(1 for t in self._tasks.values() if t.state in ("built", "staged"))
+        parts = [f"{waiting} awaiting your approval"] if waiting else []
         for t in open_tasks:
             where = f" in {t.repo}" if t.repo else ""
             if t.state == "building":

@@ -75,6 +75,33 @@ none of the pipeline.
 | 10 | **Learning Loop** — session-end reflection distills lessons (auto-applied), observations (consent-gated), and a journal; she gets smarter from every conversation | ⏳ testing |
 | 11 | **Always On** — starts at Windows logon (headless), watchdog restarts on crash, logs to file; plus endgame Stage 1: she inspects her own repo and discusses her roadmap | ⏳ testing |
 
+## The self-improvement loop (runbook)
+
+She develops herself by voice. Everything below is one conversation away.
+
+| You say | What happens |
+| --- | --- |
+| "I want you to be able to ..." | She talks it through, writes a spec (`data/specs/`, committed to the branch as `docs/tasks/<slug>.md`), reads the gist back, and starts an **Opus** coding agent on a sandboxed worktree after your explicit yes. |
+| *(later, on her own)* | "Progress on task 7: tests are passing." … "Task 7 is built and ready for your test. Say 'switch to task seven' to try it." |
+| "Switch to task seven" | She restarts **into that branch** (`data/active_checkout.json` tells the watchdog which checkout to run; `.env`, `data/`, `logs/` stay on main via `ALEXA_HOME`). Free and reversible: "go back to main", "switch to task four". |
+| "It should only do that once a day" | `revise_task`: the feedback is recorded in the spec and handed to the **same** agent, which resumes with its context. She announces the revision; switch again. |
+| "Ship it" | `approve_task`: lint + tests + clean-main gates, `merge --no-ff`, push, `uv sync` on main, restart onto main. |
+| "What's in flight?" / "What did you finish today?" / "Did we ever build X?" | `list_tasks` / `search_tasks` / `task_detail`. |
+| "What did you tell me this morning?" | `announcement_history`. |
+
+Safety nets: a staged build that crashes twice in two minutes is rolled back to
+main by the watchdog (`active_checkout.failed.json`) and she says so; builds run
+in their own hidden console with logs in `logs/tasks/` and survive her restarts
+(the board re-attaches at startup); a build that dies after starting is resumed
+once; approvals need your spoken yes every time. Quiet hours
+(`ANNOUNCE_QUIET_HOURS`) hold normal announcements for morning; alarms and
+rollbacks are urgent and bypass them.
+
+Engineering rule learned the hard way: she runs windowless, so every subprocess
+must pass `CREATE_NO_WINDOW` and never `DETACHED_PROCESS` — otherwise Windows
+opens a visible empty terminal per child. Run dev commands from a shell that
+has a console.
+
 ## Always-On runbook
 
 ```powershell
