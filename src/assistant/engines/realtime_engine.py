@@ -149,12 +149,14 @@ switches to it again. When a task NEEDS YOUR INPUT (state needs_input: the \
 agent stopped on a decision only {owner} can make, and you announced the \
 question), tell him the question, then send his decision with answer_task, \
 restated precisely; he can also answer from his phone. (3) When {owner} \
-approves — his explicit yes — approve_task merges it (gates run lint and \
-tests first) and you restart onto main; after coming back try the new \
-capability and report honestly. ONE yes can cover several tasks: "merge \
-them all" / "approve everything" → say the built tasks back by id and title \
-in one breath, get one yes, then approve_task with ids (or all=true) ONCE — \
-never ask again per task. If it is hopeless, abandon_task. Board questions ("what's in \
+approves — his explicit yes — approve_task starts the merge IN THE \
+BACKGROUND (gates run lint and tests first; a minute or two) and returns at \
+once: say it's underway and carry on. You will ANNOUNCE the result when it \
+lands and restart onto main by yourself — never promise to report back \
+within this conversation, never poll. ONE yes can cover several tasks: \
+"merge them all" / "approve everything" → say the built tasks back by id and \
+title in one breath, get one yes, then approve_task with ids (or all=true) \
+ONCE — never ask again per task. If it is hopeless, abandon_task. Board questions ("what's in \
 flight?", "what did you finish today?", "did we ever build X?") go through \
 list_tasks, task_detail, and search_tasks — never memory. One feature per \
 task; tasks persist across days and restarts. Open tasks right now: {tasks}. \
@@ -885,9 +887,11 @@ TASK_TOOLS: list[dict[str, Any]] = [
             "push — one task (id), several at once (ids), or every built one "
             "(all=true, for 'merge them all'). ONE explicit yes covers the "
             "whole list: read the ids and titles back in one breath, get his "
-            "yes, then call this once. Each task reports separately; a "
-            "failure never stops the others. Then offer restart_self so it "
-            "takes effect. Cloud tasks need branch=<the exact remote branch>."
+            "yes, then call this once. Returns AT ONCE: the merge runs in the "
+            "background (the gates take a minute or two) and you will ANNOUNCE "
+            "each result when it lands and restart onto main — so say it's "
+            "underway and move on; never poll, never promise to report back "
+            "in this conversation. Cloud tasks need branch=<the exact remote branch>."
         ),
         "parameters": {
             "type": "object",
@@ -1459,12 +1463,7 @@ class RealtimeEngine:
                     refs = [args.get("id")]
                 else:
                     return "approve_task needs an id, ids, or all=true", True
-                if len(refs) == 1:
-                    text = await board.approve(refs[0], branch=branch)
-                else:
-                    text = await board.approve_many(refs, branch=branch)
-                self._absorb_restart(board)
-                return text, False
+                return board.approve_in_background(refs, branch=branch), False
             if name == "abandon_task":
                 if (blocked := needs_yes("abandoning it")) is not None:
                     return blocked
@@ -1935,6 +1934,7 @@ class RealtimeEngine:
                     self.voice_note = None
 
             announcing: list[int] = []  # announcement ids being spoken now
+            tool_busy = False  # a tool call is running: the idle clock stops meanwhile
             announcing_opener = False  # ...and they opened this session (nobody spoke)
             waits_for_reply = False  # ...and they ask him something (question / arrival)
             opener_ids: list[int] = []  # everything spoken as an opener: read only if he replies
@@ -2071,6 +2071,7 @@ class RealtimeEngine:
                 nonlocal speaking, response_active, closing, last_activity
                 nonlocal speech_segments, command_pending, quick_close_armed
                 nonlocal quick_close_window, quick_close_reason, announcing, announcing_opener
+                nonlocal tool_busy
                 heard = ""  # live accumulation of the user's words
                 while True:
                     event = await connection.recv()
@@ -2121,7 +2122,14 @@ class RealtimeEngine:
                             self._cues.end(speaker)
                     elif kind == "response.done":
                         response_active = False
-                        closing = await self._handle_response_done(connection, event, stats)
+                        # A tool may take a while (a uv sync, a git operation):
+                        # the idle watchdog must not close the session under it.
+                        tool_busy = True
+                        try:
+                            closing = await self._handle_response_done(connection, event, stats)
+                        finally:
+                            tool_busy = False
+                            last_activity = time.monotonic()
                         announced_now = bool(announcing)
                         if announced_now:
                             if self._announcer is not None:
@@ -2178,6 +2186,8 @@ class RealtimeEngine:
             async def idle_watchdog() -> None:
                 while True:
                     await asyncio.sleep(0.5)
+                    if tool_busy:
+                        continue  # a tool call is running: no injection, no closing
                     quiet = time.monotonic() - last_activity
                     if (
                         self._announcer is not None

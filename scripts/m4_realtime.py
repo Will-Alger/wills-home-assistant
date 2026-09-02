@@ -257,6 +257,9 @@ def build_engine(fake: bool):
         # the runner exits after this cycle; the watchdog brings her back
         engine.restart_requested = True
 
+    if board is not None:
+        board.on_restart = request_restart  # a background merge landed: restart when idle
+
     panel = SettingsPanel(
         status,
         overrides,

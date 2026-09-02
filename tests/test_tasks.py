@@ -261,6 +261,41 @@ async def test_one_yes_merges_several_and_reports_each(tmp_path: Path) -> None:
     assert is_error and "needs an id" in text
 
 
+async def test_voice_approve_runs_in_the_background_and_announces(tmp_path: Path) -> None:
+    from assistant.engines.realtime_engine import RealtimeEngine
+    from assistant.home.fake import FakeHome
+    from assistant.tasks import Iteration
+
+    repo = make_repo(tmp_path)
+    board, announcer = make_board(repo)
+    task = board.draft("Ping response", "say pong")
+    await board.start(task.id)
+    await wait_state(board, task.id)
+    (Path(task.worktree) / "PONG.md").write_text("pong", encoding="utf-8")
+    await board._runner.commit_all(Path(task.worktree), "pong")
+    stuck = board.draft("Stuck", "y")
+    stuck.state = "needs_input"
+    stuck.iterations.append(Iteration(n=1, status="done", question="which room?"))
+    board._save()
+    restarts: list[int] = []
+    board.on_restart = lambda: restarts.append(1)
+
+    engine = RealtimeEngine(api_key="k", model="m", voice="v", home=FakeHome(), owner="Will", task_board=board)
+    text, is_error = await engine._execute_task_tool(
+        "approve_task", {"ids": [task.id, stuck.id], "confirmed": True}
+    )
+    assert not is_error and text.startswith("merging task 1 ('Ping response'), task 2 ('Stuck') in the background")
+    assert board.get(task.id).state == "built"  # returned at once; the gates are still running
+    async with asyncio.timeout(30):
+        await asyncio.gather(*board._bg)
+    assert board.get(task.id).state == "merged" and (repo / "PONG.md").exists()
+    texts = [a.text for a in announcer.pending()]
+    assert any(t.startswith("Task 1, 'Ping response' is merged into main.") for t in texts)
+    assert any(t.startswith("Task 2, 'Stuck' could not be merged: task 2 is needs_input") for t in texts)
+    assert all(a.priority == "urgent" for a in announcer.pending())
+    assert restarts == [1] and not board.restart_requested
+
+
 async def test_a_second_approve_while_one_is_merging_is_refused(tmp_path: Path) -> None:
     repo = make_repo(tmp_path)
     board, _ = make_board(repo)

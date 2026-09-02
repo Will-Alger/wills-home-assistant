@@ -143,6 +143,25 @@ async def test_arrival_batch_leads_with_a_welcome_and_waits(tmp_path: Path) -> N
     assert announcer.get(1).state == "spoken"  # the news still awaits his acknowledgement
 
 
+async def test_a_slow_tool_call_does_not_get_idled_out(tmp_path: Path, monkeypatch) -> None:
+    """The merge gates take minutes; the idle watchdog used to close the
+    session under them and cancel the merge half-way."""
+    announcer = Announcer(tmp_path / "a.json")
+    announcer.enqueue("Task 9 is built.", ref="task:9:1:built")
+    engine, _client = make_engine(announcer, idle_timeout_s=0.3)
+    finished: list[float] = []
+
+    async def slow_tool(connection, event, stats):
+        await asyncio.sleep(0.9)  # three idle timeouts long
+        finished.append(asyncio.get_running_loop().time())
+        return False
+
+    monkeypatch.setattr(engine, "_handle_response_done", slow_tool)
+    stats = await engine.run_conversation(NeverMic(), InstantSpeaker(), None, QuietUi(), announce=True)
+    assert finished, "the tool call was cancelled by the idle watchdog"
+    assert stats.ended_by == "announcement delivered"  # not "idle timeout"
+
+
 async def test_mid_session_injection_is_read_at_once(tmp_path: Path, monkeypatch) -> None:
     from assistant.engines import realtime_engine as mod
 

@@ -221,6 +221,7 @@ class TaskBoard:
         self._uv_exe = uv_exe
         self._resume_delay_s = resume_delay_s  # Max window: wait, then resume once
         self.restart_requested = False  # a switch/approve/abandon wants a restart
+        self.on_restart: Callable[[], None] | None = None  # the app: restart when idle
         self._path = root / "data" / "tasks.json"
         self._next_id = 1
         self._tasks: dict[int, Task] = {}
@@ -753,6 +754,62 @@ class TaskBoard:
     async def approve(self, ref: Any, branch: str = "") -> str:
         async with self._guard(ref, "merged"):
             return await self._approve(ref, branch)
+
+    def approve_in_background(self, refs: list[Any], branch: str = "") -> str:
+        """The voice path: the gates take a minute or two, far longer than a
+        session should sit silent, so the merge runs as a background task and
+        each result comes back as an announcement (spoken mid-conversation if
+        one is open, else at the next idle moment). A successful merge asks
+        the app to restart onto main when it is next idle."""
+        refs = list(refs)
+        names = []
+        for ref in refs:
+            try:
+                task = self.get(ref)
+                names.append(f"task {task.id} ('{task.title}')")
+            except DispatchError:
+                names.append(f"task {ref}")
+        self._bg.append(asyncio.create_task(self._approve_and_announce(refs, branch)))
+        return (
+            f"merging {', '.join(names)} in the background — the gates take a minute or two; "
+            "say it's underway and carry on. You will ANNOUNCE each result when it lands "
+            "and restart onto main by yourself; do not poll or promise to report back now."
+        )
+
+    async def _approve_and_announce(self, refs: list[Any], branch: str) -> None:
+        merged_any = False
+        for ref in refs:
+            task = None
+            try:
+                task = self.get(ref)
+                message = await self.approve(ref, branch=branch)
+            except Exception as err:  # noqa: BLE001 — the owner hears about it either way
+                message = str(err) or type(err).__name__
+            label = f"Task {ref}" if task is None else f"Task {task.id}, '{task.title}'"
+            if task is not None and task.state == "merged":
+                merged_any = True
+                self._announce(
+                    f"{label} is merged into main. I'll restart onto it as soon as we're done talking.",
+                    kind="task",
+                    ref=f"task:{task.id}:merged",
+                    priority="urgent",  # he asked for it minutes ago; never held for quiet hours
+                    context={"task_id": task.id},
+                )
+                continue
+            gist = " ".join(str(message).split())[:220]
+            self._announce(
+                f"{label} could not be merged: {gist} Say 'try the merge again' "
+                + (f"or 'revise task {task.id}'." if task is not None else "when it's fixed."),
+                kind="task",
+                ref=f"task:{ref}:merge-blocked:{int(self._now())}",
+                priority="urgent",
+                context={"task_id": task.id} if task is not None else {},
+            )
+        if merged_any:
+            self.restart_requested = False  # handled here, not by a tool result
+            if self.on_restart is not None:
+                with contextlib.suppress(Exception):
+                    self.on_restart()
 
     async def approve_many(self, refs: list[Any], branch: str = "") -> str:
         """One spoken yes, several merges, in order — each reports on its own
