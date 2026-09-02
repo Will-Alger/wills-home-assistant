@@ -223,6 +223,44 @@ async def test_a_build_left_running_is_reconciled_at_startup(tmp_path: Path) -> 
     assert any(h["event"] == "restart" for h in task.history)
 
 
+async def test_one_yes_merges_several_and_reports_each(tmp_path: Path) -> None:
+    from assistant.engines.realtime_engine import RealtimeEngine
+    from assistant.home.fake import FakeHome
+    from assistant.tasks import Iteration
+
+    repo = make_repo(tmp_path)
+    board, _ = make_board(repo)
+    built: list[int] = []
+    for name in ("One", "Two"):
+        task = board.draft(name, "x")
+        await board.start(task.id)
+        await wait_state(board, task.id)
+        (Path(task.worktree) / f"{name}.md").write_text(name, encoding="utf-8")
+        await board._runner.commit_all(Path(task.worktree), name)
+        built.append(task.id)
+    stuck = board.draft("Stuck", "y")
+    stuck.state = "needs_input"
+    stuck.iterations.append(Iteration(n=1, status="done", question="which room?"))
+    board._save()
+
+    report = await board.approve_many([*built, stuck.id])
+    lines = report.splitlines()
+    assert lines[0].startswith("2 of 3 merged.")
+    assert lines[1].startswith("task 1 ('One'): merged alexa/1-one")
+    assert lines[2].startswith("task 2 ('Two'): merged alexa/2-two")
+    assert lines[3].startswith("task 3: not merged: task 3 is needs_input")
+    assert (repo / "One.md").exists() and (repo / "Two.md").exists()
+    assert board.get(1).state == "merged" and board.get(2).state == "merged"
+
+    engine = RealtimeEngine(api_key="k", model="m", voice="v", home=FakeHome(), owner="Will", task_board=board)
+    text, is_error = await engine._execute_task_tool("approve_task", {"all": True, "confirmed": True})
+    assert is_error and "nothing is built" in text
+    text, is_error = await engine._execute_task_tool("approve_task", {"ids": [1], "confirmed": False})
+    assert is_error and "explicit" in text
+    text, is_error = await engine._execute_task_tool("approve_task", {"confirmed": True})
+    assert is_error and "needs an id" in text
+
+
 async def test_a_second_approve_while_one_is_merging_is_refused(tmp_path: Path) -> None:
     repo = make_repo(tmp_path)
     board, _ = make_board(repo)

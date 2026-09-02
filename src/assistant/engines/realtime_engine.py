@@ -149,9 +149,12 @@ switches to it again. When a task NEEDS YOUR INPUT (state needs_input: the \
 agent stopped on a decision only {owner} can make, and you announced the \
 question), tell him the question, then send his decision with answer_task, \
 restated precisely; he can also answer from his phone. (3) When {owner} \
-approves — his explicit yes for THIS task — approve_task merges it (gates \
-run lint and tests first) and you restart onto main; after coming back try \
-the new capability and report honestly. If it is hopeless, abandon_task. Board questions ("what's in \
+approves — his explicit yes — approve_task merges it (gates run lint and \
+tests first) and you restart onto main; after coming back try the new \
+capability and report honestly. ONE yes can cover several tasks: "merge \
+them all" / "approve everything" → say the built tasks back by id and title \
+in one breath, get one yes, then approve_task with ids (or all=true) ONCE — \
+never ask again per task. If it is hopeless, abandon_task. Board questions ("what's in \
 flight?", "what did you finish today?", "did we ever build X?") go through \
 list_tasks, task_detail, and search_tasks — never memory. One feature per \
 task; tasks persist across days and restarts. Open tasks right now: {tasks}. \
@@ -878,23 +881,27 @@ TASK_TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "name": "approve_task",
         "description": (
-            "Promote a BUILT task to main: lint/tests/clean-main gates, merge, "
-            "push. ONLY after restating which task aloud and getting the "
-            "owner's explicit yes for this specific merge. Then offer "
-            "restart_self so it takes effect, and try the new capability. "
-            "Cloud tasks need branch=<the exact remote branch from their status>."
+            "Promote BUILT tasks to main: lint/tests/clean-main gates, merge, "
+            "push — one task (id), several at once (ids), or every built one "
+            "(all=true, for 'merge them all'). ONE explicit yes covers the "
+            "whole list: read the ids and titles back in one breath, get his "
+            "yes, then call this once. Each task reports separately; a "
+            "failure never stops the others. Then offer restart_self so it "
+            "takes effect. Cloud tasks need branch=<the exact remote branch>."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "id": {"type": "integer"},
+                "ids": {"type": "array", "items": {"type": "integer"}},
+                "all": {"type": "boolean", "description": "every task that is built or staged"},
                 "confirmed": {
                     "type": "boolean",
-                    "description": "true ONLY after the owner verbally approved merging this task",
+                    "description": "true ONLY after the owner verbally approved merging these",
                 },
                 "branch": {"type": "string"},
             },
-            "required": ["id", "confirmed"],
+            "required": ["confirmed"],
         },
     },
     {
@@ -1399,9 +1406,23 @@ class RealtimeEngine:
                 self._absorb_restart(board)
                 return text, False
             if name == "approve_task":
-                if (blocked := needs_yes("merging it")) is not None:
+                if (blocked := needs_yes("merging them")) is not None:
                     return blocked
-                text = await board.approve(args.get("id"), branch=str(args.get("branch", "") or ""))
+                branch = str(args.get("branch", "") or "")
+                if args.get("all"):
+                    refs: list[Any] = [t.id for t in board.tasks() if t.state in ("built", "staged")]
+                    if not refs:
+                        return "nothing is built and waiting for approval", True
+                elif args.get("ids"):
+                    refs = list(args.get("ids") or [])
+                elif args.get("id") is not None:
+                    refs = [args.get("id")]
+                else:
+                    return "approve_task needs an id, ids, or all=true", True
+                if len(refs) == 1:
+                    text = await board.approve(refs[0], branch=branch)
+                else:
+                    text = await board.approve_many(refs, branch=branch)
                 self._absorb_restart(board)
                 return text, False
             if name == "abandon_task":

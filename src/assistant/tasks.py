@@ -754,6 +754,31 @@ class TaskBoard:
         async with self._guard(ref, "merged"):
             return await self._approve(ref, branch)
 
+    async def approve_many(self, refs: list[Any], branch: str = "") -> str:
+        """One spoken yes, several merges, in order — each reports on its own
+        line and a failure never stops the rest. A restart, if any task asked
+        for one, is left armed for the caller to absorb once."""
+        lines: list[str] = []
+        merged = 0
+        for ref in refs:
+            try:
+                message = await self.approve(ref, branch=branch)
+                task = self.get(ref)
+                label = f"task {task.id} ('{task.title}')"
+                if task.state == "merged":
+                    merged += 1
+            except DispatchError as err:
+                message = f"not merged: {err}"
+                label = f"task {ref}"
+            except Exception as err:  # noqa: BLE001 — surfaced, never fatal to the batch
+                message = f"not merged: {type(err).__name__}: {err}"
+                label = f"task {ref}"
+            lines.append(f"{label}: {' '.join(str(message).split())}")  # one line per task
+        head = f"{merged} of {len(refs)} merged."
+        if self.restart_requested:
+            head += " A restart onto main is armed — say a brief goodbye and end the conversation."
+        return head + "\n" + "\n".join(lines)
+
     async def _approve(self, ref: Any, branch: str = "") -> str:
         task = self.get(ref)
         self._check(task, "approve")
