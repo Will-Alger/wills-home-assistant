@@ -41,6 +41,8 @@ from assistant.home.fake import FakeHome
 from assistant.learning import Reflector
 from assistant.llm.anthropic_provider import AnthropicProvider
 from assistant.memory import MemoryStore
+from assistant.routines import RoutineStore
+from assistant.scheduler import Scheduler
 from assistant.tasks import TaskBoard
 from assistant.wake.detector import WakeDetector
 from assistant.web import WebSearch
@@ -166,6 +168,8 @@ def build_engine(fake: bool):
         else None
     )
     watches = WatchStore(root / "data" / "watches.json")
+    routines = RoutineStore(root / "data" / "routines.json")
+    scheduler = Scheduler(root / "data" / "schedule.json", announcer=announcer)
     thinker = None
     if settings.use_claude_subscription:
         from assistant.llm.claude_cli import ClaudeCli
@@ -198,12 +202,16 @@ def build_engine(fake: bool):
         announcer=announcer,
         thinker=thinker,
         watches=watches,
+        scheduler=scheduler,
+        routines=routines,
         web=WebSearch(
             settings.openai_api_key,
             model=settings.web_search_model,
             context_size=settings.web_search_context,
         ),
     )
+    scheduler._executor = engine._executor  # scheduled actions run through her tools
+    engine.scheduler = scheduler
     engine.event_watcher = (
         None
         if fake
@@ -254,6 +262,8 @@ async def voice(fake: bool) -> int:
         console.print(f"[magenta]◈ running the STAGED build of task {staged}[/magenta]")
     watcher = getattr(engine, "event_watcher", None)
     watcher_task = asyncio.create_task(watcher.run()) if watcher is not None else None
+    scheduler = getattr(engine, "scheduler", None)
+    scheduler_task = asyncio.create_task(scheduler.run()) if scheduler is not None else None
     console.print("Loading wake model...")
     wake = WakeDetector(settings.wake_model, threshold=settings.wake_threshold)
     session_wake = WakeDetector(settings.wake_model, threshold=settings.wake_threshold)
@@ -280,6 +290,8 @@ async def voice(fake: bool) -> int:
                 return 0  # the always-on service relaunches us in seconds
     if watcher_task is not None:
         watcher_task.cancel()
+    if scheduler_task is not None:
+        scheduler_task.cancel()
     console.print(f"\n[dim]total: ${total_cost:.4f}[/dim]")
     return 0
 

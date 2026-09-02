@@ -379,14 +379,27 @@ _DENIED_SERVICES = frozenset(
 
 class ToolExecutor:
     def __init__(
-        self, home: HomeApi, calendar: CalendarApi | None = None, web: Any | None = None
+        self,
+        home: HomeApi,
+        calendar: CalendarApi | None = None,
+        web: Any | None = None,
+        routines: Any | None = None,
     ) -> None:
         self._web = web  # WebSearch, or None when no key is configured
+        self._routines = routines  # RoutineStore: deterministic defaults/overrides
+        self.last_routines: list[str] = []  # descriptions applied on the last call
         self._home = home
         self._calendar = calendar
 
     async def execute(self, name: str, tool_input: dict[str, Any]) -> tuple[str, bool]:
         """Returns (result_text, is_error)."""
+        self.last_routines = []
+        if self._routines is not None and isinstance(tool_input, dict):
+            try:
+                tool_input, applied = self._routines.apply(name, tool_input)
+                self.last_routines = [r.description for r in applied]
+            except Exception:  # noqa: BLE001 — a routine must never break a command
+                self.last_routines = []
         try:
             if name == "get_lights":
                 return json.dumps([_light_state_view(x) for x in await self._home.get_lights()]), False
