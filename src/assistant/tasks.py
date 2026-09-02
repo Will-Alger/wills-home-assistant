@@ -127,6 +127,7 @@ class Task:
     closed: bool = False
     last_error: str = ""
     cleanup_pending: bool = False
+    last_nudged: float | None = None  # "still want it?" for a build left waiting
 
     @property
     def current(self) -> Iteration | None:
@@ -966,6 +967,35 @@ class TaskBoard:
         scored.sort(key=lambda pair: pair[0], reverse=True)
         hits = [self._row(task, now) for _, task in scored[:10]]
         return json.dumps(hits) if hits else "no past tasks match that"
+
+    def nudges(self, *, after_s: float, every_s: float = 3 * 86400) -> list[Task]:
+        """Built or staged tasks nobody has touched for `after_s` get an
+        inbox-only "still want it?" — never spoken on its own, at most once
+        per `every_s` per task."""
+        now = self._now()
+        nudged: list[Task] = []
+        for task in self._tasks.values():
+            if task.closed or task.state not in ("built", "staged"):
+                continue
+            if now - task.updated < after_s:
+                continue
+            if task.last_nudged is not None and now - task.last_nudged < every_s:
+                continue
+            task.last_nudged = now
+            days = max(1, round((now - task.updated) / 86400))
+            self._announce(
+                f"Task {task.id}, '{task.title}', has been waiting {days} day{'s' if days != 1 else ''} — "
+                f"still want it? Say 'approve task {task.id}' or 'abandon task {task.id}'.",
+                kind="nudge",
+                ref=f"task:{task.id}:nudge:{int(now)}",
+                mode="inbox",
+                context={"task_id": task.id},
+                actions=["approve", "later"],
+            )
+            nudged.append(task)
+        if nudged:
+            self._save()
+        return nudged
 
     def status_line(self) -> str:
         open_tasks = [t for t in self.tasks() if not t.closed][:_STATUS_LINE_LIMIT]

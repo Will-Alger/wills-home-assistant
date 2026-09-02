@@ -74,6 +74,7 @@ none of the pipeline.
 | 9 | **Claude dispatch** — she commissions Claude Code on her own repo by voice: sandboxed worktree branches, background jobs, `check_work` progress, human review/merge at the keyboard | ⏳ Stages 1+2 live; Stage 3 (self-proposals) remains |
 | 10 | **Learning Loop** — session-end reflection distills lessons (auto-applied), observations (consent-gated), and a journal; she gets smarter from every conversation | ⏳ testing |
 | 11 | **Always On** — starts at Windows logon (headless), watchdog restarts on crash, logs to file; plus endgame Stage 1: she inspects her own repo and discusses her roadmap | ⏳ testing |
+| 12 | **Asynchronous communication** — notifications with read state ("what did I miss?"), presence-aware delivery and the arrival welcome, phone cards with buttons that act, agents that ask you questions, a journal, follow-ups by trigger, focus mode and delivery preferences | ⏳ testing (built 2026-09-02, see `docs/ASYNC-2026-09-02.md`) |
 
 ## The self-improvement loop (runbook)
 
@@ -87,7 +88,8 @@ She develops herself by voice. Everything below is one conversation away.
 | "It should only do that once a day" | `revise_task`: the feedback is recorded in the spec and handed to the **same** agent, which resumes with its context. She announces the revision; switch again. |
 | "Ship it" | `approve_task`: lint + tests + clean-main gates, `merge --no-ff`, push, `uv sync` on main, restart onto main. |
 | "What's in flight?" / "What did you finish today?" / "Did we ever build X?" | `list_tasks` / `search_tasks` / `task_detail`. |
-| "What did you tell me this morning?" | `announcement_history`. |
+| *(the agent hits a decision only you can make)* | It writes a `QUESTION:` line and stops; she announces "task 7 needs your call: …" and waits for you. "Answer task 7: use the first name" → `answer_task` resumes the same agent. Or tap **Answer** on the phone card. |
+| "What did you tell me this morning?" | `list_notifications` (scope=all). |
 
 Safety nets: a staged build that crashes twice in two minutes is rolled back to
 main by the watchdog (`active_checkout.failed.json`) and she says so; builds run
@@ -101,6 +103,33 @@ Engineering rule learned the hard way: she runs windowless, so every subprocess
 must pass `CREATE_NO_WINDOW` and never `DETACHED_PROCESS` — otherwise Windows
 opens a visible empty terminal per child. Run dev commands from a shell that
 has a console.
+
+## Asynchronous communication (runbook)
+
+She keeps track of what she told you and whether you actually heard it.
+*Spoken* is not *read*: an announcement to an empty room stays unread, and
+read happens only when you reply, tap the phone card, or ask her to list
+them. Full detail and the voice-test phrases: `docs/ASYNC-2026-09-02.md`.
+
+| You say | What happens |
+| --- | --- |
+| *(you walk in)* | Presence (`PRESENCE_ENTITY`, the companion app's `person.*`) flips to home; ~90 s later, if anything was held for you: "Welcome back — while you were out…". Nothing is spoken to an empty house. |
+| "What's new?" / "What did I miss?" | `list_notifications` reads the unread ones out — that counts as heard. "What did you just say?" → the last one. "Mark that unread." |
+| *(you're away, a build finishes)* | A card on your phone: **Approve & merge** / **Later**. Approve runs the usual gates, merges, and restarts her; she confirms on the phone. Questions get an **Answer** box; "shall I lock up?" gets **Yes / No**. |
+| "What did you do while I was gone?" / "Did the porch light come on last night?" | `journal_search` over `data/journal/` — what she did and saw, by day. "What did we talk about this morning?" → `recent_conversations`. |
+| "When I get home remind me to…" / "when I leave…" / "next time we talk, ask me…" | `follow_up` by trigger (arrival, departure, next conversation, or a time). "What are you waiting on me for?" → `waiting_on`. |
+| "Lock up at 10 every night, but ask me first" | `schedule` with `confirm=true`: at 10 she asks; "yes" / the Yes button runs it. |
+| "I'm on a call for an hour" / "Stop pushing watch alerts to my phone" | `set_focus` / `set_notification_preference` — normal news waits, urgent things still come through (to the phone). |
+
+Setup: `PRESENCE_ENTITY=person.<you>` and `PHONE_NOTIFY_SERVICE=mobile_app_<phone>`
+in `.env` (both from the Home Assistant companion app; location permission
+"Always" for presence). A tap during a Home Assistant outage is lost — the
+card stays on the phone until she acts, so tap again. Audio caveat: Windows
+detaches a session's audio endpoints when that session is *disconnected*
+(Remote Desktop, "switch user"); she keeps running but cannot open the mic or
+speaker until you reconnect at the console — she retries with backoff (no
+beep loop) and falls back to a real microphone when the default is a
+Bluetooth headset.
 
 ## Always-On runbook
 

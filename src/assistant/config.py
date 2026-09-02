@@ -98,6 +98,7 @@ class Settings(BaseSettings):
     # calendar meeting in progress holds normal news.
     escalate_after_h: float = 4.0
     unread_expire_days: float = 3.0
+    nudge_after_days: float = 2.0
     focus_from_calendar: bool = True
     # Announcements (a build finished, a milestone, a rollback): she speaks up
     # on her own while idle. Normal ones wait out quiet hours ("23:00-08:00";

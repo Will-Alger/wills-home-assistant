@@ -209,7 +209,11 @@ only via list_notifications when he asks; listing them counts as him having \
 heard them, so never call it just to look. Never re-read what he has heard. \
 "What did you just say?" → list_notifications scope=last. "What did you \
 tell me this morning?" → scope=all with since. "Mark that unread" → \
-mark_notifications.
+mark_notifications. Delivery settings: {delivery}. "I'm on a call for an \
+hour" / "don't interrupt me until 3" → set_focus; "I'm done" → clear_focus; \
+"stop pushing watch alerts to my phone", "never announce scheduled actions, \
+just log them" → set_notification_preference (read it back first). "Door \
+events should always get through" is an URGENT watch, not a preference.
 
 Ending — two distinct modes, get this right: \
 (1) ONE-SHOT COMMAND: the speaker woke you and gave a single order (set \
@@ -640,6 +644,75 @@ FOLLOWUP_TOOLS: list[dict[str, Any]] = [
 ]
 _FOLLOWUP_TOOL_NAMES = {tool["name"] for tool in FOLLOWUP_TOOLS}
 
+DELIVERY_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "set_focus",
+        "description": (
+            "Hold normal news for a while ('I'm on a call for an hour', 'don't "
+            "interrupt me until 3'): nothing is spoken; urgent things (alarms, "
+            "timers, what he asked for) still come — to his phone."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "a call, dinner, focus time..."},
+                "minutes": {"type": "number"},
+            },
+            "required": ["name", "minutes"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "clear_focus",
+        "description": "End the focus early ('I'm done with the call').",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "set_notification_preference",
+        "description": (
+            "How a KIND of notification is delivered in a situation. kind: task, "
+            "question, watch, action, milestone, thought, system, followup, or * "
+            "for all. when=away: push | hold | inbox | journal; when=home: speak "
+            "| inbox | hold | journal; when=quiet (quiet hours): hold | speak | "
+            "journal. inbox = never spoken, listed when he asks; journal = "
+            "recorded only, never raised. 'Stop pushing watch alerts to my "
+            "phone' → watch, away, hold. 'Never announce scheduled actions, just "
+            "log them' → action, home, journal. Read it back first."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string"},
+                "when": {"type": "string", "enum": ["away", "home", "quiet"]},
+                "action": {"type": "string", "enum": ["push", "hold", "inbox", "journal", "speak"]},
+            },
+            "required": ["kind", "when", "action"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "clear_notification_preference",
+        "description": "Back to the default for a kind (and optionally one situation).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string"},
+                "when": {"type": "string", "enum": ["away", "home", "quiet"]},
+            },
+            "required": ["kind"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "list_notification_settings",
+        "description": "The current focus and notification preferences.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+]
+_DELIVERY_TOOL_NAMES = {tool["name"] for tool in DELIVERY_TOOLS}
+
 TASK_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -980,12 +1053,14 @@ class RealtimeEngine:
         sessions: Any | None = None,
         presence: Any | None = None,
         followups: Any | None = None,
+        delivery: Any | None = None,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
         self._journal = journal  # what she did and saw, by day
         self._sessions = sessions  # recent conversations, for continuity
         self._presence = presence  # is the owner home? (a wake session is proof)
         self._followups = followups  # things she promised to bring up later
+        self._delivery = delivery  # DeliverySettings: focus + per-kind preferences
         self._raised_followups: list[int] = []  # conversation follow-ups shown this session
         self._model = model
         self._voice = voice  # may be swapped to FALLBACK_VOICE during _configure
@@ -1058,6 +1133,7 @@ class RealtimeEngine:
             recent=self._sessions.recent_text() if self._sessions is not None else "none",
             presence=self._presence.describe() if self._presence is not None else "(not tracked)",
             followups=self._followups.text() if self._followups is not None else "none",
+            delivery=self._delivery.text() if self._delivery is not None else "defaults",
             extra=extra,
         )
         audio_in: dict[str, Any] = {
@@ -1085,6 +1161,8 @@ class RealtimeEngine:
             tools += JOURNAL_TOOLS
         if self._followups is not None:
             tools += FOLLOWUP_TOOLS
+        if self._delivery is not None:
+            tools += DELIVERY_TOOLS
         return {
             "type": "realtime",
             "instructions": instructions,
@@ -1187,6 +1265,8 @@ class RealtimeEngine:
                 result_text, is_error = self._execute_schedule_tool(call_name, args)
             elif call_name in _FOLLOWUP_TOOL_NAMES:
                 result_text, is_error = self._execute_followup_tool(call_name, args)
+            elif call_name in _DELIVERY_TOOL_NAMES:
+                result_text, is_error = self._execute_delivery_tool(call_name, args)
             elif call_name in _ROUTINE_TOOL_NAMES:
                 result_text, is_error = self._execute_routine_tool(call_name, args)
             elif call_name in _WATCH_TOOL_NAMES:
@@ -1488,6 +1568,38 @@ class RealtimeEngine:
             return f"unknown follow-up tool {name}", True
         except (ValueError, TypeError) as err:
             return f"follow-up error: {err}", True
+
+    def _execute_delivery_tool(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
+        settings = self._delivery
+        if settings is None:
+            return "delivery settings aren't available right now", True
+        try:
+            if name == "set_focus":
+                minutes = float(args.get("minutes", 60) or 60)
+                focus = settings.set_focus(str(args.get("name", "") or "focus"), minutes)
+                self._instructions_stale = True
+                return (
+                    f"focus '{focus['name']}' for {minutes:.0f} minutes: normal news waits, "
+                    "urgent things go to the phone"
+                ), False
+            if name == "clear_focus":
+                cleared = settings.clear_focus()
+                self._instructions_stale = True
+                return ("focus cleared" if cleared else "no focus was set"), False
+            if name == "set_notification_preference":
+                kind, when, action = (str(args.get(k, "") or "") for k in ("kind", "when", "action"))
+                settings.set_preference(kind, when, action)
+                self._instructions_stale = True
+                return f"{kind} notifications while {when}: {action}", False
+            if name == "clear_notification_preference":
+                cleared = settings.clear_preference(str(args.get("kind", "")), args.get("when") or None)
+                self._instructions_stale = True
+                return ("back to the default" if cleared else "there was no preference for that"), False
+            if name == "list_notification_settings":
+                return json.dumps(settings.describe()), False
+            return f"unknown delivery tool {name}", True
+        except (ValueError, TypeError) as err:
+            return f"delivery error: {err}", True
 
     def _execute_routine_tool(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
         store = self._routines

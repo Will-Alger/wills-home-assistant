@@ -24,6 +24,11 @@ design notes: `docs/FEATURES.md` — it is the source of truth for scope.
   resumed later with the owner's feedback (a "Revision" section in the spec).
 - `src/assistant/announce.py` — she speaks up on her own when you finish or
   print a `MILESTONE:` line (max three), so keep those short and plain.
+  Blocked on a decision only the owner can make? Print ONE line starting
+  with `QUESTION:` (one plain sentence naming the options) and STOP — end
+  your reply. The task parks as `needs_input`; he answers by voice or from
+  his phone and you are resumed with the answer. Never guess on such a
+  decision; never ask what the spec already answers.
 
 ## Rules of the house
 

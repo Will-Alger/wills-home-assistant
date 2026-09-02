@@ -223,9 +223,11 @@ class Courier:
         journal: Any | None = None,
         settings: DeliverySettings | None = None,
         calendar: Any | None = None,
+        board: Any | None = None,
         owner: str = "the owner",
         escalate_after_s: float = 4 * 3600,
         unread_expire_s: float = 3 * 86400,
+        nudge_after_s: float = 2 * 86400,
         focus_from_calendar: bool = False,
         now: Callable[[], float] = time.time,
         log: Callable[[str], None] | None = None,
@@ -237,9 +239,11 @@ class Courier:
         self._journal = journal
         self._settings = settings
         self._calendar = calendar
+        self._board = board
         self._owner = owner
         self._escalate_after = escalate_after_s
         self._expire_after = unread_expire_s
+        self._nudge_after = nudge_after_s
         self._focus_from_calendar = focus_from_calendar
         self._now = now
         self._log = log or (lambda _m: None)
@@ -293,6 +297,9 @@ class Courier:
         if apply is not None:
             with contextlib.suppress(Exception):
                 apply(now)
+        if self._board is not None:
+            with contextlib.suppress(Exception):
+                self._board.nudges(after_s=self._nudge_after)
         for item in list(self._announcer.unread()):
             age = now - (item.delivered or item.created)
             if age > self._expire_after:
