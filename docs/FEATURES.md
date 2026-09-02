@@ -9,6 +9,40 @@ command execution — "that's where the strength comes into play for a custom
 solution; Alexa isn't conversational at all." Any tradeoff that makes it a
 better command box but a worse conversation partner is the wrong tradeoff.
 
+## Checkpoint 2026-09-02 — where things stand, what's on deck
+
+**Done:** the self-improvement loop (Phases 1–4: announcements, task board, staging +
+`switch_build`, revisions via `--resume`, detached builds that survive restarts), web
+search, Apple Music, calendar (read/create/delete), earcons, one-shot auto-close. She
+runs `main` via the watchdog. Board: task 1 (birth certificate) built and unmerged —
+the ideal `approve_task` test; task 5 (staging drill) built — the ideal `switch_build`
+test. **Not yet voice-tested by Will: Phases 2–4.** Quiet hours are disabled in `.env`
+for late-night development — restore `ANNOUNCE_QUIET_HOURS=23:00-08:00`.
+
+**On deck, in order:**
+0. Drive the loop end to end by voice with a real feature (greet-by-name, a timer):
+   draft → build → "switch to task N" → revise → "ship it". First real use will
+   surface friction no test can.
+1. Phase 5 polish: announcement history ("what did you tell me this morning?"), board
+   search ranking, cloud dispatch → watch-mode only, README/runbook, wake-time status
+   line mentions pending approvals.
+2. **Brain layer** (true-jarvis pattern): a `think(question)` tool → Opus via `claude -p`
+   (Max-billed) with memory + board context, answer injected mid-conversation after
+   "let me think about that". ~1 day now that injection exists; ideal first
+   self-commission.
+3. Event reactivity: HA event subscription → announcement queue ("when the door opens
+   after 11pm, tell me"); needs Eve Door/Motion sensors (Thread via the Apple TV).
+4. Satellites = Home Assistant Voice PE pucks + an audio-stream bridge (replaces the
+   Pi plan; a June-2026 project proved gpt-realtime on Voice PE).
+5. Longer arcs: music stopwatch verdict on Apple Music, playlist authoring, YouTube
+   deep-links, calendar RESCHEDULE (update tool), voice ID, Telegram/webhook front
+   door, HA MCP server eval, scoping her to a dedicated calendar for privacy.
+
+**Engineering rules learned the hard way (2026-09-02):** she runs windowless, so every
+subprocess must pass `CREATE_NO_WINDOW`; never `DETACHED_PROCESS` (it opens a visible
+terminal per child); run dev commands from a shell that has a console (PowerShell),
+not a console-less one; `tests/conftest.py` hides test subprocesses.
+
 ## Hardware reality (governs sequencing)
 
 **Now:** a USB microphone + the desktop and/or a laptop. Everything through
