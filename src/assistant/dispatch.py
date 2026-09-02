@@ -19,12 +19,14 @@ are cloud-only and can never be merged by voice; they end as branches/PRs.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 import time
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 
 def _is_own_repo(repo: str) -> bool:
@@ -68,6 +70,10 @@ Rules:
   clear message.
 - End your reply with a short plain-language summary of what you did, the
   state of tests, and anything the reviewer should look at.
+- Progress: when you reach a meaningful milestone (plan settled, core code
+  in place, tests passing, committed), write one line on its own starting
+  with `MILESTONE:` followed by one short plain sentence — at most three per
+  task. The owner hears these read aloud.
 """
 
 
@@ -100,6 +106,7 @@ class Job:
     session_url: str = ""  # cloud jobs: open/continue at this claude.ai/code URL
     repo: str = ""  # which repository the job targets ("" = the assistant's own)
     closed: bool = False  # owner considers it dealt with — hidden from reports
+    milestones: int = 0  # MILESTONE: lines announced so far
 
 
 class DispatchError(RuntimeError):
@@ -120,9 +127,19 @@ class Dispatcher:
         extra_routines: dict[str, dict] | None = None,
         cloud_status_cmd: str = "claude -p --cloud {session_id}",
         refresh_timeout_s: float = 180.0,
+        announcer: Any | None = None,
+        model: str = "",
+        effort: str = "",
     ) -> None:
         self._root = root
-        self._claude_cmd = claude_cmd
+        # the coding agent's model/effort ride on the command line (Opus by
+        # default from settings; the CLI default otherwise)
+        self._claude_cmd = (
+            claude_cmd
+            + (f" --model {model}" if model else "")
+            + (f" --effort {effort}" if effort else "")
+        )
+        self._announcer = announcer  # she speaks up when a job finishes
         self._timeout_s = timeout_s
         self._routine_id = routine_id
         self._routine_token = routine_token
@@ -322,6 +339,7 @@ class Dispatcher:
         finally:
             job.finished = time.time()
             self._save()
+            self._announce_outcome(job)
 
     def _ingest_event(self, job: Job, line: str) -> None:
         """Parse one stream-json line into live job state."""
@@ -339,6 +357,15 @@ class Dispatcher:
             texts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
             if any(texts):
                 job.last_activity = " ".join(texts)[-200:]
+                for raw_line in " \n".join(texts).splitlines():
+                    said = raw_line.strip()
+                    if said.upper().startswith("MILESTONE:") and job.milestones < 3:
+                        job.milestones += 1
+                        self._announce(
+                            f"Progress on '{job.title}': {said[10:].strip()}",
+                            kind="milestone",
+                            ref=f"job:{job.id}:milestone:{job.milestones}",
+                        )
                 self._save()
         elif kind == "result":
             job.summary = str(event.get("result", ""))[:2000]
@@ -347,6 +374,30 @@ class Dispatcher:
             job.finished = time.time()
             job.status = "failed" if event.get("is_error") else "done"
             self._save()  # persist atomically with the status flip (readers race us)
+
+    def _announce(self, text: str, *, kind: str, ref: str, priority: str = "normal") -> None:
+        if self._announcer is None:
+            return
+        with contextlib.suppress(Exception):  # an announcement must never break a job
+            self._announcer.enqueue(text, kind=kind, ref=ref, priority=priority)
+
+    def _announce_outcome(self, job: Job) -> None:
+        """Queue the spoken result of a finished job (idempotent per status)."""
+        if job.status == "done":
+            gist = job.summary.strip().split(". ")[0][:160]
+            text = (
+                f"'{job.title}' is built and ready for your test. "
+                + (f"The agent says: {gist}. " if gist else "")
+                + "When you're ready, ask me to check on that job, or to merge it."
+            )
+        elif job.status == "failed":
+            text = (
+                f"'{job.title}' stopped without finishing: {job.summary[:140]}. "
+                "Ask for its details when you want to look."
+            )
+        else:
+            return
+        self._announce(text, kind="task", ref=f"job:{job.id}:{job.status}")
 
     async def _cmd(self, cmd: list[str] | str, cwd: Path, timeout: float = 300.0) -> tuple[int, str]:
         if isinstance(cmd, str):
@@ -517,6 +568,7 @@ class Dispatcher:
         if line.upper().startswith("DONE"):
             job.status = "done"
             job.finished = job.finished or time.time()
+            self._announce_outcome(job)
         if line.upper().startswith(("DONE", "BLOCKED")):
             job.summary = line[:600]
         self._save()

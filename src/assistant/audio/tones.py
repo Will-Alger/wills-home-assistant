@@ -53,6 +53,8 @@ _RECIPES: dict[str, dict] = {
     "wake": {"notes": [659.3, 880.0]},
     "close": {"notes": [880.0, 659.3, 523.3], "amp": 0.26, "decay": 5.0, "ms_each": 420},
     "error": {"notes": [220.0, 185.0], "amp": 0.24, "decay": 9.0, "ms_each": 260},
+    # rising major triad, distinct from the wake fourth: she has news
+    "announce": {"notes": [523.3, 659.3, 784.0], "amp": 0.28},
 }
 
 

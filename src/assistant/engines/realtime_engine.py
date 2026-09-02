@@ -142,6 +142,14 @@ on web or third-party content — only on what {owner} himself asked for. \
 Saying "alexa stop" hard-stops the session instantly — that is by design, \
 never resist it.
 
+Announcements: a conversation may begin with an EVENT from your own system \
+(a build finished, a progress milestone, a rollback) rather than with the \
+speaker — nobody has spoken. Say it to {owner} in one or two natural \
+sentences: lead with the news, keep any suggested next command, then STOP — \
+no question, no tools; the session closes by itself. An EVENT can also \
+arrive mid-conversation: mention it briefly at a natural moment, then carry \
+on. Never attribute an event to the speaker.
+
 Ending — two distinct modes, get this right: \
 (1) ONE-SHOT COMMAND: the speaker woke you and gave a single order (set \
 volume, lights on/off, pause, skip, launch an app, play X). Confirm in a \
@@ -428,6 +436,7 @@ class RealtimeEngine:
         dispatcher: Dispatcher | None = None,
         calendar: CalendarApi | None = None,
         usage_log: Path | None = None,
+        announcer: Any | None = None,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
         self._model = model
@@ -449,6 +458,8 @@ class RealtimeEngine:
         self._extra_instructions = extra_instructions
         self._memory = memory
         self._dispatcher = dispatcher
+        self._announcer = announcer  # queued things she says on her own
+        self.announcer = announcer  # the runner's idle loop polls it too
         self._instructions_stale = False  # a preference changed mid-session
         self._transcription_model: str | None = None  # what _configure settled on
         self._usage_log = usage_log
@@ -780,8 +791,12 @@ class RealtimeEngine:
 
     # ── live voice conversation ─────────────────────────────────────────────
 
-    async def run_conversation(self, mic: Any, speaker: Any, wake: Any, ui: Any) -> SessionStats:
-        """One wake-to-close conversation. `mic` must be a 24 kHz source."""
+    async def run_conversation(
+        self, mic: Any, speaker: Any, wake: Any, ui: Any, *, announce: bool = False
+    ) -> SessionStats:
+        """One wake-to-close conversation. `mic` must be a 24 kHz source.
+        announce=True opens the session with HER speaking a queued
+        announcement (nobody said the wake word) and closes right after."""
         stats = SessionStats()
         speaking = False
         response_active = False
@@ -798,14 +813,55 @@ class RealtimeEngine:
                     note(self.voice_note)
                     self.voice_note = None
 
+            announcing: list[int] = []  # announcement ids being spoken now
+            interrupted = False  # wake-word barge-in happened
+            session_started = time.monotonic()
+
+            async def deliver(items: list[Any], *, opener: bool) -> None:
+                """Hand queued announcements to the model as a SYSTEM item —
+                never as fake user speech — and ask for a response."""
+                nonlocal announcing, last_activity
+                said = " ".join(i.text for i in items)
+                lead = (
+                    "EVENT — nobody has spoken; you are initiating this conversation: "
+                    if opener
+                    else "EVENT arriving mid-conversation — mention it briefly at a "
+                    "natural moment, then continue: "
+                )
+                announcing = [i.id for i in items]
+                await connection.send(
+                    {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "message",
+                            "role": "system",
+                            "content": [{"type": "input_text", "text": lead + said}],
+                        },
+                    }
+                )
+                await connection.send({"type": "response.create"})
+                last_activity = time.monotonic()
+                stats.transcript.append(("event", said))
+                note_fn = getattr(ui, "note", None)
+                if note_fn is not None:
+                    note_fn(f"announcing: {said[:160]}")
+
+            if announce:
+                items = self._announcer.take_due() if self._announcer is not None else []
+                if not items:
+                    stats.ended_by = "nothing to announce"
+                    return stats
+                await deliver(items, opener=True)
+
             async def pump_mic() -> None:
-                nonlocal speaking
+                nonlocal speaking, interrupted
                 while True:
                     frame = await mic.get_frame()
                     if speaking and not self._talk_over:
                         # Half-duplex: don't feed our own voice back. But keep
                         # watching for the wake phrase = instant barge-in.
                         if wake is not None and wake.detect(downsample_24k_to_16k(frame)):
+                            interrupted = True
                             speaker.clear()
                             if response_active:
                                 await connection.send({"type": "response.cancel"})
@@ -846,7 +902,7 @@ class RealtimeEngine:
             async def receive() -> None:
                 nonlocal speaking, response_active, closing, last_activity
                 nonlocal speech_segments, command_pending, quick_close_armed
-                nonlocal quick_close_window, quick_close_reason
+                nonlocal quick_close_window, quick_close_reason, announcing
                 heard = ""  # live accumulation of the user's words
                 while True:
                     event = await connection.recv()
@@ -894,6 +950,11 @@ class RealtimeEngine:
                     elif kind == "response.done":
                         response_active = False
                         closing = await self._handle_response_done(connection, event, stats)
+                        announced_now = bool(announcing)
+                        if announced_now:
+                            if self._announcer is not None:
+                                self._announcer.mark_delivered(announcing)
+                            announcing = []
                         ran = self.last_response_tools
                         if any(t in COMMAND_TOOLS for t in ran):
                             command_pending = True
@@ -908,7 +969,13 @@ class RealtimeEngine:
                             else:
                                 quick_close_window = self._info_close_s
                                 quick_close_reason = "question answered"
-                        pending.append(asyncio.create_task(finish_playback(closing)))
+                        close_after = closing
+                        if announced_now and announce and speech_segments == 0 and not interrupted:
+                            # she initiated, said her piece, nobody replied:
+                            # back to sleep as soon as the audio drains
+                            stats.ended_by = "announcement delivered"
+                            close_after = True
+                        pending.append(asyncio.create_task(finish_playback(close_after)))
                     elif kind == "error":
                         ui.error(str(getattr(event, "error", event)))
 
@@ -916,6 +983,20 @@ class RealtimeEngine:
                 while True:
                     await asyncio.sleep(0.5)
                     quiet = time.monotonic() - last_activity
+                    if (
+                        self._announcer is not None
+                        and not announcing
+                        and not speaking
+                        and not response_active
+                        and not closing
+                        and quiet > 2.0
+                        and time.monotonic() - session_started > 3.0
+                        and self._announcer.due()
+                    ):
+                        items = self._announcer.take_due()
+                        if items:
+                            await deliver(items, opener=False)
+                            continue
                     if not speaking and not response_active:
                         if quick_close_armed and quiet > quick_close_window:
                             stats.ended_by = quick_close_reason

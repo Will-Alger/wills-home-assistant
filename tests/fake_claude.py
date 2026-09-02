@@ -6,6 +6,7 @@ import sys
 sys.stdin.read()  # consume the prompt like the real CLI would
 print(json.dumps({"type": "system", "subtype": "init", "session_id": "sess-fake", "model": "claude-fake-1"}))
 print(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "working on the task now"}]}}))
+print(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "MILESTONE: tests are passing.\nMoving on to the commit."}]}}))
 print(
     json.dumps(
         {

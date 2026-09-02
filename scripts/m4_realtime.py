@@ -21,6 +21,8 @@ from pathlib import Path
 
 from rich.console import Console
 
+from assistant.announce import Announcer
+from assistant.app import wait_for_trigger
 from assistant.audio import tones
 from assistant.audio.mic import Microphone, describe_device
 from assistant.audio.speaker import Speaker
@@ -114,7 +116,13 @@ def build_engine(fake: bool):
     home = FakeHome() if fake else HomeAssistantClient(settings.ha_url, settings.ha_token)
     if not fake:
         settings.require("ha_url", "ha_token")
-    memory = MemoryStore(Path(__file__).resolve().parents[1] / "data" / "memory.json")
+    root = Path(__file__).resolve().parents[1]
+    memory = MemoryStore(root / "data" / "memory.json")
+    announcer = Announcer(
+        root / "data" / "announcements.json",
+        quiet_hours=settings.announce_quiet_hours,
+        max_attempts=settings.announce_max_attempts,
+    )
     calendar = build_calendar(settings, fake)
     reflector = None
     if settings.use_claude_subscription:
@@ -149,15 +157,19 @@ def build_engine(fake: bool):
         calendar=calendar,
         dispatcher=(
             Dispatcher(
-                Path(__file__).resolve().parents[1],
+                root,
                 routine_id=settings.claude_routine_id,
                 routine_token=settings.claude_routine_token,
-                extra_routines=load_extra_routines(Path(__file__).resolve().parents[1]),
+                extra_routines=load_extra_routines(root),
+                announcer=announcer,
+                model=settings.dispatch_model,
+                effort=settings.dispatch_effort,
             )
             if settings.use_claude_subscription
             else None
         ),
-        usage_log=Path(__file__).resolve().parents[1] / ".usage.jsonl",
+        usage_log=root / ".usage.jsonl",
+        announcer=announcer,
     )
     return settings, home, engine, reflector
 
@@ -223,13 +235,18 @@ async def voice(fake: bool) -> int:
 async def one_cycle(settings, engine, wake, session_wake, total_cost: float, reflector) -> float:
     """One idle→wake→conversation cycle; returns the updated running cost."""
     await asyncio.sleep(0.2)  # let PortAudio settle between 24k/16k stream switches
-    # IDLE: wake-gate on a 16 kHz mic (local, free, private)
-    async with Microphone(settings.audio_input_device) as mic16:
-        console.print("[dim]○ idle — say the wake phrase[/dim]")
-        while True:
-            if wake.detect(await mic16.get_frame()):
-                break
-    tones.play("wake")
+    announcer = getattr(engine, "announcer", None)
+    # Something to say already? Skip the mic and speak. Otherwise IDLE:
+    # wake-gate on a 16 kHz mic (local, free, private) while watching the
+    # announcement queue.
+    trigger = "announce" if announcer is not None and announcer.due() else ""
+    if not trigger:
+        async with Microphone(settings.audio_input_device) as mic16:
+            console.print("[dim]○ idle — say the wake phrase[/dim]")
+            trigger = await wait_for_trigger(mic16, wake, announcer)
+    announcing = trigger == "announce"
+    if not announcing:
+        tones.play("wake")
     # Session: 24 kHz mic + speaker, wake detector kept for barge-in
     session_wake.reset()
     async with (
@@ -240,9 +257,14 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
         ) as mic24,
         Speaker(REALTIME_RATE) as speaker,
     ):
-        console.print("[green]● connected — talk[/green]")
+        if announcing:
+            console.print("[cyan]◆ announcing[/cyan]")
+            with contextlib.suppress(Exception):
+                speaker.enqueue(tones.pcm("announce", REALTIME_RATE))
+        else:
+            console.print("[green]● connected — talk[/green]")
         stats = await engine.run_conversation(
-            mic24, speaker, session_wake, ConsoleUi(settings.assistant_name)
+            mic24, speaker, session_wake, ConsoleUi(settings.assistant_name), announce=announcing
         )
         # Goodbye chime through the SESSION speaker: a fresh sd.play stream
         # right after this one closes silently loses the race on Windows.
@@ -257,6 +279,8 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
         "idle timeout": "quiet too long — closed to stop the meter; say the wake word anytime",
         "end_conversation": "she wrapped up",
         "question answered": "question answered — closed after quiet",
+        "announcement delivered": "announced, back to sleep",
+        "nothing to announce": "announcement was already handled",
     }.get(stats.ended_by, stats.ended_by)
     console.print(
         f"[bold]conversation closed[/bold] ({reason}) · {stats.responses} replies · "

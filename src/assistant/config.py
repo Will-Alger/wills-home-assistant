@@ -51,6 +51,15 @@ class Settings(BaseSettings):
     # then paste the routine id (trig_...) and its bearer token here.
     claude_routine_id: str = ""
     claude_routine_token: str = ""
+    # Coding agents she commissions: which Claude model (alias) and effort.
+    dispatch_model: str = "opus"
+    dispatch_effort: str = ""
+    # Announcements (a build finished, a milestone, a rollback): she speaks up
+    # on her own while idle. Normal ones wait out quiet hours ("23:00-08:00";
+    # "" = never quiet); urgent ones don't. Each is retried with backoff up to
+    # this many times before it is dropped with a log line.
+    announce_quiet_hours: str = "23:00-08:00"
+    announce_max_attempts: int = 4
 
     # Milestone 2: LLM
     anthropic_api_key: str = ""

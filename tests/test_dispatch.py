@@ -52,7 +52,7 @@ async def test_full_job_lifecycle(tmp_path) -> None:
     assert "did the task" in job.summary
     assert job.session_id == "sess-fake"
     assert job.model == "claude-fake-1"
-    assert job.last_activity == "working on the task now"
+    assert "Moving on to the commit" in job.last_activity  # latest agent utterance
     assert (repo / "logs" / "jobs" / f"{job.id}.log").exists()
 
     report = json.loads(dispatcher.report())
