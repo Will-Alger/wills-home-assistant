@@ -163,7 +163,14 @@ Later: set_timer for countdowns ("20 minute timer"), set_alarm for work/\
 sleep alarms (read the time and days back; 'snooze' pushes one out), and \
 schedule for reminders or home actions at a time / after a delay / \
 repeating ("turn on the porch light at 6:30 every night" → kind=action, \
-tool=set_lights). All of these speak up on their own when due. Routines: \
+tool=set_lights; "lock up at 10 but ask me first" → confirm=true, and when \
+it asks, his yes/no → confirm_action). All of these speak up on their own \
+when due. follow_up is for things to bring up by TRIGGER: "when I get home \
+remind me to…" → arrival; "when I leave, remind me to lock up" → departure; \
+"next time we talk, ask me how the demo went" → next_conversation; "what are \
+you waiting on me for?" → waiting_on. Things you promised to bring up THIS \
+conversation — do it once, at a natural moment, then move on: {followups}. \
+Routines: \
 when {owner} states a standing rule about HOW to do things ("after 5pm use \
 warm orange", "TV volume should default to 65%"), add_routine it — read it \
 back first — rather than storing a preference; the engine then applies it \
@@ -496,8 +503,25 @@ SCHEDULE_TOOLS: list[dict[str, Any]] = [
                 "message": {"type": "string", "description": "what to say (reminders; optional for actions)"},
                 "tool": {"type": "string", "description": "actions: the home tool name, e.g. set_lights"},
                 "tool_input": {"type": "object", "description": "actions: that tool's input"},
+                "confirm": {
+                    "type": "boolean",
+                    "description": "actions: ask the owner first when it fires ('ask me first'; locks, doors, heat)",
+                },
             },
             "required": ["kind", "label"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "confirm_action",
+        "description": (
+            "The owner's yes or no to a scheduled action that asked first "
+            "('shall I lock up?'). id = the schedule id in the event text."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"id": {"type": "integer"}, "yes": {"type": "boolean"}},
+            "required": ["id", "yes"],
         },
     },
     {
@@ -566,6 +590,55 @@ ROUTINE_TOOLS: list[dict[str, Any]] = [
     },
 ]
 _ROUTINE_TOOL_NAMES = {tool["name"] for tool in ROUTINE_TOOLS}
+
+FOLLOWUP_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "follow_up",
+        "description": (
+            "Something to bring up LATER, by trigger: when=arrival ('when I get "
+            "home remind me to…'), departure ('when I leave, remind me to lock "
+            "up'), next_conversation ('next time we talk, ask me how the demo "
+            "went'), or time (at HH:MM or in_seconds). context = a few words "
+            "so you can say why. Entity-based 'tell me when X' is watch_for, "
+            "not this. Read it back before setting."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "what": {"type": "string", "description": "what to bring up, in the owner's words"},
+                "when": {"type": "string", "enum": ["time", "arrival", "departure", "next_conversation"]},
+                "at": {"type": "string", "description": "HH:MM local (when=time)"},
+                "in_seconds": {"type": "number", "description": "delay (when=time)"},
+                "context": {"type": "string"},
+            },
+            "required": ["what", "when"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "list_follow_ups",
+        "description": "The open follow-ups with ids and their triggers.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "cancel_follow_up",
+        "description": "Drop a follow-up by id.",
+        "parameters": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]},
+    },
+    {
+        "type": "function",
+        "name": "waiting_on",
+        "description": (
+            "Everything waiting on the owner: open follow-ups, tasks that need "
+            "his answer, unanswered questions, scheduled actions awaiting his "
+            "yes — 'what are you waiting on me for?'."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+]
+_FOLLOWUP_TOOL_NAMES = {tool["name"] for tool in FOLLOWUP_TOOLS}
 
 TASK_TOOLS: list[dict[str, Any]] = [
     {
@@ -906,11 +979,14 @@ class RealtimeEngine:
         journal: Any | None = None,
         sessions: Any | None = None,
         presence: Any | None = None,
+        followups: Any | None = None,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
         self._journal = journal  # what she did and saw, by day
         self._sessions = sessions  # recent conversations, for continuity
         self._presence = presence  # is the owner home? (a wake session is proof)
+        self._followups = followups  # things she promised to bring up later
+        self._raised_followups: list[int] = []  # conversation follow-ups shown this session
         self._model = model
         self._voice = voice  # may be swapped to FALLBACK_VOICE during _configure
         self.voice_note: str | None = None
@@ -956,6 +1032,8 @@ class RealtimeEngine:
             if extra_repos
             else ""
         )
+        if self._followups is not None:
+            self._raised_followups = [f.id for f in self._followups.for_conversation()]
         instructions = _INSTRUCTIONS.format(
             name=self._name,
             owner=self._owner,
@@ -979,6 +1057,7 @@ class RealtimeEngine:
             unread=self._announcer.unread_summary() if self._announcer is not None else "none",
             recent=self._sessions.recent_text() if self._sessions is not None else "none",
             presence=self._presence.describe() if self._presence is not None else "(not tracked)",
+            followups=self._followups.text() if self._followups is not None else "none",
             extra=extra,
         )
         audio_in: dict[str, Any] = {
@@ -1004,6 +1083,8 @@ class RealtimeEngine:
             tools += ROUTINE_TOOLS
         if self._journal is not None or self._sessions is not None:
             tools += JOURNAL_TOOLS
+        if self._followups is not None:
+            tools += FOLLOWUP_TOOLS
         return {
             "type": "realtime",
             "instructions": instructions,
@@ -1100,8 +1181,12 @@ class RealtimeEngine:
                 result_text, is_error = await self._execute_task_tool(call_name, args)
             elif call_name in _SYSTEM_TOOL_NAMES:
                 result_text, is_error = self._execute_system_tool(call_name, args)
+            elif call_name == "confirm_action":
+                result_text, is_error = await self._execute_confirm_action(args)
             elif call_name in _SCHEDULE_TOOL_NAMES:
                 result_text, is_error = self._execute_schedule_tool(call_name, args)
+            elif call_name in _FOLLOWUP_TOOL_NAMES:
+                result_text, is_error = self._execute_followup_tool(call_name, args)
             elif call_name in _ROUTINE_TOOL_NAMES:
                 result_text, is_error = self._execute_routine_tool(call_name, args)
             elif call_name in _WATCH_TOOL_NAMES:
@@ -1327,12 +1412,14 @@ class RealtimeEngine:
                     message=str(args.get("message", "") or ""),
                     action=action,
                     repeat=bool(args.get("repeat", False)),
+                    confirm=bool(args.get("confirm", False)),
                 )
                 nxt = sched.next_fire(item)
                 return (
                     f"{item.kind} {item.id} ('{item.label}') scheduled"
                     + (f" — next {spoken_time(nxt)}" if nxt else "")
                     + (", repeating" if item.recurring else "")
+                    + ("; it will ask first" if item.confirm else "")
                 ), False
             if name == "list_schedule":
                 rows = sched.describe()
@@ -1348,6 +1435,59 @@ class RealtimeEngine:
             return f"unknown schedule tool {name}", True
         except (ValueError, TypeError) as err:
             return f"schedule error: {err}", True
+
+    async def _execute_confirm_action(self, args: dict[str, Any]) -> tuple[str, bool]:
+        sched = self._scheduler
+        if sched is None:
+            return "scheduling isn't available right now", True
+        try:
+            text = await sched.confirm(int(args.get("id", 0)), bool(args.get("yes", False)))
+        except (ValueError, TypeError) as err:
+            return f"confirm error: {err}", True
+        return text, text.startswith("nothing is waiting")
+
+    def _execute_followup_tool(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
+        store = self._followups
+        if store is None:
+            return "follow-ups aren't available right now", True
+        try:
+            if name == "follow_up":
+                item = store.add(
+                    str(args.get("what", "")),
+                    trigger=str(args.get("when", "") or ""),
+                    at=str(args.get("at", "") or ""),
+                    in_seconds=args.get("in_seconds"),
+                    context=str(args.get("context", "") or ""),
+                )
+                return f"follow-up {item.id} set: '{item.what}' {store.when_text(item)}", False
+            if name == "list_follow_ups":
+                rows = store.describe()
+                return (json.dumps(rows) if rows else "no open follow-ups"), False
+            if name == "cancel_follow_up":
+                gone = store.cancel(int(args.get("id", 0)))
+                return (f"follow-up {gone.id} dropped" if gone else "no open follow-up with that id"), gone is None
+            if name == "waiting_on":
+                waiting: dict[str, Any] = {"follow_ups": store.describe()}
+                if self._board is not None:
+                    waiting["tasks_needing_answers"] = [
+                        {"id": t.id, "title": t.title, "question": t.question}
+                        for t in self._board.tasks()
+                        if t.state == "needs_input"
+                    ]
+                if self._announcer is not None:
+                    waiting["unanswered_questions"] = [
+                        self._announcer.to_row(a) for a in self._announcer.unread(kinds=["question"])
+                    ]
+                if self._scheduler is not None:
+                    waiting["awaiting_your_yes"] = [
+                        {"id": i.id, "label": i.label} for i in self._scheduler.awaiting_confirmation()
+                    ]
+                if not any(waiting.values()):
+                    return "nothing is waiting on you", False
+                return json.dumps(waiting), False
+            return f"unknown follow-up tool {name}", True
+        except (ValueError, TypeError) as err:
+            return f"follow-up error: {err}", True
 
     def _execute_routine_tool(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
         store = self._routines
@@ -1869,6 +2009,11 @@ class RealtimeEngine:
                 if stats.replied and opener_ids and self._announcer is not None:
                     # she opened with news and he answered: he heard it
                     self._announcer.mark_read(opener_ids)
+                if stats.replied and self._raised_followups and self._followups is not None:
+                    # a conversation happened: the follow-ups she was carrying are raised
+                    with contextlib.suppress(Exception):
+                        self._followups.mark_raised(self._raised_followups)
+                    self._raised_followups = []
             finally:
                 for task in [*tasks, *pending]:
                     task.cancel()

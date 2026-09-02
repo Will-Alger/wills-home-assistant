@@ -37,6 +37,7 @@ from assistant.engines.realtime_engine import (
     RealtimeEngine,
 )
 from assistant.events import EventWatcher, WatchStore
+from assistant.followups import FollowUpStore
 from assistant.home import HomeAssistantClient
 from assistant.home.fake import FakeHome
 from assistant.journal import Journal
@@ -244,6 +245,7 @@ def build_engine(fake: bool):
     watches = WatchStore(root / "data" / "watches.json")
     routines = RoutineStore(root / "data" / "routines.json")
     scheduler = Scheduler(root / "data" / "schedule.json", announcer=announcer, journal=journal)
+    followups = FollowUpStore(root / "data" / "followups.json", announcer=announcer, journal=journal)
     thinker = None
     if settings.use_claude_subscription:
         from assistant.llm.claude_cli import ClaudeCli
@@ -281,6 +283,7 @@ def build_engine(fake: bool):
         journal=journal,
         sessions=sessions,
         presence=presence,
+        followups=followups,
         web=WebSearch(
             settings.openai_api_key,
             model=settings.web_search_model,
@@ -322,6 +325,7 @@ def build_engine(fake: bool):
         announcer,
         presence=presence,
         pusher=pusher,
+        followups=followups,
         journal=journal,
         settings=delivery,
         calendar=calendar,

@@ -180,6 +180,52 @@ def test_schedule_and_routine_tools_by_voice(tmp_path: Path) -> None:
     assert "removed" in engine._execute_routine_tool("remove_routine", {"id": 1})[0]
 
 
+async def test_confirm_actions_ask_before_running(tmp_path: Path) -> None:
+    clock = Clock(wed(21, 59))
+    home = FakeHome()
+    announcer = Announcer(tmp_path / "a.json", now=clock)
+    sched = Scheduler(tmp_path / "schedule.json", announcer=announcer, executor=ToolExecutor(home), now=clock)
+    lock = sched.schedule(
+        kind="action", label="lock up", at="22:00", repeat=True, confirm=True,
+        action={"tool": "set_lights", "input": {"changes": [{"target": "Hallway", "turn": "off"}]}},
+    )
+    assert sched.describe()[0]["asks first"] is True
+    clock.at = wed(22, 0) + 1
+    (asked,) = await sched.tick()
+    assert asked == "It's 10:00 PM. Shall I lock up? Say yes or no."
+    assert home.applied == []  # nothing ran yet
+    (question,) = announcer.pending()
+    assert question.kind == "question" and question.actions == ["yes", "no"]
+    assert question.context == {"schedule_id": lock.id, "fired_at": clock.at}
+    assert sched.awaiting_confirmation() == [lock] and sched.describe()[0]["awaiting your yes"] is True
+
+    assert await sched.confirm(lock.id, True) == "Done: lock up."
+    assert home.applied and home.applied[0].entity_id == "light.hallway"
+    assert question.state == "resolved" and sched.awaiting_confirmation() == []
+    assert await sched.confirm(lock.id, True) == "nothing is waiting on a yes for that"  # idempotent
+    assert lock.active  # the nightly rule keeps going
+
+    clock.at = wed(22, 0, day=3) + 1
+    await sched.tick()
+    assert await sched.confirm(lock.id, False) == "Okay, skipping lock up."
+    assert len(home.applied) == 1
+
+    clock.at = wed(22, 0, day=4) + 1
+    await sched.tick()
+    clock.at += 1801  # he never answered: skipped quietly
+    await sched.tick()
+    assert sched.awaiting_confirmation() == [] and len(home.applied) == 1
+
+    engine = RealtimeEngine(api_key="k", model="m", voice="v", home=FakeHome(), owner="Will", scheduler=sched)
+    text, is_error = await engine._execute_confirm_action({"id": lock.id, "yes": True})
+    assert is_error and "nothing is waiting" in text
+    text, is_error = engine._execute_schedule_tool(
+        "schedule", {"kind": "action", "label": "heat on", "in_seconds": 60, "confirm": True,
+                     "tool": "set_lights", "tool_input": {"changes": []}}
+    )
+    assert not is_error and text.endswith("it will ask first")
+
+
 async def test_briefing_kind_speaks_the_composed_summary(tmp_path: Path) -> None:
     clock = Clock(wed(7, 25))
     announcer = Announcer(tmp_path / "a.json", quiet_hours="23:00-08:00", now=clock)

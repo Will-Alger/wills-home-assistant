@@ -353,6 +353,9 @@ class Courier:
         if self._presence is not None:
             with contextlib.suppress(Exception):
                 self._presence.tick(now)
+        if self._followups is not None:
+            with contextlib.suppress(Exception):
+                self._followups.tick(now)
         await self._push_due(now)
         if now - self._last_minute >= 60.0:
             self._last_minute = now

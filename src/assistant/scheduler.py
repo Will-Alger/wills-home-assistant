@@ -23,6 +23,7 @@ from typing import Any
 
 _DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 KINDS = ("timer", "alarm", "reminder", "action", "briefing")
+_CONFIRM_WINDOW_S = 1800.0  # an unanswered "shall I ...?" is skipped after this
 
 
 @dataclass
@@ -41,6 +42,8 @@ class Item:
     last_fired: float | None = None
     fired: int = 0
     created: float = field(default_factory=time.time)
+    confirm: bool = False  # actions: ask the owner before running
+    pending_confirm: float | None = None  # when it asked and is waiting on a yes
 
     @property
     def recurring(self) -> bool:
@@ -164,9 +167,11 @@ class Scheduler:
         message: str = "",
         action: dict[str, Any] | None = None,
         repeat: bool = False,
+        confirm: bool = False,
     ) -> Item:
         """A reminder (spoken) or an action (a home tool call) at a time or
-        after a delay, optionally repeating daily / on given days."""
+        after a delay, optionally repeating daily / on given days. An action
+        with confirm=True asks the owner first ("shall I lock up?")."""
         if kind not in ("reminder", "action", "briefing"):
             raise ValueError("kind must be reminder, action, or briefing")
         if kind == "action" and not (action and action.get("tool")):
@@ -193,6 +198,7 @@ class Scheduler:
             action=dict(action or {}),
             priority="urgent" if kind in ("reminder", "briefing") else "normal",
             created=self._now(),
+            confirm=bool(confirm) and kind == "action",
         )
         return self._add(item)
 
@@ -256,10 +262,15 @@ class Scheduler:
                     "repeats": (", ".join(item.days) if item.days else "every day") if item.recurring else "",
                     **({"says": item.message} if item.message else {}),
                     **({"does": item.action.get("tool")} if item.action else {}),
+                    **({"asks first": True} if item.confirm else {}),
+                    **({"awaiting your yes": True} if item.pending_confirm else {}),
                 }
             )
         rows.sort(key=lambda r: r["next"])
         return rows
+
+    def awaiting_confirmation(self) -> list[Item]:
+        return [i for i in self._items if i.pending_confirm is not None]
 
     # ── firing ─────────────────────────────────────────────────────────────
 
@@ -272,7 +283,17 @@ class Scheduler:
             if when is None or when > now:
                 continue
             said.append(await self._fire(item, now))
+        for item in self.awaiting_confirmation():
+            if now - (item.pending_confirm or now) > _CONFIRM_WINDOW_S:
+                item.pending_confirm = None  # he never answered: skip, quietly
+                self._save()
+                self._journal_write("schedule", f"skipped {item.label}: no answer", item)
         return said
+
+    def _journal_write(self, kind: str, text: str, item: Item) -> None:
+        if self._journal is not None:
+            with contextlib.suppress(Exception):
+                self._journal.write(kind, text, source=item.kind, data={"id": item.id})
 
     async def _fire(self, item: Item, now: float) -> str:
         item.fired += 1
@@ -280,6 +301,25 @@ class Scheduler:
         item.snoozed_until = None
         if not item.recurring:
             item.active = False
+        if item.kind == "action" and item.confirm:
+            # ask first; confirm() runs it (by voice or a phone tap)
+            item.pending_confirm = now
+            self._save()
+            clock = datetime.fromtimestamp(now).astimezone().strftime("%I:%M %p").lstrip("0")
+            text = f"It's {clock}. Shall I {item.label}? Say yes or no."
+            self._journal_write("schedule", f"asked before running {item.label}", item)
+            if self._announcer is not None:
+                with contextlib.suppress(Exception):
+                    self._announcer.enqueue(
+                        text,
+                        kind="question",
+                        ref=f"schedule:{item.id}:{int(now)}:confirm",
+                        priority=item.priority,
+                        expires_in_s=_CONFIRM_WINDOW_S,
+                        context={"schedule_id": item.id, "fired_at": now},
+                        actions=["yes", "no"],
+                    )
+            return text
         if item.kind == "timer":
             text = f"Your {item.label} is up." if item.label != "timer" else "Your timer is up."
         elif item.kind == "alarm":
@@ -294,9 +334,7 @@ class Scheduler:
         else:
             text = await self._run_action(item)
         self._save()
-        if self._journal is not None:
-            with contextlib.suppress(Exception):
-                self._journal.write("schedule", text, source=item.kind, data={"id": item.id})
+        self._journal_write("schedule", text, item)
         if self._announcer is not None:
             with contextlib.suppress(Exception):
                 self._announcer.enqueue(
@@ -316,6 +354,26 @@ class Scheduler:
         except Exception as err:  # noqa: BLE001 — a broken briefing still says something
             return f"Good morning. I couldn't put your briefing together: {str(err) or type(err).__name__}."
         return " ".join(str(text).split()) or "Good morning. Nothing on the books today."
+
+    async def confirm(self, item_id: int, yes: bool) -> str:
+        """The owner's answer to 'shall I ...?' — by voice or a phone tap.
+        Idempotent: a second answer finds nothing waiting."""
+        item = self.get(item_id)
+        if item is None or item.pending_confirm is None:
+            return "nothing is waiting on a yes for that"
+        fired = item.pending_confirm
+        item.pending_confirm = None
+        if self._announcer is not None:
+            with contextlib.suppress(Exception):
+                self._announcer.resolve(f"schedule:{item.id}:{int(fired)}:confirm")
+        if not yes:
+            self._save()
+            self._journal_write("schedule", f"declined: {item.label}", item)
+            return f"Okay, skipping {item.label}."
+        text = await self._run_action(item)
+        self._save()
+        self._journal_write("schedule", text, item)
+        return text
 
     async def _run_action(self, item: Item) -> str:
         tool = str(item.action.get("tool", ""))
