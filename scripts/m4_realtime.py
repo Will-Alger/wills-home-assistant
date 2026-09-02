@@ -314,17 +314,28 @@ async def voice(fake: bool) -> int:
         f"mic: {describe_device(settings.audio_input_device)} · "
         f"home: {'fake apartment' if fake else settings.ha_url} · Ctrl+C quits."
     )
+    failures = 0
     with contextlib.suppress(KeyboardInterrupt, asyncio.CancelledError):
         while True:
             try:
                 total_cost = await one_cycle(
                     settings, engine, wake, session_wake, total_cost, reflector
                 )
+                failures = 0
             except (KeyboardInterrupt, asyncio.CancelledError):
                 raise
             except Exception as err:  # noqa: BLE001 — the app must never die on its own
-                tones.play("error")
-                console.print(f"[red]recovered from: {err!r} — back to idle[/red]")
+                # Back off instead of spinning: a mic that won't open would
+                # otherwise retry (and beep) five times a second. One error
+                # tone per streak, then 5 s → 60 s between attempts.
+                failures += 1
+                if failures == 1:
+                    with contextlib.suppress(Exception):
+                        tones.play("error")
+                delay = min(5.0 * 2 ** (failures - 1), 60.0)
+                console.print(f"[red]recovered from: {err!r} — retrying in {delay:.0f}s[/red]")
+                await asyncio.sleep(delay)
+                continue
             if engine.restart_requested:
                 console.print("[yellow]self-restart requested — exiting for the watchdog[/yellow]")
                 return 0  # the always-on service relaunches us in seconds
@@ -346,6 +357,9 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
     trigger = "announce" if announcer is not None and announcer.due() else ""
     if not trigger:
         async with Microphone(settings.audio_input_device) as mic16:
+            if mic16.device_note and mic16.device_note != getattr(engine, "_mic_note", None):
+                engine._mic_note = mic16.device_note  # say it once per fallback, not per cycle
+                console.print(f"[yellow]{mic16.device_note}[/yellow]")
             console.print("[dim]○ idle — say the wake phrase[/dim]")
             trigger = await wait_for_trigger(mic16, wake, announcer)
     announcing = trigger == "announce"

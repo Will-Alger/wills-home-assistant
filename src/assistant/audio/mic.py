@@ -32,6 +32,35 @@ def describe_device(spec: str) -> str:
         return spec or "default"
 
 
+# Endpoints that are never the room microphone: a Bluetooth headset's
+# hands-free profile (Windows makes it the default input the moment a headset
+# connects, and it won't open), virtual/loopback inputs, line-ins.
+_NOT_A_MIC = ("headset", "hands-free", "steam", "stereo mix", "line in", "loopback")
+
+
+def input_candidates() -> list[int]:
+    """Input devices worth trying when the configured one will not open:
+    real microphones first (WASAPI before the others), then anything else
+    with an input channel that isn't a known non-microphone."""
+    try:
+        devices = sd.query_devices()
+        apis = [str(api.get("name", "")).lower() for api in sd.query_hostapis()]
+    except Exception:  # noqa: BLE001 — no PortAudio, no candidates
+        return []
+    wasapi = next((i for i, name in enumerate(apis) if "wasapi" in name), -1)
+    mics: list[tuple[int, int]] = []
+    rest: list[tuple[int, int]] = []
+    for index, dev in enumerate(devices):
+        if int(dev.get("max_input_channels", 0) or 0) <= 0:
+            continue
+        name = str(dev.get("name", "")).lower()
+        if any(word in name for word in _NOT_A_MIC):
+            continue
+        rank = 0 if dev.get("hostapi") == wasapi else 1
+        (mics if "mic" in name else rest).append((rank, index))
+    return [i for _, i in sorted(mics)] + [i for _, i in sorted(rest)]
+
+
 class Microphone:
     """Continuous capture; frames buffer in an asyncio queue (drops when full).
 
@@ -53,25 +82,45 @@ class Microphone:
         self._queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=queue_frames)
         self._stream: sd.RawInputStream | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self.device_note: str | None = None  # set when a fallback device was used
 
-    async def __aenter__(self) -> Self:
-        self._loop = asyncio.get_running_loop()
-
+    def _open(self, device: int | str | None) -> sd.RawInputStream:
         def callback(indata, _frames, _time, _status) -> None:  # PortAudio thread
             data = bytes(indata)
             assert self._loop is not None
             self._loop.call_soon_threadsafe(self._offer, data)
 
-        self._stream = sd.RawInputStream(
+        stream = sd.RawInputStream(
             samplerate=self._samplerate,
             blocksize=self._frame_samples,
             dtype="int16",
             channels=1,
-            device=self._device,
+            device=device,
             callback=callback,
         )
-        self._stream.start()
-        return self
+        stream.start()
+        return stream
+
+    async def __aenter__(self) -> Self:
+        self._loop = asyncio.get_running_loop()
+        try:
+            self._stream = self._open(self._device)
+            return self
+        except sd.PortAudioError as err:
+            # The configured/default input won't open (typical: a Bluetooth
+            # headset just became Windows' default input). Try real mics
+            # instead of looping on the error — she must keep hearing the room.
+            for index in input_candidates():
+                if index == self._device:
+                    continue
+                try:
+                    self._stream = self._open(index)
+                except sd.PortAudioError:
+                    continue
+                name = describe_device(str(index))
+                self.device_note = f"mic fallback: using '{name}' — the default input would not open ({err})"
+                return self
+            raise
 
     async def __aexit__(self, *exc_info: object) -> None:
         if self._stream is not None:
