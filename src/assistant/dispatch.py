@@ -168,6 +168,18 @@ message.
 
 
 @dataclass
+class GateRunner:
+    """How the merge gates run ruff and pytest on a checkout."""
+
+    prefix: list[str]  # [uv, "run"] or [python, "-m"]
+    env: dict[str, str] | None = None  # set on the fallback path only
+    note: str = ""  # "" behind uv; names the fallback otherwise, to be spoken
+
+    def command(self, *args: str) -> list[str]:
+        return [*self.prefix, *args]
+
+
+@dataclass
 class AgentRun:
     """Live state of one headless agent process."""
 
@@ -309,17 +321,21 @@ class Dispatcher:
         return code == 0
 
     async def _cmd(
-        self, cmd: list[str] | str, cwd: Path, timeout: float = 300.0
+        self,
+        cmd: list[str] | str,
+        cwd: Path,
+        timeout: float = 300.0,
+        env: dict[str, str] | None = None,
     ) -> tuple[int, str]:
         if isinstance(cmd, str):
             proc = await asyncio.create_subprocess_shell(
                 cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                creationflags=NO_WINDOW,
+                creationflags=NO_WINDOW, env=env,
             )
         else:
             proc = await asyncio.create_subprocess_exec(
                 *cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                creationflags=NO_WINDOW,
+                creationflags=NO_WINDOW, env=env,
             )
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -529,10 +545,8 @@ class Dispatcher:
         code, _ = await self._cmd([python, "-c", GATE_TOOLS_PROBE], cwd, timeout=60.0)
         return code == 0
 
-    async def resolve_gate_runner(
-        self, gates_dir: Path, uv_exe: str = ""
-    ) -> tuple[list[str], str]:
-        """The command prefix the merge gates run ruff and pytest behind.
+    async def resolve_gate_runner(self, gates_dir: Path, uv_exe: str = "") -> GateRunner:
+        """How to run ruff and pytest on a checkout.
 
         `uv run` first, found the way uv_sync finds it (UV_EXE, PATH, then the
         WinGet folder) — a bare "uv" in a shell fails whenever her service
@@ -540,18 +554,29 @@ class Dispatcher:
         error that had nothing to do with the branch. When uv is nowhere, fall
         back to an interpreter that already has both tools — the branch's own
         .venv, else the one she is running in — as `python -m ruff` /
-        `python -m pytest`. Returns (prefix, note): the note is empty on the uv
-        path and names the fallback otherwise, so she can say out loud how the
-        checks ran. Raises DispatchError when nothing here can run them."""
+        `python -m pytest`, with the branch's own `src` pinned on PYTHONPATH:
+        her interpreter's editable install points at MAIN's src, so without the
+        pin the gates would happily check code the branch never changed (the
+        same trick alexa_service uses to run a staged build). Raises
+        DispatchError when nothing here can run the checks at all."""
         uv = self.resolve_uv(uv_exe)
         if uv is not None:
-            return [uv, "run"], ""
+            return GateRunner([uv, "run"])
+        prior = os.environ.get("PYTHONPATH", "")
+        env = {
+            **os.environ,
+            "PYTHONPATH": str(gates_dir / "src") + (os.pathsep + prior if prior else ""),
+        }
         for python, where in (
             (self._venv_python(gates_dir), "the branch's own virtual environment"),
             (sys.executable, "her own Python"),
         ):
             if python and await self._runs_the_gate_tools(python, gates_dir):
-                return [python, "-m"], f"uv was not found, so the checks ran with {where}"
+                return GateRunner(
+                    [python, "-m"],
+                    env=env,
+                    note=f"uv was not found, so the checks ran with {where}",
+                )
         raise DispatchError(
             "the checks could not run at all: uv was not found on PATH, at UV_EXE, or in "
             "its WinGet folder, and no Python here has both ruff and pytest. Install uv "
@@ -573,14 +598,17 @@ class Dispatcher:
         note = ""  # how the checks ran, when it wasn't the usual `uv run`
         if (gates_dir / "pyproject.toml").exists():
             try:
-                prefix, note = await self.resolve_gate_runner(gates_dir, uv_exe)
+                gate = await self.resolve_gate_runner(gates_dir, uv_exe)
             except DispatchError as exc:
                 return False, f"merge blocked on {merge_ref}: {exc}"
+            note = gate.note
             for label, check in (
                 ("lint", ["ruff", "check", "src", "scripts", "tests"]),
                 ("tests", ["pytest", "-q"]),
             ):
-                code, out = await self._cmd(prefix + check, gates_dir, timeout=600.0)
+                code, out = await self._cmd(
+                    gate.command(*check), gates_dir, timeout=600.0, env=gate.env
+                )
                 if code != 0:
                     aside = f" ({note})" if note else ""
                     return False, (

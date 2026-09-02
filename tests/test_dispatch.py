@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -108,8 +109,9 @@ async def test_gate_runner_prefers_uv_then_the_branch_venv(
 
     configured_uv = tmp_path / "uv.exe"  # UV_EXE, as staging already resolves it
     configured_uv.write_text("", encoding="utf-8")
-    prefix, note = await runner.resolve_gate_runner(repo, str(configured_uv))
-    assert prefix == [str(configured_uv), "run"] and note == ""
+    gate = await runner.resolve_gate_runner(repo, str(configured_uv))
+    assert gate.command("pytest", "-q") == [str(configured_uv), "run", "pytest", "-q"]
+    assert gate.note == "" and gate.env is None
 
     monkeypatch.setattr(Dispatcher, "resolve_uv", staticmethod(lambda configured="": None))
 
@@ -121,9 +123,11 @@ async def test_gate_runner_prefers_uv_then_the_branch_venv(
     venv_python = repo / ".venv" / venv
     venv_python.parent.mkdir(parents=True)
     venv_python.write_text("", encoding="utf-8")
-    prefix, note = await runner.resolve_gate_runner(repo)
-    assert prefix == [str(venv_python), "-m"]
-    assert "uv was not found" in note and "branch's own virtual environment" in note
+    gate = await runner.resolve_gate_runner(repo)
+    assert gate.command("ruff", "check") == [str(venv_python), "-m", "ruff", "check"]
+    assert "uv was not found" in gate.note and "branch's own virtual environment" in gate.note
+    assert gate.env is not None  # the checked-out src, not whatever main installed
+    assert gate.env["PYTHONPATH"].split(os.pathsep)[0] == str(repo / "src")
 
 
 async def test_merge_gates_fall_back_to_a_plain_python_without_uv(
@@ -149,9 +153,11 @@ testpaths = ["tests"]
     for folder in ("src", "scripts"):
         (worktree / folder).mkdir()
         (worktree / folder / "thing.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (worktree / "src" / "branch_only.py").write_text('MARK = "branch"\n', encoding="utf-8")
     (worktree / "tests").mkdir()
-    (worktree / "tests" / "test_thing.py").write_text(
-        "def test_thing() -> None:\n    assert True\n", encoding="utf-8"
+    (worktree / "tests" / "test_thing.py").write_text(  # only imports under the branch's src
+        'import branch_only\n\n\ndef test_thing() -> None:\n    assert branch_only.MARK == "branch"\n',
+        encoding="utf-8",
     )
     assert await runner.commit_all(worktree, "a branch with checks to run")
 

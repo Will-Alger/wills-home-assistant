@@ -797,6 +797,15 @@ class TaskBoard:
                 f"{message} Task {task.id} is merged, but syncing main's dependencies failed "
                 f"({note}) — NOT restarting; the owner should run uv sync and restart by hand."
             )
+        # A missing uv no longer blocks the merge (the gates fall back to a
+        # plain interpreter), but he should hear that main's packages were left
+        # untouched rather than find out when a new dependency is missing.
+        aside = ""
+        if not synced:
+            aside = (
+                f" Main's dependencies were not synced ({note}) — if this branch added a "
+                "package, install uv or sync main by hand."
+            )
         if pointer is not None:
             clear_pointer(self._root)
             for other in self._tasks.values():
@@ -807,10 +816,13 @@ class TaskBoard:
         if self._staged_task_id is not None:
             self.restart_requested = True
             return (
-                f"{message} Task {task.id} is merged into main — restarting onto main now: "
+                f"{message} Task {task.id} is merged into main.{aside} Now restarting onto main: "
                 "say a brief goodbye and end the conversation."
             )
-        return f"{message} Task {task.id} is merged — offer to restart yourself so it takes effect."
+        return (
+            f"{message} Task {task.id} is merged — offer to restart yourself so it takes "
+            f"effect.{aside}"
+        )
 
     def abandon(self, ref: Any) -> str:
         task = self.get(ref)
