@@ -216,3 +216,21 @@ def test_interrupted_local_build_is_marked_failed_on_reload(tmp_path: Path) -> N
     task = board.get(1)
     assert task.state == "failed" and task.current.status == "interrupted"
     assert "interrupted" in task.last_error
+
+
+def test_stale_running_records_on_closed_tasks_do_not_count(tmp_path: Path) -> None:
+    """A migrated or abandoned task may still carry a 'running' iteration;
+    it must not block switching or starting other work."""
+    repo = make_repo(tmp_path)
+    board, _ = make_board(repo)
+    from assistant.tasks import Iteration
+
+    ghost = board.draft("Ghost", "old cloud probe")
+    ghost.state = "building"
+    ghost.iterations.append(Iteration(n=1, status="running", started=1.0))
+    board._save()
+    assert ghost.running
+    board.abandon(ghost.id)
+    assert not board.get(ghost.id).running
+    assert board.get(ghost.id).current.status == "interrupted"
+    assert not any(t.running for t in board.tasks())

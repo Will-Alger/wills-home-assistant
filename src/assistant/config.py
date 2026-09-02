@@ -80,7 +80,7 @@ class Settings(BaseSettings):
     uv_exe: str = ""
     # Web search (OpenAI Responses API web_search tool, same OPENAI_API_KEY):
     # the model that reads the results, and how much context it pulls.
-    web_search_model: str = "gpt-5-mini"
+    web_search_model: str = "gpt-4.1-mini"  # 4s; gpt-5-mini took ~29s
     web_search_context: str = "low"
 
     # Milestone 2: LLM

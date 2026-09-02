@@ -24,7 +24,7 @@ class WebSearch:
         self,
         api_key: str,
         *,
-        model: str = "gpt-5-mini",
+        model: str = "gpt-4.1-mini",
         context_size: str = "low",
         timeout: float = 40.0,
         client: Any | None = None,

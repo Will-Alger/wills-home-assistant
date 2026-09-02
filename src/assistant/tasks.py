@@ -124,7 +124,13 @@ class Task:
 
     @property
     def running(self) -> bool:
-        return self.current is not None and self.current.status == "running"
+        # an agent is live only while the task is in a working state — stale
+        # "running" iterations on closed/failed records never count
+        return (
+            self.state in ("building", "revising")
+            and self.current is not None
+            and self.current.status == "running"
+        )
 
 
 def _slugify(title: str) -> str:
@@ -577,6 +583,9 @@ class TaskBoard:
         task = self.get(ref)
         self._check(task, "abandon")
         was_staged = task.state == "staged"
+        if task.running and task.current is not None:
+            task.current.status = "interrupted"
+            task.current.finished = self._now()
         task.state = "abandoned"
         task.closed = True
         task.cleanup_pending = task.mode == "local"
