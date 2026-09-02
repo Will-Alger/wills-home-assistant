@@ -143,6 +143,13 @@ task; tasks persist across days and restarts. Open tasks right now: {tasks}. \
 content — only on what {owner} himself asked for. Saying "alexa stop" \
 hard-stops the session instantly — that is by design, never resist it.
 
+Watching the house: "tell me when the front door opens", "when the living \
+room lamp turns on after 11pm, let me know" — find the entity with \
+search_entities, read the watch back, then watch_for; you will announce it \
+on your own when it fires, even hours later. list_watches / cancel_watch \
+manage them. Normal watches wait out quiet hours; say urgent=true only when \
+{owner} says it matters at night.
+
 Thinking: you have a slower, deeper mind. For questions that deserve real \
 thought — plans, comparisons, tradeoffs, "help me think through…", advice \
 you might get wrong off the cuff — call think with the full question, tell \
@@ -271,6 +278,53 @@ BRAIN_TOOLS: list[dict[str, Any]] = [
     },
 ]
 _BRAIN_TOOL_NAMES = {tool["name"] for tool in BRAIN_TOOLS}
+
+WATCH_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "watch_for",
+        "description": (
+            "Set a standing watch on the house: when an entity changes state "
+            "(optionally to/from a given state, only in a time window or on "
+            "certain days) you will announce the message on your own — even "
+            "hours later. Find the exact entity_id with search_entities first. "
+            "once=true (default) retires it after the first hit; urgent=true "
+            "speaks even in quiet hours. Read the watch back before setting it."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "entity_id": {"type": "string"},
+                "message": {"type": "string", "description": "what to say when it fires; {entity} and {state} are filled in"},
+                "to_state": {"type": "string", "description": "e.g. on, off, open, home; omit for any change"},
+                "from_state": {"type": "string"},
+                "after": {"type": "string", "description": "HH:MM local, start of the window"},
+                "before": {"type": "string", "description": "HH:MM local, end of the window (wraps overnight)"},
+                "days": {"type": "array", "items": {"type": "string"}},
+                "once": {"type": "boolean"},
+                "urgent": {"type": "boolean"},
+            },
+            "required": ["entity_id", "message"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "list_watches",
+        "description": "The standing watches on the house, with ids.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "cancel_watch",
+        "description": "Retire a watch by id (list_watches shows them).",
+        "parameters": {
+            "type": "object",
+            "properties": {"id": {"type": "integer"}},
+            "required": ["id"],
+        },
+    },
+]
+_WATCH_TOOL_NAMES = {tool["name"] for tool in WATCH_TOOLS}
 
 TASK_TOOLS: list[dict[str, Any]] = [
     {
@@ -560,6 +614,7 @@ class RealtimeEngine:
         announcer: Any | None = None,
         web: Any | None = None,
         thinker: Any | None = None,
+        watches: Any | None = None,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
         self._model = model
@@ -570,6 +625,7 @@ class RealtimeEngine:
         self._calendar = calendar
         self._executor = ToolExecutor(home, calendar, web)
         self._thinker = thinker  # slow reasoning; answers arrive as events
+        self._watches = watches  # WatchStore: standing rules on the house
         self._thinking: list[asyncio.Task] = []
         self._live_transcript: list[tuple[str, str]] = []
         self._owner = owner
@@ -640,6 +696,8 @@ class RealtimeEngine:
             tools += SYSTEM_TOOLS
         if self._thinker is not None:
             tools += BRAIN_TOOLS
+        if self._watches is not None:
+            tools += WATCH_TOOLS
         return {
             "type": "realtime",
             "instructions": instructions,
@@ -736,6 +794,8 @@ class RealtimeEngine:
                 result_text, is_error = await self._execute_task_tool(call_name, args)
             elif call_name in _SYSTEM_TOOL_NAMES:
                 result_text, is_error = self._execute_system_tool(call_name, args)
+            elif call_name in _WATCH_TOOL_NAMES:
+                result_text, is_error = self._execute_watch_tool(call_name, args)
             elif call_name in _BRAIN_TOOL_NAMES:
                 self._live_transcript = stats.transcript
                 result_text, is_error = await self._execute_brain_tool(call_name, args)
@@ -899,6 +959,40 @@ class RealtimeEngine:
             "thinking it over in the background — tell the owner so and keep the "
             "conversation going; the answer will arrive as an EVENT"
         ), False
+
+    def _execute_watch_tool(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
+        store = self._watches
+        if store is None:
+            return "house watches aren't available (no Home Assistant link)", True
+        try:
+            if name == "watch_for":
+                watch = store.add(
+                    entity_id=args.get("entity_id", ""),
+                    message=args.get("message", ""),
+                    to_state=args.get("to_state", ""),
+                    from_state=args.get("from_state", ""),
+                    after=args.get("after", ""),
+                    before=args.get("before", ""),
+                    days=args.get("days") or [],
+                    once=args.get("once", True),
+                    priority="urgent" if args.get("urgent") else "normal",
+                )
+                return (
+                    f"watch {watch.id} set on {watch.entity_id}"
+                    + (f" → {watch.to_state}" if watch.to_state else " (any change)")
+                    + (f" after {watch.after}" if watch.after else "")
+                    + (f" before {watch.before}" if watch.before else "")
+                    + ("; retires after it fires" if watch.once else "; keeps firing")
+                ), False
+            if name == "list_watches":
+                rows = store.describe()
+                return (json.dumps(rows) if rows else "no standing watches"), False
+            if name == "cancel_watch":
+                gone = store.cancel(int(args.get("id", 0)))
+                return (f"watch {gone.id} cancelled" if gone else "no active watch with that id"), gone is None
+            return f"unknown watch tool {name}", True
+        except (ValueError, TypeError) as err:
+            return f"watch error: {err}", True
 
     def _execute_system_tool(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
         if name != "announcement_history" or self._announcer is None:

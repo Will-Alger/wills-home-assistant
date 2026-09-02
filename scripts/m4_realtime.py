@@ -35,6 +35,7 @@ from assistant.engines.realtime_engine import (
     REALTIME_RATE,
     RealtimeEngine,
 )
+from assistant.events import EventWatcher, WatchStore
 from assistant.home import HomeAssistantClient
 from assistant.home.fake import FakeHome
 from assistant.learning import Reflector
@@ -164,6 +165,7 @@ def build_engine(fake: bool):
         if settings.use_claude_subscription
         else None
     )
+    watches = WatchStore(root / "data" / "watches.json")
     thinker = None
     if settings.use_claude_subscription:
         from assistant.llm.claude_cli import ClaudeCli
@@ -195,11 +197,20 @@ def build_engine(fake: bool):
         usage_log=root / ".usage.jsonl",
         announcer=announcer,
         thinker=thinker,
+        watches=watches,
         web=WebSearch(
             settings.openai_api_key,
             model=settings.web_search_model,
             context_size=settings.web_search_context,
         ),
+    )
+    engine.event_watcher = (
+        None
+        if fake
+        else EventWatcher(
+            settings.ha_url, settings.ha_token, watches, announcer,
+            log=lambda m: console.print(f"[dim]{m}[/dim]"),
+        )
     )
     return settings, home, engine, reflector
 
@@ -241,6 +252,8 @@ async def voice(fake: bool) -> int:
     staged = os.environ.get("ALEXA_STAGED_TASK", "").strip()
     if staged:
         console.print(f"[magenta]◈ running the STAGED build of task {staged}[/magenta]")
+    watcher = getattr(engine, "event_watcher", None)
+    watcher_task = asyncio.create_task(watcher.run()) if watcher is not None else None
     console.print("Loading wake model...")
     wake = WakeDetector(settings.wake_model, threshold=settings.wake_threshold)
     session_wake = WakeDetector(settings.wake_model, threshold=settings.wake_threshold)
@@ -265,6 +278,8 @@ async def voice(fake: bool) -> int:
             if engine.restart_requested:
                 console.print("[yellow]self-restart requested — exiting for the watchdog[/yellow]")
                 return 0  # the always-on service relaunches us in seconds
+    if watcher_task is not None:
+        watcher_task.cancel()
     console.print(f"\n[dim]total: ${total_cost:.4f}[/dim]")
     return 0
 
