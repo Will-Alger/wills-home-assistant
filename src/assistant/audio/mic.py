@@ -76,6 +76,7 @@ class Microphone:
         samplerate: int = SAMPLE_RATE,
         frame_samples: int = FRAME_SAMPLES,
     ) -> None:
+        self._spec = device
         self._device = resolve_device(device)
         self._samplerate = samplerate
         self._frame_samples = frame_samples
@@ -83,6 +84,7 @@ class Microphone:
         self._stream: sd.RawInputStream | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self.device_note: str | None = None  # set when a fallback device was used
+        self.device_in_use = ""  # the mic actually opened (the panel shows it)
 
     def _open(self, device: int | str | None) -> sd.RawInputStream:
         def callback(indata, _frames, _time, _status) -> None:  # PortAudio thread
@@ -105,6 +107,7 @@ class Microphone:
         self._loop = asyncio.get_running_loop()
         try:
             self._stream = self._open(self._device)
+            self.device_in_use = describe_device(self._spec)
             return self
         except sd.PortAudioError as err:
             # The configured/default input won't open (typical: a Bluetooth
@@ -118,6 +121,7 @@ class Microphone:
                 except sd.PortAudioError:
                     continue
                 name = describe_device(str(index))
+                self.device_in_use = name
                 self.device_note = f"mic fallback: using '{name}' — the default input would not open ({err})"
                 return self
             raise

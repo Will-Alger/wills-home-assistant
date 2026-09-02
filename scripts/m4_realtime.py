@@ -21,15 +21,17 @@ import wave
 from pathlib import Path
 
 from rich.console import Console
+from rich.markup import render
 
 from assistant.announce import Announcer
 from assistant.app import record_session, wait_for_trigger
 from assistant.audio import tones
+from assistant.audio.cues import VoiceCues
 from assistant.audio.mic import Microphone, describe_device
 from assistant.audio.speaker import Speaker
 from assistant.brain.thinker import Thinker
 from assistant.briefing import compose_briefing
-from assistant.config import home_dir, load_settings
+from assistant.config import code_root, home_dir, load_settings
 from assistant.delivery import Courier, DeliveryPolicy, DeliverySettings
 from assistant.dispatch import Dispatcher, load_extra_routines, migrate_cloud_routines
 from assistant.engines.realtime_engine import (
@@ -45,11 +47,13 @@ from assistant.journal import Journal
 from assistant.learning import Reflector
 from assistant.llm.anthropic_provider import AnthropicProvider
 from assistant.memory import MemoryStore
+from assistant.panel import PanelOverrides, SettingsPanel
 from assistant.presence import Presence
 from assistant.push import PhoneActions, PhonePusher
 from assistant.routines import RoutineStore
 from assistant.scheduler import Scheduler
 from assistant.sessions import SessionLog
+from assistant.status import AssistantStatus
 from assistant.tasks import TaskBoard
 from assistant.wake.detector import WakeDetector
 from assistant.web import WebSearch
@@ -57,19 +61,31 @@ from assistant.web import WebSearch
 console = Console()
 
 
+def say(status, text: str, style: str = "") -> None:
+    """Print a line AND put it in the panel's live feed (plain, no markup)."""
+    console.print(f"[{style}]{text}[/{style}]" if style else text, highlight=False)
+    if status is not None:
+        with contextlib.suppress(Exception):
+            status.note(text)
+
+
 class ConsoleUi:
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, status=None) -> None:
         self._name = name.lower()
         self._last_status = ""
+        self._status = status  # the panel's live feed reads what the console shows
 
     def _say(self, text: str) -> None:
         self._last_status = ""
         console.print(text, highlight=False)
+        if self._status is not None:
+            with contextlib.suppress(Exception):
+                self._status.note(render(text).plain)
 
     def listening(self) -> None:
         if self._last_status != "listening":  # multi-step replies fire this repeatedly
+            self._say("[green]● listening[/green]")
             self._last_status = "listening"
-            console.print("[green]● listening[/green]")
 
     def user_speaking(self) -> None:
         pass  # semantic VAD handles it; printing here is just noise
@@ -104,6 +120,9 @@ class ConsoleUi:
 
     def error(self, message: str) -> None:
         self._say(f"[red]{message}[/red]")
+        if self._status is not None:
+            with contextlib.suppress(Exception):
+                self._status.error(message)
 
 
 def build_calendar(settings, fake: bool):
@@ -126,11 +145,13 @@ def build_calendar(settings, fake: bool):
 
 def build_engine(fake: bool):
     settings = load_settings()
+    root = home_dir()  # .env, data/, logs/: the MAIN repo even when staged
+    overrides = PanelOverrides(root / "data" / "panel.json")
+    applied = overrides.apply(settings)  # voice / wake word chosen in the panel
     settings.require("openai_api_key")
     home = FakeHome() if fake else HomeAssistantClient(settings.ha_url, settings.ha_token)
     if not fake:
         settings.require("ha_url", "ha_token")
-    root = home_dir()  # .env, data/, logs/: the MAIN repo even when staged
     staged = os.environ.get("ALEXA_STAGED_TASK", "").strip()
     memory = MemoryStore(root / "data" / "memory.json")
     journal = Journal(root / "data" / "journal", keep_days=settings.journal_keep_days)
@@ -222,6 +243,27 @@ def build_engine(fake: bool):
             name=settings.assistant_name,
             owner=settings.owner_name,
         )
+    status = AssistantStatus(
+        mic=describe_device(settings.audio_input_device),
+        voice=settings.realtime_voice,
+        wake_word=settings.wake_phrase,
+        home="fake apartment" if fake else settings.ha_url,
+    )
+    for change in applied:
+        status.note(f"settings panel: {change}")
+    cues = VoiceCues(rate=REALTIME_RATE, status=status)
+
+    def request_restart() -> None:
+        # the runner exits after this cycle; the watchdog brings her back
+        engine.restart_requested = True
+
+    panel = SettingsPanel(
+        status,
+        overrides,
+        restart=request_restart,
+        models_dir=code_root() / "models",
+        log=lambda m: console.print(f"[dim]{m}[/dim]"),
+    )
     engine = RealtimeEngine(
         api_key=settings.openai_api_key,
         model=settings.realtime_model,
@@ -255,6 +297,8 @@ def build_engine(fake: bool):
             model=settings.web_search_model,
             context_size=settings.web_search_context,
         ),
+        cues=cues,
+        panel=panel,
     )
     scheduler._executor = engine._executor  # scheduled actions run through her tools
     scheduler.briefing = compose_briefing(calendar, board, scheduler, announcer, settings.owner_name)
@@ -263,6 +307,10 @@ def build_engine(fake: bool):
     engine.sessions = sessions
     engine.presence = presence
     engine.home = home
+    engine.status = status  # what the settings panel shows
+    engine.cues = cues
+    engine.panel = panel
+    engine.overrides = overrides
     pusher = None
     if settings.phone_notify_service and not fake:
         pusher = PhonePusher(home, settings.phone_notify_service, name=settings.assistant_name, journal=journal)
@@ -275,16 +323,13 @@ def build_engine(fake: bool):
             )
         )
 
-    def request_restart() -> None:
-        engine.restart_requested = True
-
     engine.phone_actions = PhoneActions(
         announcer,
         board=board,
         scheduler=scheduler,
         pusher=pusher,
         journal=journal,
-        log=lambda m: console.print(f"[dim]{m}[/dim]"),
+        log=lambda m: say(status, m, "dim"),
         request_restart=request_restart,
     )
     engine.courier = Courier(
@@ -301,7 +346,7 @@ def build_engine(fake: bool):
         unread_expire_s=settings.unread_expire_days * 86400,
         nudge_after_s=settings.nudge_after_days * 86400,
         focus_from_calendar=settings.focus_from_calendar,
-        log=lambda m: console.print(f"[dim]{m}[/dim]"),
+        log=lambda m: say(status, m, "dim"),
     )
 
     def on_state(entity_id: str, old: str | None, new: str | None) -> None:
@@ -313,7 +358,7 @@ def build_engine(fake: bool):
         if fake
         else EventWatcher(
             settings.ha_url, settings.ha_token, watches, announcer,
-            log=lambda m: console.print(f"[dim]{m}[/dim]"),
+            log=lambda m: say(status, m, "dim"),
             journal=journal,
             on_state=on_state,
             on_event=(
@@ -355,20 +400,47 @@ async def text_probe(fake: bool, text: str) -> int:
     return 0
 
 
+def load_wake_detectors(settings, overrides) -> tuple[WakeDetector, WakeDetector]:
+    """The idle detector and the barge-in one. A wake word chosen in the
+    panel that will not load must never brick the boot: drop the override,
+    fall back to the .env value, and say so."""
+
+    def build() -> tuple[WakeDetector, WakeDetector]:
+        return (
+            WakeDetector(settings.wake_model, threshold=settings.wake_threshold),
+            WakeDetector(settings.wake_model, threshold=settings.wake_threshold),
+        )
+
+    try:
+        return build()
+    except Exception as err:  # a missing model is not a crash
+        if overrides is None or not overrides.wake_model:
+            raise
+        overrides.clear("wake_model")
+        settings.wake_model = load_settings().wake_model
+        console.print(
+            f"[yellow]wake word from the settings panel would not load ({err}) — "
+            f"back to '{settings.wake_phrase}'[/yellow]"
+        )
+        return build()
+
+
 async def voice(fake: bool) -> int:
     settings, _home, engine, reflector = build_engine(fake)
+    status = getattr(engine, "status", None)
+    cues = getattr(engine, "cues", None)
     board = getattr(engine, "_board", None)
     if board is not None:
         with contextlib.suppress(Exception):  # housekeeping must never block boot
             await board.startup_maintenance()
     staged = os.environ.get("ALEXA_STAGED_TASK", "").strip()
     if staged:
-        console.print(f"[magenta]◈ running the STAGED build of task {staged}[/magenta]")
+        say(status, f"◈ running the STAGED build of task {staged}", "magenta")
     presence = getattr(engine, "presence", None)
     if presence is not None:
         with contextlib.suppress(Exception):  # HA down at boot: keep what we knew
             await presence.sync(engine.home, boot=True)
-        console.print(f"[dim]presence: {presence.describe()}[/dim]")
+        say(status, f"presence: {presence.describe()}", "dim")
     watcher = getattr(engine, "event_watcher", None)
     watcher_task = asyncio.create_task(watcher.run()) if watcher is not None else None
     scheduler = getattr(engine, "scheduler", None)
@@ -376,14 +448,17 @@ async def voice(fake: bool) -> int:
     courier = getattr(engine, "courier", None)
     courier_task = asyncio.create_task(courier.run()) if courier is not None else None
     console.print("Loading wake model...")
-    wake = WakeDetector(settings.wake_model, threshold=settings.wake_threshold)
-    session_wake = WakeDetector(settings.wake_model, threshold=settings.wake_threshold)
+    wake, session_wake = load_wake_detectors(settings, getattr(engine, "overrides", None))
     total_cost = 0.0
-    console.print(
-        f"[bold]Voice online.[/bold] “{settings.wake_phrase}” to talk to "
-        f"{settings.assistant_name} · voice: {settings.realtime_voice} · "
-        f"mic: {describe_device(settings.audio_input_device)} · "
-        f"home: {'fake apartment' if fake else settings.ha_url} · Ctrl+C quits."
+    mic_name = describe_device(settings.audio_input_device)
+    if status is not None:
+        status.configure(mic=mic_name, voice=settings.realtime_voice, wake_word=settings.wake_phrase)
+        status.set_state("idle")
+    say(
+        status,
+        f"Voice online. “{settings.wake_phrase}” to talk to {settings.assistant_name} · "
+        f"voice: {settings.realtime_voice} · mic: {mic_name} · "
+        f"home: {'fake apartment' if fake else settings.ha_url} · Ctrl+C quits.",
     )
     failures = 0
     with contextlib.suppress(KeyboardInterrupt, asyncio.CancelledError):
@@ -400,15 +475,14 @@ async def voice(fake: bool) -> int:
                 # otherwise retry (and beep) five times a second. One error
                 # tone per streak, then 5 s → 60 s between attempts.
                 failures += 1
-                if failures == 1:
-                    with contextlib.suppress(Exception):
-                        tones.play("error")
+                if failures == 1 and cues is not None:
+                    cues.error(f"{err}")  # never a listening ding on a failure
                 delay = min(5.0 * 2 ** (failures - 1), 60.0)
-                console.print(f"[red]recovered from: {err!r} — retrying in {delay:.0f}s[/red]")
+                say(status, f"recovered from: {err!r} — retrying in {delay:.0f}s", "red")
                 await asyncio.sleep(delay)
                 continue
             if engine.restart_requested:
-                console.print("[yellow]self-restart requested — exiting for the watchdog[/yellow]")
+                say(status, "self-restart requested — exiting for the watchdog", "yellow")
                 actions = getattr(engine, "phone_actions", None)
                 if actions is not None:
                     await actions.drain()  # never exit mid-merge from a phone tap
@@ -425,6 +499,8 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
     await asyncio.sleep(0.2)  # let PortAudio settle between 24k/16k stream switches
     if engine.restart_requested:
         return total_cost  # a phone approve while idle: the runner exits for the watchdog
+    status = getattr(engine, "status", None)
+    cues = getattr(engine, "cues", None)
     announcer = getattr(engine, "announcer", None)
     # Something to say already? Skip the mic and speak. Otherwise IDLE:
     # wake-gate on a 16 kHz mic (local, free, private) while watching the
@@ -434,7 +510,10 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
         async with Microphone(settings.audio_input_device) as mic16:
             if mic16.device_note and mic16.device_note != getattr(engine, "_mic_note", None):
                 engine._mic_note = mic16.device_note  # say it once per fallback, not per cycle
-                console.print(f"[yellow]{mic16.device_note}[/yellow]")
+                say(status, mic16.device_note, "yellow")
+            if status is not None:
+                status.configure(mic=mic16.device_in_use)  # the mic she is really on
+                status.set_state("idle")
             console.print("[dim]○ idle — say the wake phrase[/dim]")
             trigger = await wait_for_trigger(
                 mic16, wake, announcer, restart=lambda: engine.restart_requested
@@ -442,8 +521,8 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
     if trigger == "restart":
         return total_cost
     announcing = trigger == "announce"
-    if not announcing:
-        tones.play("wake")
+    if not announcing and cues is not None:
+        cues.start()  # the wake ding, through a fresh stream: no session yet
     # Session: 24 kHz mic + speaker, wake detector kept for barge-in
     session_wake.reset()
     async with (
@@ -455,28 +534,32 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
         Speaker(REALTIME_RATE) as speaker,
     ):
         if announcing:
-            console.print("[cyan]◆ announcing[/cyan]")
+            say(status, "◆ announcing", "cyan")
             with contextlib.suppress(Exception):
                 speaker.enqueue(tones.pcm("announce", REALTIME_RATE))
         else:
-            console.print("[green]● connected — talk[/green]")
+            say(status, "● connected — talk", "green")
         sessions = getattr(engine, "sessions", None)
         row = None
         if sessions is not None:
             with contextlib.suppress(Exception):
                 row = sessions.start("announce" if announcing else "wake")
         stats = await engine.run_conversation(
-            mic24, speaker, session_wake, ConsoleUi(settings.assistant_name), announce=announcing
+            mic24, speaker, session_wake,
+            ConsoleUi(settings.assistant_name, status), announce=announcing,
         )
         # Goodbye chime through the SESSION speaker: a fresh sd.play stream
         # right after this one closes silently loses the race on Windows.
         with contextlib.suppress(Exception):
-            speaker.enqueue(tones.pcm("close", REALTIME_RATE))
+            if cues is not None:
+                cues.session_end(speaker)
             await asyncio.wait_for(speaker.wait_idle(), timeout=3.0)
     total_cost += stats.cost_usd
     if engine.voice_note:
-        console.print(f"[yellow]{engine.voice_note}[/yellow]")
+        say(status, engine.voice_note, "yellow")
         engine.voice_note = None
+        if status is not None:
+            status.configure(voice=engine.voice)  # the panel shows what she really speaks with
     reason = {
         "idle timeout": "quiet too long — closed to stop the meter; say the wake word anytime",
         "end_conversation": "she wrapped up",
@@ -486,10 +569,11 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
         "no reply": "asked, no reply — back to sleep",
         "interrupted announcement": "you cut in — closed after quiet",
     }.get(stats.ended_by, stats.ended_by)
-    console.print(
-        f"[bold]conversation closed[/bold] ({reason}) · {stats.responses} replies · "
+    say(
+        status,
+        f"conversation closed ({reason}) · {stats.responses} replies · "
         f"tools: {stats.tool_calls or 'none'} · ${stats.cost_usd:.4f} "
-        f"(${total_cost:.4f} session)"
+        f"(${total_cost:.4f} session)",
     )
     reflection = await record_session(
         sessions, getattr(engine, "journal", None), stats, row, reflector

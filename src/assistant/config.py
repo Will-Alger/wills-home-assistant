@@ -32,6 +32,16 @@ def home_dir() -> Path:
 _REPO_ROOT = home_dir()
 
 
+def wake_phrase(model: str) -> str:
+    """Spoken form of a wake-word model name or path: models/hey_gary.onnx
+    -> "hey gary". Also used by the settings panel, which offers models the
+    running Settings object has never seen."""
+    stem = model.replace("\\", "/").rsplit("/", 1)[-1]
+    for suffix in (".onnx", ".tflite"):
+        stem = stem.removesuffix(suffix)
+    return stem.replace("_", " ").removesuffix(" v0.1").strip()
+
+
 class MissingSettingError(RuntimeError):
     pass
 
@@ -178,10 +188,7 @@ class Settings(BaseSettings):
     @property
     def wake_phrase(self) -> str:
         """Spoken form of the wake word, derived from the model name/path."""
-        stem = self.wake_model.replace("\\", "/").rsplit("/", 1)[-1]
-        for suffix in (".onnx", ".tflite"):
-            stem = stem.removesuffix(suffix)
-        return stem.replace("_", " ").removesuffix(" v0.1").strip()
+        return wake_phrase(self.wake_model)
 
     def require(self, *field_names: str) -> None:
         """Raise with a setup hint if any of the named settings are unset."""

@@ -53,6 +53,12 @@ _RECIPES: dict[str, dict] = {
     "wake": {"notes": [659.3, 880.0]},
     "close": {"notes": [880.0, 659.3, 523.3], "amp": 0.26, "decay": 5.0, "ms_each": 420},
     "error": {"notes": [220.0, 185.0], "amp": 0.24, "decay": 9.0, "ms_each": 260},
+    # the listening window closing: a quick soft step down, deliberately
+    # smaller than "close" (which ends the whole conversation)
+    "listen_end": {
+        "notes": [880.0, 587.3], "ms_each": 200, "stagger_ms": 70,
+        "amp": 0.22, "decay": 12.0,
+    },
     # rising major triad, distinct from the wake fourth: she has news
     "announce": {"notes": [523.3, 659.3, 784.0], "amp": 0.28},
 }
@@ -66,8 +72,9 @@ def pcm(kind: str, rate: int) -> bytes:
     return (rendered * 32767).astype(np.int16).tobytes()
 
 
-# wake: rising fourth, bright — I'm listening. close: falling, softer, longer
-# ring — going back to sleep. error: low, brief, minor-ish.
+# wake: rising fourth, bright — I'm listening. listen_end: a short step down,
+# your turn is over. close: falling, softer, longer ring — going back to
+# sleep. error: low, brief, minor-ish.
 _SOUNDS = {kind: _chime(**recipe) for kind, recipe in _RECIPES.items()}
 
 
