@@ -44,3 +44,10 @@ async def test_due_announcement_triggers_without_wake() -> None:
 async def test_wake_beats_announcement_on_the_same_frame() -> None:
     announcer = Announcer(due_after_frames=1)
     assert await wait_for_trigger(Source([WAKE]), Wake(), announcer) == "wake"
+
+
+async def test_restart_request_ends_the_idle_wait() -> None:
+    """A phone approve while idle: the runner must notice without a wake word."""
+    assert await wait_for_trigger(Source([NOISE] * 5), Wake(), None, restart=lambda: True) == "restart"
+    flips = iter([False, False, True])
+    assert await wait_for_trigger(Source([NOISE] * 5), Wake(), None, restart=lambda: next(flips)) == "restart"

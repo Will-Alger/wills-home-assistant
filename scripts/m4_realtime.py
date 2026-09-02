@@ -44,6 +44,7 @@ from assistant.learning import Reflector
 from assistant.llm.anthropic_provider import AnthropicProvider
 from assistant.memory import MemoryStore
 from assistant.presence import Presence
+from assistant.push import PhoneActions, PhonePusher
 from assistant.routines import RoutineStore
 from assistant.scheduler import Scheduler
 from assistant.sessions import SessionLog
@@ -293,9 +294,34 @@ def build_engine(fake: bool):
     engine.sessions = sessions
     engine.presence = presence
     engine.home = home
+    pusher = None
+    if settings.phone_notify_service and not fake:
+        pusher = PhonePusher(home, settings.phone_notify_service, name=settings.assistant_name, journal=journal)
+        # a card he has read or that is moot comes off his phone
+        announcer.subscribe(
+            lambda item, event: (
+                pusher.clear_later(item)
+                if event in ("read", "resolved", "cancelled", "journaled") and item.pushed is not None
+                else None
+            )
+        )
+
+    def request_restart() -> None:
+        engine.restart_requested = True
+
+    engine.phone_actions = PhoneActions(
+        announcer,
+        board=board,
+        scheduler=scheduler,
+        pusher=pusher,
+        journal=journal,
+        log=lambda m: console.print(f"[dim]{m}[/dim]"),
+        request_restart=request_restart,
+    )
     engine.courier = Courier(
         announcer,
         presence=presence,
+        pusher=pusher,
         journal=journal,
         settings=delivery,
         calendar=calendar,
@@ -318,6 +344,11 @@ def build_engine(fake: bool):
             log=lambda m: console.print(f"[dim]{m}[/dim]"),
             journal=journal,
             on_state=on_state,
+            on_event=(
+                {"mobile_app_notification_action": engine.phone_actions.handle_event}
+                if pusher is not None
+                else None
+            ),
             on_connect=(lambda: presence.sync(home)) if presence is not None else None,
         )
     )
@@ -406,6 +437,9 @@ async def voice(fake: bool) -> int:
                 continue
             if engine.restart_requested:
                 console.print("[yellow]self-restart requested — exiting for the watchdog[/yellow]")
+                actions = getattr(engine, "phone_actions", None)
+                if actions is not None:
+                    await actions.drain()  # never exit mid-merge from a phone tap
                 return 0  # the always-on service relaunches us in seconds
     for background in (watcher_task, scheduler_task, courier_task):
         if background is not None:
@@ -417,10 +451,12 @@ async def voice(fake: bool) -> int:
 async def one_cycle(settings, engine, wake, session_wake, total_cost: float, reflector) -> float:
     """One idle→wake→conversation cycle; returns the updated running cost."""
     await asyncio.sleep(0.2)  # let PortAudio settle between 24k/16k stream switches
+    if engine.restart_requested:
+        return total_cost  # a phone approve while idle: the runner exits for the watchdog
     announcer = getattr(engine, "announcer", None)
     # Something to say already? Skip the mic and speak. Otherwise IDLE:
     # wake-gate on a 16 kHz mic (local, free, private) while watching the
-    # announcement queue.
+    # announcement queue and the restart flag.
     trigger = "announce" if announcer is not None and announcer.due() else ""
     if not trigger:
         async with Microphone(settings.audio_input_device) as mic16:
@@ -428,7 +464,11 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
                 engine._mic_note = mic16.device_note  # say it once per fallback, not per cycle
                 console.print(f"[yellow]{mic16.device_note}[/yellow]")
             console.print("[dim]○ idle — say the wake phrase[/dim]")
-            trigger = await wait_for_trigger(mic16, wake, announcer)
+            trigger = await wait_for_trigger(
+                mic16, wake, announcer, restart=lambda: engine.restart_requested
+            )
+    if trigger == "restart":
+        return total_cost
     announcing = trigger == "announce"
     if not announcing:
         tones.play("wake")

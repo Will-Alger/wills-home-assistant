@@ -224,7 +224,17 @@ class TaskBoard:
         self._next_id = 1
         self._tasks: dict[int, Task] = {}
         self._bg: list[asyncio.Task] = []
+        self._locks: dict[int, asyncio.Lock] = {}  # one merge/continue per task at a time
         self._load()
+
+    def _guard(self, ref: Any, what: str) -> asyncio.Lock:
+        """A voice approve racing a phone tap must not merge twice: the
+        second caller is told to wait instead."""
+        task = self.get(ref)
+        lock = self._locks.setdefault(task.id, asyncio.Lock())
+        if lock.locked():
+            raise DispatchError(f"task {task.id} is already being {what} — give it a moment")
+        return lock
 
     # ── persistence ────────────────────────────────────────────────────────
 
@@ -614,6 +624,10 @@ class TaskBoard:
     async def revise(self, ref: Any, feedback: str) -> Task:
         """The owner tested it and reports a problem: hand the feedback to the
         SAME agent (its session resumes with full context) on the same branch."""
+        async with self._guard(ref, "revised"):
+            return await self._revise(ref, feedback)
+
+    async def _revise(self, ref: Any, feedback: str) -> Task:
         task = self.get(ref)
         self._check(task, "revise")
         feedback = " ".join(str(feedback).split())
@@ -637,6 +651,10 @@ class TaskBoard:
     async def answer(self, ref: Any, answer: str) -> Task:
         """The agent stopped on a QUESTION; hand it the owner's decision and
         let the same session continue."""
+        async with self._guard(ref, "answered"):
+            return await self._answer(ref, answer)
+
+    async def _answer(self, ref: Any, answer: str) -> Task:
         task = self.get(ref)
         self._check(task, "answer")
         answer = " ".join(str(answer).split())
@@ -732,6 +750,10 @@ class TaskBoard:
     # ── finishing ──────────────────────────────────────────────────────────
 
     async def approve(self, ref: Any, branch: str = "") -> str:
+        async with self._guard(ref, "merged"):
+            return await self._approve(ref, branch)
+
+    async def _approve(self, ref: Any, branch: str = "") -> str:
         task = self.get(ref)
         self._check(task, "approve")
         cleanup: Path | None = None

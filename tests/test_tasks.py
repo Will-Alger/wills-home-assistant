@@ -223,6 +223,21 @@ async def test_a_build_left_running_is_reconciled_at_startup(tmp_path: Path) -> 
     assert any(h["event"] == "restart" for h in task.history)
 
 
+async def test_a_second_approve_while_one_is_merging_is_refused(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    board, _ = make_board(repo)
+    task = board.draft("Greeting", "x")
+    await board.start(task.id)
+    await wait_state(board, task.id)
+    (Path(task.worktree) / "G.md").write_text("g", encoding="utf-8")
+    await board._runner.commit_all(Path(task.worktree), "g")
+    first = asyncio.create_task(board.approve(task.id))
+    await asyncio.sleep(0.05)  # the merge is underway
+    with pytest.raises(DispatchError, match="already being merged"):
+        await board.approve(task.id)
+    assert "merged" in await first
+
+
 def test_stale_running_records_on_closed_tasks_do_not_count(tmp_path: Path) -> None:
     """A migrated or abandoned task may still carry a 'running' iteration;
     it must not block switching or starting other work."""
