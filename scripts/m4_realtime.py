@@ -29,6 +29,7 @@ from assistant.audio.mic import Microphone, describe_device
 from assistant.audio.speaker import Speaker
 from assistant.brain.thinker import Thinker
 from assistant.config import home_dir, load_settings
+from assistant.delivery import Courier, DeliveryPolicy, DeliverySettings
 from assistant.dispatch import Dispatcher, load_extra_routines, migrate_cloud_routines
 from assistant.engines.realtime_engine import (
     FRAME_SAMPLES_24K,
@@ -42,6 +43,7 @@ from assistant.journal import Journal
 from assistant.learning import Reflector
 from assistant.llm.anthropic_provider import AnthropicProvider
 from assistant.memory import MemoryStore
+from assistant.presence import Presence
 from assistant.routines import RoutineStore
 from assistant.scheduler import Scheduler
 from assistant.sessions import SessionLog
@@ -181,6 +183,24 @@ def build_engine(fake: bool):
         )
     )
     calendar = build_calendar(settings, fake)
+    presence = None
+    if settings.presence_entity and not fake:
+        presence = Presence(
+            root / "data" / "presence.json",
+            settings.presence_entity,
+            owner=settings.owner_name,
+            arrive_after_s=settings.presence_arrive_s,
+            leave_after_s=settings.presence_leave_s,
+            settle_s=settings.presence_settle_s,
+            journal=journal,
+        )
+    delivery = DeliverySettings(root / "data" / "delivery.json")
+    announcer.policy = DeliveryPolicy(
+        quiet=announcer.is_quiet,
+        presence=presence,
+        push_kinds=frozenset(k.strip() for k in settings.push_while_away_kinds.split(",") if k.strip()),
+        settings=delivery,
+    ).decide
     reflector = None
     if settings.use_claude_subscription:
         from assistant.llm.claude_cli import ClaudeCli
@@ -259,6 +279,7 @@ def build_engine(fake: bool):
         routines=routines,
         journal=journal,
         sessions=sessions,
+        presence=presence,
         web=WebSearch(
             settings.openai_api_key,
             model=settings.web_search_model,
@@ -270,6 +291,25 @@ def build_engine(fake: bool):
     engine.scheduler = scheduler
     engine.journal = journal
     engine.sessions = sessions
+    engine.presence = presence
+    engine.home = home
+    engine.courier = Courier(
+        announcer,
+        presence=presence,
+        journal=journal,
+        settings=delivery,
+        calendar=calendar,
+        owner=settings.owner_name,
+        escalate_after_s=settings.escalate_after_h * 3600,
+        unread_expire_s=settings.unread_expire_days * 86400,
+        focus_from_calendar=settings.focus_from_calendar,
+        log=lambda m: console.print(f"[dim]{m}[/dim]"),
+    )
+
+    def on_state(entity_id: str, old: str | None, new: str | None) -> None:
+        if presence is not None and entity_id == settings.presence_entity:
+            presence.observe(new)
+
     engine.event_watcher = (
         None
         if fake
@@ -277,6 +317,8 @@ def build_engine(fake: bool):
             settings.ha_url, settings.ha_token, watches, announcer,
             log=lambda m: console.print(f"[dim]{m}[/dim]"),
             journal=journal,
+            on_state=on_state,
+            on_connect=(lambda: presence.sync(home)) if presence is not None else None,
         )
     )
     return settings, home, engine, reflector
@@ -319,10 +361,17 @@ async def voice(fake: bool) -> int:
     staged = os.environ.get("ALEXA_STAGED_TASK", "").strip()
     if staged:
         console.print(f"[magenta]◈ running the STAGED build of task {staged}[/magenta]")
+    presence = getattr(engine, "presence", None)
+    if presence is not None:
+        with contextlib.suppress(Exception):  # HA down at boot: keep what we knew
+            await presence.sync(engine.home, boot=True)
+        console.print(f"[dim]presence: {presence.describe()}[/dim]")
     watcher = getattr(engine, "event_watcher", None)
     watcher_task = asyncio.create_task(watcher.run()) if watcher is not None else None
     scheduler = getattr(engine, "scheduler", None)
     scheduler_task = asyncio.create_task(scheduler.run()) if scheduler is not None else None
+    courier = getattr(engine, "courier", None)
+    courier_task = asyncio.create_task(courier.run()) if courier is not None else None
     console.print("Loading wake model...")
     wake = WakeDetector(settings.wake_model, threshold=settings.wake_threshold)
     session_wake = WakeDetector(settings.wake_model, threshold=settings.wake_threshold)
@@ -358,10 +407,9 @@ async def voice(fake: bool) -> int:
             if engine.restart_requested:
                 console.print("[yellow]self-restart requested — exiting for the watchdog[/yellow]")
                 return 0  # the always-on service relaunches us in seconds
-    if watcher_task is not None:
-        watcher_task.cancel()
-    if scheduler_task is not None:
-        scheduler_task.cancel()
+    for background in (watcher_task, scheduler_task, courier_task):
+        if background is not None:
+            background.cancel()
     console.print(f"\n[dim]total: ${total_cost:.4f}[/dim]")
     return 0
 

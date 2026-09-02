@@ -80,6 +80,25 @@ class Settings(BaseSettings):
     # Her journal (what she did and saw, one small file per day) is pruned
     # after this many days.
     journal_keep_days: int = 90
+    # Presence: the Home Assistant person entity that says whether the owner
+    # is home (the companion app's GPS), e.g. person.will. Empty = untracked
+    # (she then assumes he is home). Debounce and settle grace in seconds.
+    presence_entity: str = ""
+    presence_arrive_s: float = 60.0
+    presence_leave_s: float = 300.0
+    presence_settle_s: float = 90.0
+    # While he is away, normal notifications of these kinds go to his phone
+    # (urgent ones always do); the rest wait for the arrival welcome.
+    push_while_away_kinds: str = "task,question,watch,thought,system,followup"
+    # The phone: a Home Assistant companion-app notify service name WITHOUT the
+    # domain, e.g. mobile_app_wills_iphone. Empty = no phone channel.
+    phone_notify_service: str = ""
+    # Delivery polish: spoken-but-unread items go to the phone (silently)
+    # after this many hours; unread items expire after this many days; a
+    # calendar meeting in progress holds normal news.
+    escalate_after_h: float = 4.0
+    unread_expire_days: float = 3.0
+    focus_from_calendar: bool = True
     # Announcements (a build finished, a milestone, a rollback): she speaks up
     # on her own while idle. Normal ones wait out quiet hours ("23:00-08:00";
     # "" = never quiet); urgent ones don't. Each is retried with backoff up to

@@ -119,6 +119,67 @@ async def test_watcher_authenticates_subscribes_and_announces(tmp_path: Path) ->
     assert watcher.events_seen == 2
 
 
+async def test_watcher_feeds_hooks_and_subscribes_custom_events(tmp_path: Path) -> None:
+    sent: list[dict] = []
+    incoming: asyncio.Queue = asyncio.Queue()
+    states: list[tuple] = []
+    taps: list[dict] = []
+    connects: list[int] = []
+
+    class FakeWs:
+        async def recv(self):
+            return await incoming.get()
+
+        async def send(self, raw):
+            sent.append(json.loads(raw))
+            msg = sent[-1]
+            if msg["type"] == "auth":
+                incoming.put_nowait(json.dumps({"type": "auth_ok"}))
+            if msg["type"] == "subscribe_events":
+                incoming.put_nowait(json.dumps({"id": msg["id"], "type": "result", "success": True}))
+                if msg["id"] == 1:
+                    incoming.put_nowait(event("person.will", "not_home", "home"))
+                else:
+                    incoming.put_nowait(
+                        json.dumps(
+                            {
+                                "type": "event",
+                                "event": {
+                                    "event_type": msg["event_type"],
+                                    "data": {"action": "alexa:read:1", "reply_text": ""},
+                                },
+                            }
+                        )
+                    )
+
+    @asynccontextmanager
+    async def connector(url: str):
+        incoming.put_nowait(json.dumps({"type": "auth_required"}))
+        yield FakeWs()
+
+    async def on_connect() -> None:
+        connects.append(1)
+
+    watcher = EventWatcher(
+        "http://192.168.1.114", "tok", WatchStore(tmp_path / "w.json"), Announcer(tmp_path / "a.json"),
+        connector=connector,
+        on_state=lambda entity, old, new: states.append((entity, old, new)),
+        on_event={"mobile_app_notification_action": taps.append},
+        on_connect=on_connect,
+    )
+    task = asyncio.create_task(watcher.run())
+    async with asyncio.timeout(5):
+        while not (states and taps):
+            await asyncio.sleep(0.05)
+    watcher.stop()
+    task.cancel()
+    assert sent[1]["event_type"] == "state_changed"
+    assert sent[2] == {"id": 2, "type": "subscribe_events", "event_type": "mobile_app_notification_action"}
+    assert states == [("person.will", "not_home", "home")]
+    assert taps[0]["action"] == "alexa:read:1" and connects == [1]
+    assert watcher.events_seen == 2
+
+
 def test_watch_tools_by_voice(tmp_path: Path) -> None:
     store = WatchStore(tmp_path / "watches.json")
     engine = RealtimeEngine(api_key="k", model="m", voice="v", home=FakeHome(), owner="Will", watches=store)

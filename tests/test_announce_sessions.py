@@ -127,6 +127,22 @@ async def test_question_opener_asks_and_waits(tmp_path: Path) -> None:
     assert announcer.get(1).state == "spoken"  # still unread: he never answered
 
 
+async def test_arrival_batch_leads_with_a_welcome_and_waits(tmp_path: Path) -> None:
+    announcer = Announcer(tmp_path / "a.json")
+    announcer.enqueue("Task 7 is built.", kind="task", ref="task:7:1:built")
+    announcer.enqueue("Will just got home.", kind="presence", ref="presence:arrived:1")
+    engine, client = make_engine(announcer, info_close_s=0.2)
+    stats = await engine.run_conversation(NeverMic(), InstantSpeaker(), None, QuietUi(), announce=True)
+    lead = next(
+        e for e in client.connection.sent if e["type"] == "conversation.item.create"
+    )["item"]["content"][0]["text"]
+    assert lead.startswith("EVENT — Will just walked in")
+    assert lead.index("just got home") < lead.index("Task 7 is built")  # the welcome comes first
+    assert stats.ended_by == "no reply"
+    assert announcer.get(2).state == "read"  # the marker is ephemeral
+    assert announcer.get(1).state == "spoken"  # the news still awaits his acknowledgement
+
+
 async def test_mid_session_injection_is_read_at_once(tmp_path: Path, monkeypatch) -> None:
     from assistant.engines import realtime_engine as mod
 

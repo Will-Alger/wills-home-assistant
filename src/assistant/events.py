@@ -211,6 +211,9 @@ class EventWatcher:
         connector: Callable[..., Any] | None = None,
         log: Callable[[str], None] | None = None,
         journal: Any | None = None,
+        on_state: Callable[[str, str | None, str | None], Any] | None = None,
+        on_event: dict[str, Callable[[dict[str, Any]], Any]] | None = None,
+        on_connect: Callable[[], Any] | None = None,
     ) -> None:
         self._url = url.rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
         self._token = token
@@ -219,6 +222,11 @@ class EventWatcher:
         self._journal = journal
         self._connector = connector
         self._log = log or (lambda _m: None)
+        # hooks: every state change (presence), other HA event types by name
+        # (phone notification taps), and each (re)connect (presence resync)
+        self._on_state = on_state
+        self._on_event = dict(on_event or {})
+        self._on_connect = on_connect
         self._stop = asyncio.Event()
         self.events_seen = 0
 
@@ -256,7 +264,15 @@ class EventWatcher:
             if auth.get("type") != "auth_ok":
                 raise RuntimeError(f"Home Assistant refused the token: {auth.get('message', auth)}")
             await ws.send(json.dumps({"id": 1, "type": "subscribe_events", "event_type": "state_changed"}))
-            self._log("event watcher: connected, watching state changes")
+            for n, event_type in enumerate(self._on_event, start=2):
+                await ws.send(json.dumps({"id": n, "type": "subscribe_events", "event_type": event_type}))
+            extra = f" + {', '.join(self._on_event)}" if self._on_event else ""
+            self._log(f"event watcher: connected, watching state changes{extra}")
+            if self._on_connect is not None:
+                with contextlib.suppress(Exception):
+                    result = self._on_connect()
+                    if asyncio.iscoroutine(result):
+                        await result
             while not self._stop.is_set():
                 raw = await ws.recv()
                 if raw is None:
@@ -271,13 +287,25 @@ class EventWatcher:
             return []
         if msg.get("type") != "event":
             return []
-        data = (msg.get("event") or {}).get("data") or {}
+        event = msg.get("event") or {}
+        data = event.get("data") or {}
+        event_type = str(event.get("event_type") or "state_changed")
+        if event_type != "state_changed":
+            handler = self._on_event.get(event_type)
+            if handler is not None:
+                self.events_seen += 1
+                with contextlib.suppress(Exception):
+                    handler(dict(data))
+            return []
         entity_id = str(data.get("entity_id") or "")
         if not entity_id:
             return []
         old = (data.get("old_state") or {}).get("state")
         new = (data.get("new_state") or {}).get("state")
         self.events_seen += 1
+        if self._on_state is not None:
+            with contextlib.suppress(Exception):
+                self._on_state(entity_id, old, new)
         said: list[str] = []
         for watch, text in self._store.evaluate(entity_id, old, new):
             if self._journal is not None:

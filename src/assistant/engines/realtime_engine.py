@@ -192,7 +192,9 @@ arrive mid-conversation: mention it briefly at a natural moment, then carry \
 on. Never attribute an event to the speaker.
 
 Notifications: things you announced that {owner} has not acknowledged, plus \
-anything held back for him, are UNREAD. Right now: {unread}. When a \
+anything held back for him, are UNREAD. Right now: {unread}. Presence: \
+{presence} (delivery is handled for you: nothing is spoken to an empty \
+house, urgent things reach his phone). When a \
 conversation starts with unread items, lead with the count in a few words \
 ("two things while you were out — want them?") once the current request is \
 handled — but not when it was a one-shot command that closes. Read them out \
@@ -903,10 +905,12 @@ class RealtimeEngine:
         routines: Any | None = None,
         journal: Any | None = None,
         sessions: Any | None = None,
+        presence: Any | None = None,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
         self._journal = journal  # what she did and saw, by day
         self._sessions = sessions  # recent conversations, for continuity
+        self._presence = presence  # is the owner home? (a wake session is proof)
         self._model = model
         self._voice = voice  # may be swapped to FALLBACK_VOICE during _configure
         self.voice_note: str | None = None
@@ -974,6 +978,7 @@ class RealtimeEngine:
             staged=self._board.staged_paragraph() if self._board else "",
             unread=self._announcer.unread_summary() if self._announcer is not None else "none",
             recent=self._sessions.recent_text() if self._sessions is not None else "none",
+            presence=self._presence.describe() if self._presence is not None else "(not tracked)",
             extra=extra,
         )
         audio_in: dict[str, Any] = {
@@ -1594,6 +1599,9 @@ class RealtimeEngine:
         ended = asyncio.Event()
 
         self._ui_tool_hook = getattr(ui, "tool", None)  # observability: show tool outcomes
+        if not announce and self._presence is not None:
+            with contextlib.suppress(Exception):
+                self._presence.observe("home", source="voice")  # he said the wake word: he is here
         async with self._client.realtime.connect(model=self._model) as connection:
             await self._configure(connection, transcription=True)
             if self.voice_note:

@@ -40,7 +40,7 @@ _BACKOFF_S = (0.0, 60.0, 300.0, 900.0)  # by attempt number; then parked in the 
 _SWEEP_EVERY_S = 2.0
 _DUE_CACHE_S = 1.0
 _GROUP_WINDOW_S = 600.0  # repeats with the same explicit group merge within this
-_EPHEMERAL_KINDS = frozenset({"timer", "alarm", "briefing"})  # read once spoken
+_EPHEMERAL_KINDS = frozenset({"timer", "alarm", "briefing", "presence"})  # read once spoken
 
 Policy = Callable[["Announcement", float], str]  # -> speak | hold | push | inbox
 
@@ -361,6 +361,32 @@ class Announcer:
             self._due_cache = (-1.0, False)
             self._save()
         return out
+
+    def apply_decisions(self, now: float | None = None) -> int:
+        """Preferences that change what an item IS: 'inbox' parks a speak
+        item (never spoken, listed later); 'journal' resolves it at once
+        (recorded, never raised). Returns how many changed."""
+        if self._policy is None:
+            return 0
+        now = self._now() if now is None else now
+        quiet = self.is_quiet(now)
+        changed = 0
+        for item in self._items:
+            if not item.live:
+                continue
+            decision = self._decision(item, now, quiet)
+            if decision == "journal":
+                item.resolved = now
+                changed += 1
+                self._emit(item, "journaled")
+            elif decision == "inbox" and item.mode == "speak" and item.delivered is None:
+                item.mode = "inbox"
+                changed += 1
+                self._emit(item, "parked")
+        if changed:
+            self._due_cache = (-1.0, False)
+            self._save()
+        return changed
 
     def pending_push(self, now: float | None = None) -> list[Announcement]:
         """Live items the policy wants on his phone that haven't gone yet."""
