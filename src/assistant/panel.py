@@ -1,11 +1,12 @@
 """The Settings panel — a small desktop window she opens and closes by voice.
 
 It shows what the running session knows about itself (microphone, whether she
-is listening, voice, wake word, a status summary and a live log feed) and
-holds the two settings worth changing without a keyboard — her voice and her
-wake word — plus a restart button, because both only take effect on a fresh
-session. It is deliberately NOT a microphone switch: nothing in the panel
-turns listening on or off.
+is listening, the push-to-talk hotkey, voice, wake word, a status summary and
+a live log feed) and holds the two settings worth changing without a keyboard
+— her voice and her wake word — plus a restart button, because both only take
+effect on a fresh session. It is deliberately NOT a microphone switch: nothing
+in the panel turns listening on or off, and the hotkey is shown, not edited
+(it lives in `.env`, beside the wake word's threshold).
 
 The window is Tk (standard library, no new dependency) on its own thread, and
 every Tk call happens on that thread: the app posts intent through flags the
@@ -282,7 +283,12 @@ class _TkPanel:
 
         self._values: dict[str, Any] = {}
         for row, (key, label) in enumerate(
-            (("mic", "Microphone"), ("listening", "Listening"), ("summary", "Status"))
+            (
+                ("mic", "Microphone"),
+                ("listening", "Listening"),
+                ("hotkey", "Push to talk"),
+                ("summary", "Status"),
+            )
         ):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=2)
             value = ttk.Label(frame, text="…", wraplength=380, justify="left")
@@ -295,25 +301,25 @@ class _TkPanel:
         self._voice = tk.StringVar(
             value=str(snapshot.get("saved_voice") or snapshot.get("voice", ""))
         )
-        ttk.Label(frame, text="Voice").grid(row=3, column=0, sticky="w", pady=2)
+        ttk.Label(frame, text="Voice").grid(row=4, column=0, sticky="w", pady=2)
         ttk.Combobox(
             frame, textvariable=self._voice, values=self._panel.voice_choices(),
             state="readonly", width=18,
-        ).grid(row=3, column=1, sticky="w", pady=2)
+        ).grid(row=4, column=1, sticky="w", pady=2)
 
         self._wake_choices = self._panel.wake_choices()
         current = str(snapshot.get("saved_wake_word") or snapshot.get("wake_word", ""))
         self._wake = tk.StringVar(
             value=next((k for k, v in self._wake_choices.items() if v == current), current)
         )
-        ttk.Label(frame, text="Wake word").grid(row=4, column=0, sticky="w", pady=2)
+        ttk.Label(frame, text="Wake word").grid(row=5, column=0, sticky="w", pady=2)
         ttk.Combobox(
             frame, textvariable=self._wake, values=list(self._wake_choices),
             state="readonly", width=18,
-        ).grid(row=4, column=1, sticky="w", pady=2)
+        ).grid(row=5, column=1, sticky="w", pady=2)
 
         buttons = ttk.Frame(frame)
-        buttons.grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 4))
+        buttons.grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 4))
         ttk.Button(buttons, text="Save", command=self._on_save).pack(side="left")
         ttk.Button(buttons, text="Restart assistant", command=self._on_restart).pack(
             side="left", padx=6
@@ -324,15 +330,15 @@ class _TkPanel:
             frame, text="Voice and wake word take effect on the next start.",
             wraplength=520, justify="left",
         )
-        self._message.grid(row=6, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        self._message.grid(row=7, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
-        ttk.Label(frame, text="Live log").grid(row=7, column=0, sticky="w")
+        ttk.Label(frame, text="Live log").grid(row=8, column=0, sticky="w")
         self._feed = tk.Text(frame, height=14, width=64, wrap="none", state="disabled")
-        self._feed.grid(row=8, column=0, columnspan=3, sticky="nsew")
+        self._feed.grid(row=9, column=0, columnspan=3, sticky="nsew")
         scroll = ttk.Scrollbar(frame, orient="vertical", command=self._feed.yview)
-        scroll.grid(row=8, column=3, sticky="ns")
+        scroll.grid(row=9, column=3, sticky="ns")
         self._feed.configure(yscrollcommand=scroll.set)
-        frame.rowconfigure(8, weight=1)
+        frame.rowconfigure(9, weight=1)
         frame.columnconfigure(2, weight=1)
 
         self._refresh()
@@ -358,6 +364,8 @@ class _TkPanel:
         self._values["listening"].configure(
             text="● yes — she is hearing you" if snapshot.get("listening") else "○ no"
         )
+        hotkey = str(snapshot.get("hotkey") or "")
+        self._values["hotkey"].configure(text=f"hold {hotkey}" if hotkey else "off")
         self._values["summary"].configure(text=str(snapshot.get("summary", "")))
         lines = list(snapshot.get("log", []))  # type: ignore[arg-type]
         if lines != self._shown:

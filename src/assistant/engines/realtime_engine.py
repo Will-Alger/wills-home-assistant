@@ -386,6 +386,20 @@ _QUIET_TOOLS = frozenset(
 _INJECT_QUIET_S = 2.0
 _INJECT_MIN_AGE_S = 3.0
 
+# Push to talk. A hold shorter than this, or one carrying nothing but room
+# tone, is a slip of the hand: throw the audio away rather than make her
+# answer silence. The peak is on the int16 scale, and deliberately LOW —
+# quiet speech must always get through, so this catches a dead mic and an
+# empty room, not every silent hold (the listening ding can leak into a
+# hold that opened the session). The duration rule is the exact one. Then:
+# how often the engine reads the key, and how long a release waits for the
+# microphone's own buffer to reach the socket when the session opened
+# mid-hold.
+_PTT_MIN_HOLD_S = 0.3
+_PTT_SILENCE_PEAK = 500
+_PTT_POLL_S = 0.02
+_PTT_FLUSH_S = 0.3
+
 BRAIN_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -1138,7 +1152,24 @@ class RealtimeEngine:
         """The voice actually in use — a gated one falls back on connect."""
         return self._voice
 
-    async def _session_config(self, transcription_model: str | None) -> dict[str, Any]:
+    def _audio_input(
+        self, transcription_model: str | None, *, turn_detection: bool = True
+    ) -> dict[str, Any]:
+        """The `audio.input` block. turn_detection=False sends null, which the
+        API reads as "the client decides when a turn ends" — push to talk."""
+        audio_in: dict[str, Any] = {
+            "format": {"type": "audio/pcm", "rate": REALTIME_RATE},
+            "turn_detection": (
+                {"type": "semantic_vad", "eagerness": self._eagerness} if turn_detection else None
+            ),
+        }
+        if transcription_model:
+            audio_in["transcription"] = {"model": transcription_model}
+        return audio_in
+
+    async def _session_config(
+        self, transcription_model: str | None, *, turn_detection: bool = True
+    ) -> dict[str, Any]:
         extra = f"\n{self._extra_instructions}\n" if self._extra_instructions else ""
         extra_repos = self._board.extra_repo_names() if self._board else []
         other_repos = (
@@ -1181,12 +1212,6 @@ class RealtimeEngine:
             delivery=self._delivery.text() if self._delivery is not None else "defaults",
             extra=extra,
         )
-        audio_in: dict[str, Any] = {
-            "format": {"type": "audio/pcm", "rate": REALTIME_RATE},
-            "turn_detection": {"type": "semantic_vad", "eagerness": self._eagerness},
-        }
-        if transcription_model:
-            audio_in["transcription"] = {"model": transcription_model}
         tools = realtime_tools(calendar=self._calendar is not None) + (
             MEMORY_TOOLS if self._memory else []
         )
@@ -1217,7 +1242,7 @@ class RealtimeEngine:
             "tool_choice": "auto",
             "output_modalities": ["audio"],
             "audio": {
-                "input": audio_in,
+                "input": self._audio_input(transcription_model, turn_detection=turn_detection),
                 "output": {
                     "format": {"type": "audio/pcm", "rate": REALTIME_RATE},
                     "voice": self._voice,
@@ -1225,7 +1250,9 @@ class RealtimeEngine:
             },
         }
 
-    async def _configure(self, connection: Any, transcription: bool) -> None:
+    async def _configure(
+        self, connection: Any, transcription: bool, *, turn_detection: bool = True
+    ) -> None:
         """Send session config and wait for acceptance before any audio flows —
         otherwise a rejected update leaves a session running with no tools.
         Degrades gracefully: a gated voice falls back; transcription steps
@@ -1238,7 +1265,12 @@ class RealtimeEngine:
         )
         for _attempt in range(6):
             await connection.send(
-                {"type": "session.update", "session": await self._session_config(transcribers[0])}
+                {
+                    "type": "session.update",
+                    "session": await self._session_config(
+                        transcribers[0], turn_detection=turn_detection
+                    ),
+                }
             )
             resend = False
             while not resend:
@@ -1909,11 +1941,22 @@ class RealtimeEngine:
     # ── live voice conversation ─────────────────────────────────────────────
 
     async def run_conversation(
-        self, mic: Any, speaker: Any, wake: Any, ui: Any, *, announce: bool = False
+        self,
+        mic: Any,
+        speaker: Any,
+        wake: Any,
+        ui: Any,
+        *,
+        announce: bool = False,
+        ptt: Any | None = None,
+        ptt_session: bool = False,
     ) -> SessionStats:
         """One wake-to-close conversation. `mic` must be a 24 kHz source.
         announce=True opens the session with HER speaking a queued
-        announcement (nobody said the wake word) and closes right after."""
+        announcement (nobody said the wake word) and closes right after.
+        `ptt` is the push-to-talk hotkey, watched for the whole session;
+        ptt_session=True means a press opened it, so turn detection is off
+        from the first breath and each hold is exactly one turn."""
         stats = SessionStats()
         speaking = False
         response_active = False
@@ -1926,7 +1969,9 @@ class RealtimeEngine:
             with contextlib.suppress(Exception):
                 self._presence.observe("home", source="voice")  # he said the wake word: he is here
         async with self._client.realtime.connect(model=self._model) as connection:
-            await self._configure(connection, transcription=True)
+            await self._configure(
+                connection, transcription=True, turn_detection=not ptt_session
+            )
             if self.voice_note:
                 note = getattr(ui, "note", None)
                 if note is not None:
@@ -1940,6 +1985,15 @@ class RealtimeEngine:
             opener_ids: list[int] = []  # everything spoken as an opener: read only if he replies
             interrupted = False  # wake-word barge-in happened
             session_started = time.monotonic()
+            # Push to talk: a hold in progress, when it began, and what the
+            # mic has put on the wire since. `vad_off` is what the SERVER is
+            # configured with right now.
+            ptt_active = False
+            ptt_started = 0.0
+            ptt_frames = 0
+            ptt_peak = 0
+            ptt_seen = getattr(ptt, "presses", 0) - (1 if ptt_session else 0)
+            vad_off = ptt_session
 
             async def deliver(items: list[Any], *, opener: bool) -> None:
                 """Hand queued announcements to the model as a SYSTEM item —
@@ -2005,7 +2059,7 @@ class RealtimeEngine:
                 await deliver(items, opener=True)
 
             async def pump_mic() -> None:
-                nonlocal speaking, interrupted
+                nonlocal speaking, interrupted, ptt_frames, ptt_peak
                 nonlocal quick_close_armed, quick_close_window, quick_close_reason
                 while True:
                     frame = await mic.get_frame()
@@ -2028,12 +2082,22 @@ class RealtimeEngine:
                                 quick_close_window = self._info_close_s
                                 quick_close_reason = "interrupted announcement"
                         continue
+                    if ptt_session and not ptt_active:
+                        # Push to talk with nobody holding: the buffer must
+                        # stay empty, or the next commit would carry every
+                        # sound the room made since his last turn.
+                        continue
                     await connection.send(
                         {
                             "type": "input_audio_buffer.append",
                             "audio": base64.b64encode(frame).decode("ascii"),
                         }
                     )
+                    if ptt_active:
+                        ptt_frames += 1
+                        ptt_peak = max(
+                            ptt_peak, int(np.abs(np.frombuffer(frame, dtype=np.int16)).max())
+                        )
 
             pending: list[asyncio.Task] = []
 
@@ -2048,13 +2112,19 @@ class RealtimeEngine:
                     ended.set()
                     return
                 if listening and self._cues is not None:
-                    # The ding goes out BEFORE half-duplex lifts, so the mic
-                    # never feeds our own chime back to the model.
-                    self._cues.start(speaker)
-                    await speaker.wait_idle()
+                    if ptt_session:
+                        # Each hold is one turn: she is not listening again
+                        # until he presses, so neither ding nor flag says so.
+                        self._cues.idle()
+                    else:
+                        # The ding goes out BEFORE half-duplex lifts, so the
+                        # mic never feeds our own chime back to the model.
+                        self._cues.start(speaker)
+                        await speaker.wait_idle()
                 speaking = False
                 mic.drain()
-                ui.listening()
+                if not ptt_session:
+                    ui.listening()
 
             # One-shot quick close: a single user utterance gets its answer,
             # then the ENGINE closes the session after a short silence — no
@@ -2066,6 +2136,111 @@ class RealtimeEngine:
             quick_close_armed = False
             quick_close_window = self._command_close_s
             quick_close_reason = "command complete"
+
+            # ── push to talk: his key press is the start and end of a turn ──
+
+            async def set_turn_detection(on: bool) -> None:
+                """Hand turn-taking to the server, or take it back. Only
+                `audio.input` is sent: the API leaves out what a session.update
+                omits, and `voice` must never appear once she has spoken."""
+                nonlocal vad_off
+                await connection.send(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "audio": {
+                                "input": self._audio_input(
+                                    self._transcription_model, turn_detection=on
+                                )
+                            },
+                        },
+                    }
+                )
+                vad_off = not on
+
+            async def ptt_press() -> None:
+                """He is holding the key: his turn starts now, whatever she
+                was in the middle of."""
+                nonlocal ptt_active, ptt_started, ptt_frames, ptt_peak
+                nonlocal speaking, interrupted, last_activity, quick_close_armed
+                if ptt_active:
+                    return
+                if speaking or response_active:
+                    # Barge-in, exactly as the wake word does it: she stops
+                    # mid-word and he gets the floor.
+                    speaker.clear()
+                    if response_active:
+                        await connection.send({"type": "response.cancel"})
+                    interrupted = True
+                    speaking = False
+                    ui.interrupted()
+                if not vad_off:
+                    await set_turn_detection(False)
+                await connection.send({"type": "input_audio_buffer.clear"})
+                ptt_active = True
+                ptt_started = getattr(ptt, "pressed_at", 0.0) or time.monotonic()
+                ptt_frames = 0
+                ptt_peak = 0
+                quick_close_armed = False
+                last_activity = time.monotonic()
+                if self._cues is not None:
+                    self._cues.start(speaker)  # silent when the ding already rang
+                ui.listening()
+
+            async def ptt_release() -> None:
+                """He let go: end the turn on HIS timing, not the API's."""
+                nonlocal ptt_active, last_activity
+                nonlocal quick_close_armed, quick_close_window, quick_close_reason
+                if not ptt_active:
+                    return
+                let_go = getattr(ptt, "released_at", 0.0)
+                held_s = (let_go if let_go > ptt_started else time.monotonic()) - ptt_started
+                long_enough = held_s >= _PTT_MIN_HOLD_S
+                if self._cues is not None and long_enough:
+                    # The window closed because he let go — the flag drops on
+                    # his action, never on the API's confirmation.
+                    self._cues.end(speaker)
+                if long_enough and ptt_frames == 0:
+                    # The session was still connecting when he pressed: his
+                    # words are in the mic's own queue. Give them a moment to
+                    # reach the socket before deciding he said nothing.
+                    deadline = time.monotonic() + _PTT_FLUSH_S
+                    while ptt_frames == 0 and time.monotonic() < deadline:
+                        await asyncio.sleep(_PTT_POLL_S)
+                spoke = long_enough and ptt_peak >= _PTT_SILENCE_PEAK
+                ptt_active = False
+                if spoke:
+                    quick_close_armed = False  # an answer is on its way
+                    await connection.send({"type": "input_audio_buffer.commit"})
+                    await connection.send({"type": "response.create"})
+                else:
+                    # A slip of the hand, or a hold with nothing in it: drop
+                    # the scraps. Committing an empty buffer is an API error,
+                    # and answering room tone is worse than saying nothing.
+                    await connection.send({"type": "input_audio_buffer.clear"})
+                    if self._cues is not None:
+                        self._cues.idle()
+                    if ptt_session:
+                        quick_close_armed = True
+                        quick_close_window = self._command_close_s
+                        quick_close_reason = "nothing said"
+                if not ptt_session and vad_off:
+                    await set_turn_detection(True)  # back to the wake-word contract
+                last_activity = time.monotonic()
+
+            async def ptt_watch() -> None:
+                """The hotkey read as a level, never as a queue of edges: a
+                session that opens mid-hold sees the same state the idle loop
+                did, and nothing can be lost between them."""
+                nonlocal ptt_seen
+                while True:
+                    if ptt_active and (not ptt.held or ptt.presses > ptt_seen):
+                        await ptt_release()
+                    if not ptt_active and ptt.presses > ptt_seen:
+                        ptt_seen = ptt.presses
+                        await ptt_press()
+                    await asyncio.sleep(_PTT_POLL_S)
 
             async def receive() -> None:
                 nonlocal speaking, response_active, closing, last_activity
@@ -2143,6 +2318,12 @@ class RealtimeEngine:
                         ran = self.last_response_tools
                         if any(t in COMMAND_TOOLS for t in ran):
                             command_pending = True
+                        elif not ran and ptt_session:
+                            # Each hold is one turn: she answers, then closes
+                            # unless he holds again.
+                            quick_close_armed = True
+                            quick_close_window = self._command_close_s
+                            quick_close_reason = "push to talk turn done"
                         elif not ran and speech_segments <= 1:
                             # the final spoken answer of a single-utterance
                             # session: command confirmations close fast,
@@ -2186,8 +2367,10 @@ class RealtimeEngine:
             async def idle_watchdog() -> None:
                 while True:
                     await asyncio.sleep(0.5)
-                    if tool_busy:
-                        continue  # a tool call is running: no injection, no closing
+                    if tool_busy or ptt_active:
+                        # A tool call is running, or he is holding the hotkey:
+                        # nothing closes and nothing is injected under him.
+                        continue
                     quiet = time.monotonic() - last_activity
                     if (
                         self._announcer is not None
@@ -2213,11 +2396,19 @@ class RealtimeEngine:
                             ended.set()
                             return
 
+            if ptt is not None and ptt_session and ptt.presses > ptt_seen:
+                # He is holding right now — start his turn before the mic
+                # pump does anything, so the frames the microphone buffered
+                # while we were connecting go into THIS utterance.
+                ptt_seen = ptt.presses
+                await ptt_press()
             tasks = [
                 asyncio.create_task(pump_mic()),
                 asyncio.create_task(receive()),
                 asyncio.create_task(idle_watchdog()),
             ]
+            if ptt is not None:
+                tasks.append(asyncio.create_task(ptt_watch()))
             try:
                 await ended.wait()
                 if stats.ended_by == "unknown":

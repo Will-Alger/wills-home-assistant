@@ -21,10 +21,13 @@ class AssistantStatus:
         voice: str = "",
         wake_word: str = "",
         home: str = "",
+        hotkey: str = "",
         keep_lines: int = 300,
     ) -> None:
         self._lock = threading.Lock()
-        self._fields = {"mic": mic, "voice": voice, "wake_word": wake_word, "home": home}
+        self._fields = {
+            "mic": mic, "voice": voice, "wake_word": wake_word, "home": home, "hotkey": hotkey,
+        }
         self._state = "starting"
         self._listening = False
         self._error = ""
@@ -34,7 +37,7 @@ class AssistantStatus:
     # ── writes (event loop) ───────────────────────────────────────────────
 
     def configure(self, **fields: str) -> None:
-        """Set the descriptive fields (mic, voice, wake_word, home)."""
+        """Set the descriptive fields (mic, voice, wake_word, home, hotkey)."""
         with self._lock:
             for key, value in fields.items():
                 if key in self._fields and value:

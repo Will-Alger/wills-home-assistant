@@ -1,8 +1,9 @@
 """The capture cues: you always know whether she is hearing you.
 
-One ding when a listening window opens — the wake, and every follow-up turn
-in the same conversation — a smaller, falling one when it closes normally,
-and the low error tone when capture fails, times out, or the session errors.
+One ding when a listening window opens — the wake, a push-to-talk hold, and
+every follow-up turn in the same conversation — a smaller, falling one when it
+closes normally, and the low error tone when capture fails, times out, or the
+session errors.
 A failure never plays the listening ding and clears the listening flag, so
 neither the tone nor the Settings panel can tell you she's listening when
 she isn't.
@@ -79,6 +80,13 @@ class VoiceCues:
             with contextlib.suppress(Exception):
                 self._status.error(message or "capture failed")
                 self._status.set_listening(False)
+
+    def idle(self) -> None:
+        """Nobody is being listened to and nothing is being worked on, but the
+        session is still open — push to talk between holds, or a hold so short
+        it caught nothing. Silent on purpose: a tone here would be a lie."""
+        self.listening = False
+        self._state("idle")
 
     def session_end(self, speaker: Any | None = None) -> None:
         """The conversation is over: the goodbye chime, back to idle."""

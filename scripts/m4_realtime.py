@@ -8,7 +8,9 @@
 
 Say "hey jarvis" to open a conversation; it speaks, listens, runs your
 lights, and closes itself when you wrap up ("that's all") or after silence.
-Say the wake phrase mid-reply to cut it off. Ctrl+C quits.
+Say the wake phrase mid-reply to cut it off. Or hold the push-to-talk hotkey
+(PTT_HOTKEY, default Ctrl+Alt) and speak: your hold IS the turn, so a pause
+never ends it and she stops listening the moment you let go. Ctrl+C quits.
 """
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ from assistant.events import EventWatcher, WatchStore
 from assistant.followups import FollowUpStore
 from assistant.home import HomeAssistantClient
 from assistant.home.fake import FakeHome
+from assistant.hotkey import HotkeyError, build_push_to_talk
 from assistant.journal import Journal
 from assistant.learning import Reflector
 from assistant.llm.anthropic_provider import AnthropicProvider
@@ -243,14 +246,23 @@ def build_engine(fake: bool):
             name=settings.assistant_name,
             owner=settings.owner_name,
         )
+    hotkey = None
+    hotkey_note = ""
+    try:
+        hotkey = build_push_to_talk(settings.ptt_hotkey)
+    except HotkeyError as err:  # a typo must never cost her the wake word
+        hotkey_note = f"push to talk is off: {err}"
     status = AssistantStatus(
         mic=describe_device(settings.audio_input_device),
         voice=settings.realtime_voice,
         wake_word=settings.wake_phrase,
         home="fake apartment" if fake else settings.ha_url,
+        hotkey=hotkey.label if hotkey is not None else "",
     )
     for change in applied:
         status.note(f"settings panel: {change}")
+    if hotkey_note:
+        status.note(hotkey_note)
     cues = VoiceCues(rate=REALTIME_RATE, status=status)
 
     def request_restart() -> None:
@@ -311,6 +323,8 @@ def build_engine(fake: bool):
     engine.presence = presence
     engine.home = home
     engine.status = status  # what the settings panel shows
+    engine.hotkey = hotkey  # push to talk: held right now, presses so far
+    engine.hotkey_note = hotkey_note
     engine.cues = cues
     engine.panel = panel
     engine.overrides = overrides
@@ -450,6 +464,10 @@ async def voice(fake: bool) -> int:
     scheduler_task = asyncio.create_task(scheduler.run()) if scheduler is not None else None
     courier = getattr(engine, "courier", None)
     courier_task = asyncio.create_task(courier.run()) if courier is not None else None
+    hotkey = getattr(engine, "hotkey", None)
+    hotkey_task = asyncio.create_task(hotkey.run()) if hotkey is not None else None
+    if getattr(engine, "hotkey_note", ""):
+        say(status, engine.hotkey_note, "yellow")
     console.print("Loading wake model...")
     wake, session_wake = load_wake_detectors(settings, getattr(engine, "overrides", None))
     total_cost = 0.0
@@ -457,10 +475,11 @@ async def voice(fake: bool) -> int:
     if status is not None:
         status.configure(mic=mic_name, voice=settings.realtime_voice, wake_word=settings.wake_phrase)
         status.set_state("idle")
+    hold = f" · or hold {hotkey.label} and speak" if hotkey is not None else ""
     say(
         status,
-        f"Voice online. “{settings.wake_phrase}” to talk to {settings.assistant_name} · "
-        f"voice: {settings.realtime_voice} · mic: {mic_name} · "
+        f"Voice online. “{settings.wake_phrase}” to talk to {settings.assistant_name}"
+        f"{hold} · voice: {settings.realtime_voice} · mic: {mic_name} · "
         f"home: {'fake apartment' if fake else settings.ha_url} · Ctrl+C quits.",
     )
     failures = 0
@@ -468,7 +487,7 @@ async def voice(fake: bool) -> int:
         while True:
             try:
                 total_cost = await one_cycle(
-                    settings, engine, wake, session_wake, total_cost, reflector
+                    settings, engine, wake, session_wake, total_cost, reflector, hotkey
                 )
                 failures = 0
             except (KeyboardInterrupt, asyncio.CancelledError):
@@ -490,14 +509,16 @@ async def voice(fake: bool) -> int:
                 if actions is not None:
                     await actions.drain()  # never exit mid-merge from a phone tap
                 return 0  # the always-on service relaunches us in seconds
-    for background in (watcher_task, scheduler_task, courier_task):
+    for background in (watcher_task, scheduler_task, courier_task, hotkey_task):
         if background is not None:
             background.cancel()
     console.print(f"\n[dim]total: ${total_cost:.4f}[/dim]")
     return 0
 
 
-async def one_cycle(settings, engine, wake, session_wake, total_cost: float, reflector) -> float:
+async def one_cycle(
+    settings, engine, wake, session_wake, total_cost: float, reflector, hotkey=None
+) -> float:
     """One idle→wake→conversation cycle; returns the updated running cost."""
     await asyncio.sleep(0.2)  # let PortAudio settle between 24k/16k stream switches
     if engine.restart_requested:
@@ -517,15 +538,23 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
             if status is not None:
                 status.configure(mic=mic16.device_in_use)  # the mic she is really on
                 status.set_state("idle")
-            console.print("[dim]○ idle — say the wake phrase[/dim]")
+            waiting = "say the wake phrase"
+            if hotkey is not None:
+                waiting += f", or hold {hotkey.label}"
+            console.print(f"[dim]○ idle — {waiting}[/dim]")
             trigger = await wait_for_trigger(
-                mic16, wake, announcer, restart=lambda: engine.restart_requested
+                mic16, wake, announcer, restart=lambda: engine.restart_requested, ptt=hotkey
             )
     if trigger == "restart":
         return total_cost
     announcing = trigger == "announce"
+    push = trigger == "ptt"
     if not announcing and cues is not None:
-        cues.start()  # the wake ding, through a fresh stream: no session yet
+        # The listening ding, through a fresh stream: no session yet. Push to
+        # talk gets it the moment he presses — his hold and the microphone
+        # both start now, so by the time the socket is up his first words are
+        # already queued behind it.
+        cues.start()
     # Session: 24 kHz mic + speaker, wake detector kept for barge-in
     session_wake.reset()
     async with (
@@ -540,16 +569,19 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
             say(status, "◆ announcing", "cyan")
             with contextlib.suppress(Exception):
                 speaker.enqueue(tones.pcm("announce", REALTIME_RATE))
+        elif push:
+            say(status, "● connected — keep holding, let go when you're done", "green")
         else:
             say(status, "● connected — talk", "green")
         sessions = getattr(engine, "sessions", None)
         row = None
         if sessions is not None:
             with contextlib.suppress(Exception):
-                row = sessions.start("announce" if announcing else "wake")
+                row = sessions.start("announce" if announcing else "ptt" if push else "wake")
         stats = await engine.run_conversation(
             mic24, speaker, session_wake,
             ConsoleUi(settings.assistant_name, status), announce=announcing,
+            ptt=hotkey, ptt_session=push,
         )
         # Goodbye chime through the SESSION speaker: a fresh sd.play stream
         # right after this one closes silently loses the race on Windows.
@@ -571,6 +603,8 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
         "nothing to announce": "announcement was already handled",
         "no reply": "asked, no reply — back to sleep",
         "interrupted announcement": "you cut in — closed after quiet",
+        "push to talk turn done": "answered — hold the key again to carry on",
+        "nothing said": "nothing was said — back to sleep",
     }.get(stats.ended_by, stats.ended_by)
     say(
         status,

@@ -1,11 +1,11 @@
 """The app's idle loop, extracted so it can be tested without audio.
 
-While idle, the app watches every 80 ms mic frame for the wake word AND
-checks whether an announcement is due — the two things that can start a
-conversation. `wait_for_trigger` returns which one happened (or "restart"
-when something else — a phone approve — asked for one). `record_session`
-is the bookkeeping after a conversation: the session log, the journal, and
-reflection.
+While idle, the app watches every 80 ms mic frame for the wake word, reads
+the push-to-talk hotkey, and checks whether an announcement is due — the
+three things that can start a conversation. `wait_for_trigger` returns which
+one happened (or "restart" when something else — a phone approve — asked for
+one). `record_session` is the bookkeeping after a conversation: the session
+log, the journal, and reflection.
 """
 
 from __future__ import annotations
@@ -20,13 +20,17 @@ async def wait_for_trigger(
     wake: Any,
     announcer: Any = None,
     restart: Callable[[], bool] | None = None,
+    ptt: Any = None,
 ) -> str:
-    """Block until the wake phrase is heard ("wake"), an announcement is
-    ready to be spoken ("announce"), or a restart was requested ("restart")."""
+    """Block until the wake phrase is heard ("wake"), the push-to-talk hotkey
+    is held ("ptt"), an announcement is ready to be spoken ("announce"), or a
+    restart was requested ("restart")."""
     while True:
         frame = await source.get_frame()
         if wake.detect(frame):
             return "wake"
+        if ptt is not None and ptt.held:
+            return "ptt"
         if announcer is not None and announcer.due():
             return "announce"
         if restart is not None and restart():
