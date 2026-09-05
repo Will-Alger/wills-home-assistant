@@ -32,25 +32,7 @@ class FakeConnection:
         if event["type"] == "session.update":
             self._events.put_nowait(SimpleNamespace(type="session.updated"))
         elif event["type"] == "response.create":
-            self._events.put_nowait(SimpleNamespace(type="response.created"))
-            self._events.put_nowait(
-                SimpleNamespace(
-                    type="response.output_audio.delta",
-                    delta=base64.b64encode(b"\x00\x00" * 240).decode("ascii"),
-                )
-            )
-            self._events.put_nowait(
-                SimpleNamespace(
-                    type="response.output_audio_transcript.done",
-                    transcript="Heads up: the build finished.",
-                )
-            )
-            self._events.put_nowait(
-                SimpleNamespace(
-                    type="response.done",
-                    response=SimpleNamespace(output=[], usage=None),
-                )
-            )
+            self._reply("Heads up: the build finished.")
             if self.say_after_response and not self._said:
                 self._said = True
                 self._events.put_nowait(SimpleNamespace(type="input_audio_buffer.speech_started"))
@@ -62,9 +44,27 @@ class FakeConnection:
                     )
                 )
 
-    def user_says(self, text: str) -> None:
+    def _reply(self, transcript: str) -> None:
+        """One spoken response with no tool calls: created, audio, transcript, done."""
+        self._events.put_nowait(SimpleNamespace(type="response.created"))
+        self._events.put_nowait(
+            SimpleNamespace(
+                type="response.output_audio.delta",
+                delta=base64.b64encode(b"\x00\x00" * 240).decode("ascii"),
+            )
+        )
+        self._events.put_nowait(
+            SimpleNamespace(type="response.output_audio_transcript.done", transcript=transcript)
+        )
+        self._events.put_nowait(
+            SimpleNamespace(type="response.done", response=SimpleNamespace(output=[], usage=None))
+        )
+
+    def user_says(self, text: str, *, reply: str | None = None) -> None:
         """Script a user turn at a moment the test chooses (say_after_response
-        fires one immediately instead, in the same batch as the reply)."""
+        fires one immediately instead, in the same batch as the reply). With
+        `reply`, the server answers it the way VAD-created responses do — a
+        spoken reply with no tool call."""
         self._events.put_nowait(SimpleNamespace(type="input_audio_buffer.speech_started"))
         self._events.put_nowait(SimpleNamespace(type="input_audio_buffer.speech_stopped"))
         self._events.put_nowait(
@@ -72,6 +72,8 @@ class FakeConnection:
                 type="conversation.item.input_audio_transcription.completed", transcript=text
             )
         )
+        if reply is not None:
+            self._reply(reply)
 
     async def recv(self) -> Any:
         return await self._events.get()

@@ -47,6 +47,29 @@ def is_stop_command(transcript: str) -> bool:
     return bool(_STOP_COMMAND.match(transcript.strip().lower()))
 
 
+# "That's all" means the conversation is over, whatever the model does next:
+# the ENGINE closes after her goodbye plays. The whole utterance must be a
+# wrap-up — "that's all for the lights, now play music" is not one.
+_WRAPUP_FILLER = re.compile(
+    r"^(?:(?:ok(?:ay)?|alright|all right|no|nope|yeah|yes|yep|cool|great|perfect|"
+    r"thanks|thank you|thanks a lot|alexa)\b[,!. ]*)+"
+)
+_WRAPUP_TAIL = re.compile(r"(?:[,!. ]*\b(?:alexa|thanks|thank you|for now|for today|for tonight))+[,!. ]*$")
+_WRAPUP = re.compile(
+    r"^(?:that'?s (?:all|it)|that'?ll (?:be all|do)|that is (?:all|it)|that will (?:be all|do)|"
+    r"nothing else|no thanks|no thank you|i'?m (?:good|done|all set)|we'?re done|all set|all good|"
+    r"never ?mind|(?:bye|goodbye|bye bye)|good ?night|(?:talk|see you|catch you) later|later)$"
+)
+
+
+def is_wrapup(transcript: str) -> bool:
+    """The speaker said the conversation is over ("that's all", "thanks, bye")."""
+    text = transcript.strip().lower().replace("’", "'")
+    text = _WRAPUP_TAIL.sub("", text)
+    text = _WRAPUP_FILLER.sub("", text)
+    return bool(text) and bool(_WRAPUP.match(text.strip("!,. ")))
+
+
 REALTIME_RATE = 24_000
 FRAME_SAMPLES_24K = 1920  # 80 ms
 FALLBACK_VOICE = "marin"  # used automatically when the configured voice is gated
@@ -417,6 +440,7 @@ _QUIET_TOOLS = frozenset(
 # shrink them.
 _INJECT_QUIET_S = 2.0
 _INJECT_MIN_AGE_S = 3.0
+_WRAPUP_GRACE_S = 1.5  # after "that's all" with nothing playing: close, don't listen
 
 BRAIN_TOOLS: list[dict[str, Any]] = [
     {
@@ -2032,7 +2056,8 @@ class RealtimeEngine:
             announcing_opener = False  # ...and they opened this session (nobody spoke)
             waits_for_reply = False  # ...and they ask him something (question / arrival)
             opener_ids: list[int] = []  # everything spoken as an opener: read only if he replies
-            interrupted = False  # wake-word barge-in happened
+            interrupted = False  # wake-word barge-in cut THIS response (reset per response)
+            wrapup_heard = False  # he said "that's all": close after her goodbye, tool or no tool
             session_started = time.monotonic()
 
             async def deliver(items: list[Any], *, opener: bool) -> None:
@@ -2134,9 +2159,11 @@ class RealtimeEngine:
             async def finish_playback(close_after: bool, listening: bool = True) -> None:
                 nonlocal speaking
                 await speaker.wait_idle()
-                if close_after and not interrupted:
+                if (close_after or wrapup_heard) and not interrupted:
                     # (a barge-in during the audio keeps the session open: he
                     # wanted to say something)
+                    if wrapup_heard and not close_after:
+                        stats.ended_by = "wrap-up"  # he said so; the model never called the tool
                     speaking = False
                     mic.drain()
                     ended.set()
@@ -2165,7 +2192,7 @@ class RealtimeEngine:
                 nonlocal speaking, response_active, closing, last_activity
                 nonlocal speech_segments, command_pending, quick_close_armed
                 nonlocal quick_close_window, quick_close_reason, announcing, announcing_opener
-                nonlocal tool_busy
+                nonlocal tool_busy, interrupted, wrapup_heard
                 heard = ""  # live accumulation of the user's words
                 while True:
                     event = await connection.recv()
@@ -2176,6 +2203,9 @@ class RealtimeEngine:
                         speaker.enqueue(base64.b64decode(event.delta))
                     elif kind == "response.created":
                         response_active = True
+                        # a barge-in belongs to the response it cut; a stale flag
+                        # used to veto every later goodbye ("closing out" … ding)
+                        interrupted = False
                     elif kind.endswith("audio_transcript.done"):
                         said = getattr(event, "transcript", "")
                         stats.transcript.append(("alexa", said))
@@ -2189,6 +2219,8 @@ class RealtimeEngine:
                         stats.transcript.append(("you", said))
                         stats.replied = True
                         ui.user_said(said)
+                        if is_wrapup(said):
+                            wrapup_heard = True  # the engine closes after her goodbye
                         if is_stop_command(said):
                             # Instant hard stop: no model round-trip, works even
                             # when background audio keeps the session alive.
@@ -2248,7 +2280,9 @@ class RealtimeEngine:
                             else:
                                 quick_close_window = self._info_close_s
                                 quick_close_reason = "question answered"
-                        close_after = closing
+                        close_after = closing or wrapup_heard
+                        if wrapup_heard and not closing:
+                            stats.ended_by = "wrap-up"
                         if announced_now and announce and speech_segments == 0 and not interrupted:
                             if waits_for_reply:
                                 # she asked him something (or welcomed him home):
@@ -2298,6 +2332,12 @@ class RealtimeEngine:
                             await deliver(items, opener=False)
                             continue
                     if not speaking and not response_active:
+                        if wrapup_heard and quiet > _WRAPUP_GRACE_S:
+                            # his transcript landed after her reply had already
+                            # finished (or she never replied): no listening window
+                            stats.ended_by = "wrap-up"
+                            ended.set()
+                            return
                         if quick_close_armed and quiet > quick_close_window:
                             stats.ended_by = quick_close_reason
                             ended.set()

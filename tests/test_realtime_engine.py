@@ -127,6 +127,22 @@ async def test_read_tools_are_answered_in_one_breath(tmp_path) -> None:
     assert "BEFORE SPEAKING" not in by_name["set_lights"]  # commands are confirmed after, not narrated before
 
 
+def test_wrapup_phrases_are_recognised_whole_not_by_fragment() -> None:
+    from assistant.engines.realtime_engine import is_wrapup
+
+    for said in (
+        "That's all.", "that’s it", "OK, that's all, thanks!", "No, that's all Alexa.", "Thanks, bye!",
+        "Nothing else, thank you.", "Alright, I'm good.", "Never mind.", "Good night", "that'll be all for now",
+        "Okay thanks that's it for tonight.", "Bye bye.",
+    ):
+        assert is_wrapup(said), said
+    for said in (
+        "That's all for the lights, now play some music.", "Is that all you can do?", "Bye the way, what time is it",
+        "Good night mode please", "", "thanks", "ok", "turn it off",
+    ):
+        assert not is_wrapup(said), said
+
+
 def test_command_tools_cover_home_actions_only() -> None:
     """COMMAND_TOOLS drives the engine's one-shot auto-close: action tools
     only — info/chat tools must not trigger it."""

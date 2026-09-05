@@ -24,7 +24,7 @@ from rich.console import Console
 from rich.markup import render
 
 from assistant.announce import Announcer
-from assistant.app import RescanClock, record_session, wait_for_trigger
+from assistant.app import RescanClock, record_session, reflect_session, wait_for_trigger
 from assistant.audio import devices, tones
 from assistant.audio.cues import VoiceCues
 from assistant.audio.mic import Microphone, describe_device
@@ -626,6 +626,7 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
     reason = {
         "idle timeout": "quiet too long — closed to stop the meter; say the wake word anytime",
         "end_conversation": "she wrapped up",
+        "wrap-up": "you wrapped up — closed after her goodbye",
         "question answered": "question answered — closed after quiet",
         "announcement delivered": "announced, back to sleep",
         "nothing to announce": "announcement was already handled",
@@ -638,14 +639,23 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
         f"tools: {stats.tool_calls or 'none'} · ${stats.cost_usd:.4f} "
         f"(${total_cost:.4f} session)",
     )
-    reflection = await record_session(
-        sessions, getattr(engine, "journal", None), stats, row, reflector
-    )
-    if reflection is not None:
-        for lesson in reflection.lessons:
-            console.print(f"[magenta]✎ learned:[/magenta] {lesson}")
-        for obs in reflection.observations:
-            console.print(f"[magenta]✎ noticed (will ask):[/magenta] {obs}")
+    await record_session(sessions, getattr(engine, "journal", None), stats, row, None)
+    if reflector is not None and stats.transcript:
+        # Reflection is a Claude CLI call (seconds). It used to run here, in
+        # line, with the wake-word mic closed: "hey alexa" right after a
+        # conversation went unheard. Now the mic reopens at once.
+        async def reflect_later() -> None:
+            reflection = await reflect_session(reflector, sessions, row, stats)
+            if reflection is not None:
+                for lesson in reflection.lessons:
+                    console.print(f"[magenta]✎ learned:[/magenta] {lesson}")
+                for obs in reflection.observations:
+                    console.print(f"[magenta]✎ noticed (will ask):[/magenta] {obs}")
+
+        keep = engine.__dict__.setdefault("_reflections", set())
+        task = asyncio.create_task(reflect_later())
+        keep.add(task)
+        task.add_done_callback(keep.discard)
     return total_cost
 
 

@@ -89,8 +89,17 @@ async def record_session(
                     "tools": list(stats.tool_calls)[:20],
                 },
             )
+    if reflector is None:
+        return None
+    return await reflect_session(reflector, sessions, row, stats)
+
+
+async def reflect_session(reflector: Any, sessions: Any, row: Any, stats: Any) -> Any | None:
+    """Reflection is a Claude CLI call that takes seconds: the runner awaits
+    it in the BACKGROUND, because while it ran in line the wake-word mic
+    stayed closed and "hey alexa" right after a conversation went unheard."""
     reflection = None
-    if reflector is not None and stats.transcript:
+    if stats.transcript:
         with contextlib.suppress(Exception):  # learning must never break the loop
             reflection = await reflector.reflect(stats.transcript)
     summary = getattr(reflection, "summary", "") if reflection is not None else ""
