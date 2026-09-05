@@ -92,6 +92,36 @@ async def test_session_config_renders_unread_and_no_stale_denial(tmp_path) -> No
     assert "announcement_history" not in names
 
 
+async def test_read_tools_are_answered_in_one_breath(tmp_path) -> None:
+    """A lookup's result carries the no-preamble nudge; a command carries the
+    close nudge; the instructions say to call the tool first and speak once."""
+    import json
+    from types import SimpleNamespace
+
+    from assistant.engines.realtime_engine import RealtimeEngine, SessionStats
+    from assistant.home.fake import FakeHome
+    from tests.fake_realtime import FakeClient
+
+    engine = RealtimeEngine(api_key="k", model="m", voice="v", home=FakeHome(), owner="Will")
+    connection = FakeClient().connection
+
+    def call(name: str, args: dict) -> SimpleNamespace:
+        item = SimpleNamespace(type="function_call", name=name, arguments=json.dumps(args), call_id="c1")
+        return SimpleNamespace(response=SimpleNamespace(output=[item], usage=None))
+
+    await engine._handle_response_done(connection, call("get_lights", {}), SessionStats())
+    output = json.loads(next(e for e in connection.sent if e["type"] == "conversation.item.create")["item"]["output"])
+    assert "one breath" in output["note"] and "result" in output
+    connection.sent.clear()
+    await engine._handle_response_done(
+        connection, call("set_lights", {"changes": [{"target": "Hallway", "turn": "on"}]}), SessionStats()
+    )
+    output = json.loads(next(e for e in connection.sent if e["type"] == "conversation.item.create")["item"]["output"])
+    assert "end_conversation" in output["note"]
+    text = (await engine._session_config(None))["instructions"]
+    assert "call the tool FIRST" in text and "let me pull that up" in text
+
+
 def test_command_tools_cover_home_actions_only() -> None:
     """COMMAND_TOOLS drives the engine's one-shot auto-close: action tools
     only — info/chat tools must not trigger it."""

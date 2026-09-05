@@ -66,6 +66,15 @@ class, not just commands. Default to BRIEF: commands get a few words ("Done." \
 follow-up suggestions. In conversation, match the speaker's energy but stay \
 compact: a sentence or two unless asked to go deeper.
 
+Tools and speech: when a request needs a tool, call the tool FIRST, without \
+saying anything, then answer ONCE, in one breath, with the substance: "Sure, \
+today you have the dentist at three and run club at six thirty." Never \
+narrate the mechanics — no "let me pull that up", no "okay I have it now", \
+no "I'm going to read it" — the speaker hears the answer, never the steps. \
+The only exception is a tool that takes seconds (web_search, think, a merge): \
+at most two words before it ("checking", "one sec"), then straight into the \
+answer when it returns, never "okay, I've got it".
+
 You control the home through tools. No canned routines: interpret intent and \
 decide. Prefer area targets, and batch every lighting change into ONE \
 set_lights call. Music: browse_music finds music — scope 'library' for the \
@@ -83,8 +92,9 @@ MORE than the lights and media listed below — thermostats, switches, scenes, \
 sensors, weather: discover with search_entities, read with get_entity, act \
 via ha_call_service (the escape hatch — prefer the dedicated tools whenever \
 one fits). Questions about the world outside the home — store hours, news, \
-scores, facts, "is the highway closed" — go to web_search: say you're \
-checking, then give the answer in a sentence or two with one source named. \
+scores, facts, "is the highway closed" — go to web_search: at most \
+"checking" before it, then the answer in a sentence or two with one source \
+named, no "okay, here's what I found". \
 If something is truly beyond your tools, say so honestly.
 
 Lights:
@@ -367,6 +377,22 @@ JOURNAL_TOOLS: list[dict[str, Any]] = [
     },
 ]
 _JOURNAL_TOOL_NAMES = {tool["name"] for tool in JOURNAL_TOOLS}
+
+# Tools whose result IS the answer: the reply must carry the substance in
+# one breath, never "I have it now, let me read it".
+_READ_TOOLS = frozenset(
+    {
+        "list_calendar_events", "journal_search", "recent_conversations", "list_notifications",
+        "announcement_history", "list_tasks", "task_detail", "search_tasks", "list_schedule",
+        "list_watches", "list_routines", "list_memories", "get_entity", "search_entities",
+        "browse_music", "web_search", "list_follow_ups", "waiting_on", "list_audio_devices",
+        "get_lights", "project_status", "read_roadmap", "read_history",
+    }
+)
+_READ_NOTE = (
+    "answer with the substance now, in one breath — no preamble about having "
+    "pulled it up, no 'I'll read it to you'"
+)
 
 # Read-only lookups are not journaled — the journal is what she DID, not
 # every glance she took.
@@ -1391,6 +1417,8 @@ class RealtimeEngine:
                     "if this completes a one-shot request, confirm in a few "
                     "words and call end_conversation in this same response"
                 )
+            elif call_name in _READ_TOOLS and not is_error:
+                payload["note"] = _READ_NOTE  # "Sure, today you have…", not "I have it now"
             outputs.append(
                 {
                     "type": "conversation.item.create",
