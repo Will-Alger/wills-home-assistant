@@ -22,6 +22,7 @@ import contextlib
 import json
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1357,10 +1358,20 @@ class RealtimeEngine:
                 # anything else (session.created, ...) is ignored during setup
         raise RuntimeError("Realtime session config could not be applied")
 
-    async def _handle_response_done(self, connection: Any, event: Any, stats: SessionStats) -> bool:
+    async def _handle_response_done(
+        self,
+        connection: Any,
+        event: Any,
+        stats: SessionStats,
+        *,
+        late_note: Callable[[], str] | None = None,
+    ) -> bool:
         """Execute any function calls; returns True when end_conversation fired.
         Side effect: self.last_response_tools lists what this response called —
-        the quick-close logic in run_conversation reads it."""
+        the quick-close logic in run_conversation reads it. `late_note` is
+        asked, once the tool has run, whether the owner said something in the
+        meantime; its sentence rides on the tool output so the model answers
+        the correction, not the request it superseded."""
         self.last_response_tools = []
         response = getattr(event, "response", None)
         usage = getattr(response, "usage", None)
@@ -1451,6 +1462,9 @@ class RealtimeEngine:
                 )
             elif call_name in _READ_TOOLS and not is_error:
                 payload["note"] = _READ_NOTE  # "Sure, today you have…", not "I have it now"
+            since = late_note() if late_note is not None else ""
+            if since:
+                payload["since"] = since  # he spoke while this ran: answer THAT
             outputs.append(
                 {
                     "type": "conversation.item.create",
@@ -2038,6 +2052,27 @@ class RealtimeEngine:
         closing = False
         last_activity = time.monotonic()
         ended = asyncio.Event()
+        pending: list[asyncio.Task] = []
+
+        def supervise(task: asyncio.Task) -> None:
+            # A receiver, mic, tool or playback task that dies used to leave
+            # the session waiting on the idle timer — or forever, with her
+            # "speaking" flag stuck. One bounded path out: end the session,
+            # say why, and let the runner recover.
+            if task.cancelled() or ended.is_set():
+                return
+            err = task.exception()
+            if err is not None:
+                stats.ended_by = f"session error: {err}"[:160]
+                with contextlib.suppress(Exception):
+                    ui.error(str(err))
+                ended.set()
+
+        def spawn(coro: Any) -> asyncio.Task:
+            task = asyncio.create_task(coro)
+            task.add_done_callback(supervise)
+            pending.append(task)
+            return task
 
         self._ui_tool_hook = getattr(ui, "tool", None)  # observability: show tool outcomes
         if not announce and self._presence is not None:
@@ -2058,6 +2093,9 @@ class RealtimeEngine:
             opener_ids: list[int] = []  # everything spoken as an opener: read only if he replies
             interrupted = False  # wake-word barge-in cut THIS response (reset per response)
             wrapup_heard = False  # he said "that's all": close after her goodbye, tool or no tool
+            user_turns = 0  # finished user transcripts so far (a tool learns what he said meanwhile)
+            audio_in_response = False  # the current response produced speech
+            farewell_pending = False  # end_conversation fired without a word: a goodbye was requested
             session_started = time.monotonic()
 
             async def deliver(items: list[Any], *, opener: bool) -> None:
@@ -2168,11 +2206,29 @@ class RealtimeEngine:
                         }
                     )
 
-            pending: list[asyncio.Task] = []
-
-            async def finish_playback(close_after: bool, listening: bool = True) -> None:
+            async def finish_playback(
+                close_after: bool,
+                listening: bool = True,
+                announced: list[int] | None = None,
+                opener: bool = False,
+            ) -> None:
                 nonlocal speaking
                 await speaker.wait_idle()
+                if announced and self._announcer is not None:
+                    # Delivered means PLAYED, not generated. Cut off by a
+                    # barge-in: spoken-but-unread, and never read by his reply
+                    # to the interruption — "what did I miss" still has it.
+                    self._announcer.mark_delivered(announced)
+                    stats.announced.extend(announced)
+                    if interrupted:
+                        for nid in announced:
+                            if nid in opener_ids:
+                                opener_ids.remove(nid)
+                        note_fn = getattr(ui, "note", None)
+                        if note_fn is not None:
+                            note_fn("announcement cut short — kept unread")
+                    elif not opener:
+                        self._announcer.mark_read(announced)  # slipped into a live conversation: heard
                 if (close_after or wrapup_heard) and not interrupted:
                     # (a barge-in during the audio keeps the session open: he
                     # wanted to say something)
@@ -2202,11 +2258,105 @@ class RealtimeEngine:
             quick_close_window = self._command_close_s
             quick_close_reason = "command complete"
 
+            async def after_response(event: Any, turn_at_start: int, had_audio: bool, segments_at_done: int) -> None:
+                """Everything that follows response.done — tool calls first —
+                as its own task, so the receiver keeps reading meanwhile.
+                `segments_at_done` is how often he had spoken when the response
+                finished: the close decisions are about that moment, not about
+                what he says while a tool runs."""
+                nonlocal tool_busy, closing, last_activity, announcing, announcing_opener
+                nonlocal command_pending, quick_close_armed, quick_close_window, quick_close_reason
+                nonlocal farewell_pending
+
+                def late_note() -> str:
+                    if user_turns <= turn_at_start:
+                        return ""
+                    latest = next((t for r, t in reversed(stats.transcript) if r == "you"), "")
+                    return (
+                        f"while this ran {self._owner} said: '{latest}' — if that changes or "
+                        "cancels the request, follow it and skip what is now moot"
+                    )
+
+                try:
+                    closing = await self._handle_response_done(connection, event, stats, late_note=late_note)
+                finally:
+                    tool_busy = False
+                    last_activity = time.monotonic()
+                announced_ids = list(announcing)
+                opener_batch = announcing_opener
+                if announced_ids:
+                    announcing = []
+                    announcing_opener = False
+                ran = self.last_response_tools
+                if any(t in COMMAND_TOOLS for t in ran):
+                    command_pending = True
+                elif not ran and segments_at_done <= 1:
+                    # the final spoken answer of a single-utterance
+                    # session: command confirmations close fast,
+                    # question answers get a longer follow-up window
+                    quick_close_armed = True
+                    if command_pending:
+                        quick_close_window = self._command_close_s
+                        quick_close_reason = "command complete"
+                    else:
+                        quick_close_window = self._info_close_s
+                        quick_close_reason = "question answered"
+                if closing and not had_audio and not farewell_pending:
+                    # The end tool fired without a word (LiveKit's pattern: the
+                    # tool's answer IS the goodbye). Ask for it; close after it plays.
+                    farewell_pending = True
+                    closing = False
+                    await connection.send(
+                        {
+                            "type": "conversation.item.create",
+                            "item": {
+                                "type": "message",
+                                "role": "system",
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": "Say a brief goodbye now — a few words, nothing more.",
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                    await connection.send({"type": "response.create"})
+                    last_activity = time.monotonic()
+                    return
+                if farewell_pending and not ran:
+                    farewell_pending = False
+                    closing = True
+                    stats.ended_by = "end_conversation"
+                close_after = closing or wrapup_heard
+                if wrapup_heard and not closing:
+                    stats.ended_by = "wrap-up"
+                if announced_ids and announce and segments_at_done == 0 and not interrupted:
+                    if waits_for_reply:
+                        # she asked him something (or welcomed him home):
+                        # hold the question window open, then close
+                        quick_close_armed = True
+                        quick_close_window = self._info_close_s
+                        quick_close_reason = "no reply"
+                    else:
+                        # she initiated, said her piece, nobody replied:
+                        # back to sleep as soon as the audio drains
+                        stats.ended_by = "announcement delivered"
+                        close_after = True
+                spawn(
+                    finish_playback(
+                        close_after,
+                        listening=not self.last_response_followup,
+                        announced=announced_ids,
+                        opener=opener_batch,
+                    )
+                )
+
             async def receive() -> None:
                 nonlocal speaking, response_active, closing, last_activity
                 nonlocal speech_segments, command_pending, quick_close_armed
                 nonlocal quick_close_window, quick_close_reason, announcing, announcing_opener
-                nonlocal tool_busy, interrupted, wrapup_heard
+                nonlocal tool_busy, interrupted, wrapup_heard, user_turns, audio_in_response
                 heard = ""  # live accumulation of the user's words
                 while True:
                     event = await connection.recv()
@@ -2214,12 +2364,14 @@ class RealtimeEngine:
                     last_activity = time.monotonic()
                     if kind.endswith("audio.delta") and "transcript" not in kind:
                         speaking = True
+                        audio_in_response = True
                         begin = getattr(speaker, "begin_item", None)
                         if begin is not None:  # per-item playback accounting (truncate needs it)
                             begin(getattr(event, "item_id", "") or "")
                         speaker.enqueue(base64.b64decode(event.delta))
                     elif kind == "response.created":
                         response_active = True
+                        audio_in_response = False
                         # a barge-in belongs to the response it cut; a stale flag
                         # used to veto every later goodbye ("closing out" … ding)
                         interrupted = False
@@ -2235,6 +2387,7 @@ class RealtimeEngine:
                         said = getattr(event, "transcript", "")
                         stats.transcript.append(("you", said))
                         stats.replied = True
+                        user_turns += 1
                         ui.user_said(said)
                         if is_wrapup(said):
                             wrapup_heard = True  # the engine closes after her goodbye
@@ -2265,60 +2418,12 @@ class RealtimeEngine:
                             self._cues.end(speaker)
                     elif kind == "response.done":
                         response_active = False
-                        # A tool may take a while (a uv sync, a git operation):
-                        # the idle watchdog must not close the session under it.
+                        # A tool may take a while (a search, a uv sync): the
+                        # idle watchdog must not close the session under it, and
+                        # THIS loop must keep reading — his "actually, never
+                        # mind" is processed while the tool runs, not after.
                         tool_busy = True
-                        try:
-                            closing = await self._handle_response_done(connection, event, stats)
-                        finally:
-                            tool_busy = False
-                            last_activity = time.monotonic()
-                        announced_now = bool(announcing)
-                        if announced_now:
-                            if self._announcer is not None:
-                                self._announcer.mark_delivered(announcing)
-                                if not announcing_opener:
-                                    # slipped into a live conversation: he heard it
-                                    self._announcer.mark_read(announcing)
-                            stats.announced.extend(announcing)
-                            announcing = []
-                            announcing_opener = False
-                        ran = self.last_response_tools
-                        if any(t in COMMAND_TOOLS for t in ran):
-                            command_pending = True
-                        elif not ran and speech_segments <= 1:
-                            # the final spoken answer of a single-utterance
-                            # session: command confirmations close fast,
-                            # question answers get a longer follow-up window
-                            quick_close_armed = True
-                            if command_pending:
-                                quick_close_window = self._command_close_s
-                                quick_close_reason = "command complete"
-                            else:
-                                quick_close_window = self._info_close_s
-                                quick_close_reason = "question answered"
-                        close_after = closing or wrapup_heard
-                        if wrapup_heard and not closing:
-                            stats.ended_by = "wrap-up"
-                        if announced_now and announce and speech_segments == 0 and not interrupted:
-                            if waits_for_reply:
-                                # she asked him something (or welcomed him home):
-                                # hold the question window open, then close
-                                quick_close_armed = True
-                                quick_close_window = self._info_close_s
-                                quick_close_reason = "no reply"
-                            else:
-                                # she initiated, said her piece, nobody replied:
-                                # back to sleep as soon as the audio drains
-                                stats.ended_by = "announcement delivered"
-                                close_after = True
-                        pending.append(
-                            asyncio.create_task(
-                                finish_playback(
-                                    close_after, listening=not self.last_response_followup
-                                )
-                            )
-                        )
+                        spawn(after_response(event, user_turns, audio_in_response, speech_segments))
                     elif kind == "error":
                         message = str(getattr(event, "error", event))
                         if self._cues is not None and self._cues.listening:
@@ -2369,6 +2474,8 @@ class RealtimeEngine:
                 asyncio.create_task(receive()),
                 asyncio.create_task(idle_watchdog()),
             ]
+            for task in tasks:
+                task.add_done_callback(supervise)
             try:
                 await ended.wait()
                 if stats.ended_by == "unknown":

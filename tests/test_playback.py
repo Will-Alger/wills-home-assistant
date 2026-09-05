@@ -113,7 +113,7 @@ async def test_barge_in_tells_the_server_how_much_he_heard() -> None:
     truncate = next(e for e in client.connection.sent if e["type"] == "conversation.item.truncate")
     assert truncate == {"type": "conversation.item.truncate", "item_id": "item_1", "content_index": 0, "audio_end_ms": 1234}
     assert "response.cancel" not in client.connection.kinds()  # nothing left to cancel: the response had completed
-    assert speaker.chunks == []  # cleared at the barge-in
+    assert all(chunk == b"" for chunk in speaker.chunks)  # her audio was cleared; only the (empty) cue remains
     assert stats.ended_by != "unknown"
 
 

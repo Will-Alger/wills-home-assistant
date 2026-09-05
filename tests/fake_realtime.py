@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
@@ -44,28 +45,49 @@ class FakeConnection:
                     )
                 )
 
-    def _reply(self, transcript: str) -> None:
-        """One spoken response with no tool calls: created, audio, transcript, done."""
+    def _reply(
+        self,
+        transcript: str,
+        *,
+        calls: list[tuple[str, dict[str, Any]]] | None = None,
+        audio: bool = True,
+    ) -> None:
+        """One response: created, (audio, transcript,) done — with any
+        function calls listed on the done event, the way the server does it."""
         self._events.put_nowait(SimpleNamespace(type="response.created"))
-        self._events.put_nowait(
-            SimpleNamespace(
-                type="response.output_audio.delta",
-                item_id="item_1",
-                delta=base64.b64encode(b"\x00\x00" * 240).decode("ascii"),
+        if audio:
+            self._events.put_nowait(
+                SimpleNamespace(
+                    type="response.output_audio.delta",
+                    item_id="item_1",
+                    delta=base64.b64encode(b"\x00\x00" * 240).decode("ascii"),
+                )
             )
-        )
+        if transcript:
+            self._events.put_nowait(
+                SimpleNamespace(type="response.output_audio_transcript.done", transcript=transcript)
+            )
+        output = [
+            SimpleNamespace(type="function_call", name=name, arguments=json.dumps(args), call_id=f"call_{i}")
+            for i, (name, args) in enumerate(calls or [])
+        ]
         self._events.put_nowait(
-            SimpleNamespace(type="response.output_audio_transcript.done", transcript=transcript)
-        )
-        self._events.put_nowait(
-            SimpleNamespace(type="response.done", response=SimpleNamespace(output=[], usage=None))
+            SimpleNamespace(type="response.done", response=SimpleNamespace(output=output, usage=None))
         )
 
-    def user_says(self, text: str, *, reply: str | None = None) -> None:
+    def user_says(
+        self,
+        text: str,
+        *,
+        reply: str | None = None,
+        calls: list[tuple[str, dict[str, Any]]] | None = None,
+        audio: bool = True,
+    ) -> None:
         """Script a user turn at a moment the test chooses (say_after_response
         fires one immediately instead, in the same batch as the reply). With
-        `reply`, the server answers it the way VAD-created responses do — a
-        spoken reply with no tool call."""
+        `reply`, the server answers it the way VAD-created responses do; `calls`
+        puts function calls on that response, `audio=False` makes it a
+        tool-only response with no speech."""
         self._events.put_nowait(SimpleNamespace(type="input_audio_buffer.speech_started"))
         self._events.put_nowait(SimpleNamespace(type="input_audio_buffer.speech_stopped"))
         self._events.put_nowait(
@@ -73,10 +95,16 @@ class FakeConnection:
                 type="conversation.item.input_audio_transcription.completed", transcript=text
             )
         )
-        if reply is not None:
-            self._reply(reply)
+        if reply is not None or calls:
+            self._reply(reply or "", calls=calls, audio=audio)
+
+    fail_recv_after: int | None = None  # the socket dies on this recv (1-based)
+    _recv_count = 0
 
     async def recv(self) -> Any:
+        self._recv_count += 1
+        if self.fail_recv_after is not None and self._recv_count >= self.fail_recv_after:
+            raise ConnectionError("socket closed")
         return await self._events.get()
 
     def kinds(self) -> list[str]:
