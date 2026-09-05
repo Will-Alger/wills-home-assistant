@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
@@ -74,6 +75,22 @@ class FakeConnection:
         )
         if reply is not None:
             self._reply(reply)
+
+    def push(self, event_type: str, **fields: Any) -> None:
+        """One scripted event, at the moment the test chooses — so a test can
+        put real delays between the steps of a turn and time them."""
+        self._events.put_nowait(SimpleNamespace(type=event_type, **fields))
+
+    def push_response_done(self, *calls: tuple[str, str, dict[str, Any]]) -> None:
+        """A finished response, optionally with function calls to execute:
+        each is (call_id, name, arguments)."""
+        output = [
+            SimpleNamespace(
+                type="function_call", call_id=call_id, name=name, arguments=json.dumps(args)
+            )
+            for call_id, name, args in calls
+        ]
+        self.push("response.done", response=SimpleNamespace(output=output, usage=None))
 
     async def recv(self) -> Any:
         return await self._events.get()

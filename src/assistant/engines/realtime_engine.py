@@ -34,6 +34,7 @@ from scipy.signal import resample_poly
 from assistant.brain.tools import CALENDAR_TOOLS, TOOL_DEFINITIONS, ToolExecutor
 from assistant.calendar.base import CalendarApi, spoken_now
 from assistant.home.base import HomeApi, device_table, media_table
+from assistant.latency import LatencyLog, TurnTrace, latency_report, since_label
 from assistant.memory import MemoryStore
 from assistant.tasks import TaskBoard
 
@@ -162,7 +163,9 @@ actions, watches that fired, scheduled things, your notifications, comings \
 and goings. "Did the porch light come on last night?", "what did you do \
 while I was gone?", "when did I leave today?" → journal_search. It knows only \
 what you did or watched — not every device change in the house; say so when \
-it comes up empty.
+it comes up empty. How QUICK you have been — "how fast were you today?", \
+"how long do you take to answer?", "were you quicker yesterday?" — is \
+latency_report, never the journal and never a guess.
 
 Your own development — the build loop, all by voice. You are an evolving open \
 project: project_status shows your recent code changes, read_roadmap your \
@@ -411,7 +414,7 @@ _READ_TOOLS = frozenset(
         "announcement_history", "list_tasks", "task_detail", "search_tasks", "list_schedule",
         "list_watches", "list_routines", "list_memories", "get_entity", "search_entities",
         "browse_music", "web_search", "list_follow_ups", "waiting_on", "list_audio_devices",
-        "get_lights", "project_status", "read_roadmap", "read_history",
+        "get_lights", "project_status", "read_roadmap", "read_history", "latency_report",
     }
 )
 _READ_NOTE = (
@@ -431,7 +434,7 @@ _QUIET_TOOLS = frozenset(
         "list_tasks", "task_detail", "search_tasks", "web_search", "list_notifications",
         "announcement_history", "journal_search", "recent_conversations", "read_roadmap",
         "read_history", "project_status", "show_me", "think", "list_watches",
-        "list_schedule", "list_routines", "list_calendar_events",
+        "list_schedule", "list_routines", "list_calendar_events", "latency_report",
     }
 )
 
@@ -1073,6 +1076,27 @@ PANEL_TOOLS: list[dict[str, Any]] = [
 ]
 _PANEL_TOOL_NAMES = {tool["name"] for tool in PANEL_TOOLS}
 
+LATENCY_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "latency_report",
+        "description": (
+            "How fast you have actually been, from the turn log: the median "
+            "wake-to-chime, the median gap between the speaker finishing and "
+            "your first word, and your slowest tool. For 'how fast were you "
+            "today?', 'how long do you take to answer?', 'were you quicker "
+            "yesterday?'. since: today (default) | yesterday | week | a number "
+            "of hours | an ISO date. It returns the sentence to say — call it "
+            "before you speak and read the numbers out, never guess them."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"since": {"type": "string"}},
+        },
+    },
+]
+_LATENCY_TOOL_NAMES = {tool["name"] for tool in LATENCY_TOOLS}
+
 
 def realtime_tools(*, calendar: bool = False) -> list[dict[str, Any]]:
     """Our Anthropic-shaped tool defs, converted to Realtime's function shape."""
@@ -1185,6 +1209,7 @@ class RealtimeEngine:
         delivery: Any | None = None,
         cues: Any | None = None,
         panel: Any | None = None,
+        latency: LatencyLog | None = None,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
         self._journal = journal  # what she did and saw, by day
@@ -1221,6 +1246,8 @@ class RealtimeEngine:
         self._announcer = announcer  # queued things she says on her own
         self.announcer = announcer  # the runner's idle loop polls it too
         self._cues = cues  # listening earcons: start / end / error
+        self._latency = latency  # logs/turns.jsonl: how long each step took
+        self._trace = TurnTrace()  # replaced per conversation; this one writes nothing
         self._panel = panel  # the desktop Settings panel she opens by voice
         self.last_response_followup = False  # a tool ran: more audio is coming
         self._instructions_stale = False  # a preference changed mid-session
@@ -1304,6 +1331,8 @@ class RealtimeEngine:
             tools += DELIVERY_TOOLS
         if self._panel is not None:
             tools += PANEL_TOOLS
+        if self._latency is not None:
+            tools += LATENCY_TOOLS
         return {
             "type": "realtime",
             "instructions": instructions,
@@ -1340,6 +1369,7 @@ class RealtimeEngine:
                 kind = event.type
                 if kind == "session.updated":
                     self._transcription_model = transcribers[0]
+                    self._trace.connected()  # the session is live and configured
                     return
                 if kind == "error":
                     message = str(getattr(event, "error", event)).lower()
@@ -1385,6 +1415,7 @@ class RealtimeEngine:
                 args = json.loads(item.arguments or "{}")
             except json.JSONDecodeError:
                 args = {}
+            call_started = time.monotonic()
             if call_name == "restart_self":
                 self.restart_requested = True
                 result_text, is_error = (
@@ -1416,11 +1447,14 @@ class RealtimeEngine:
                 result_text, is_error = self._execute_journal_tool(call_name, args)
             elif call_name in _PANEL_TOOL_NAMES:
                 result_text, is_error = self._execute_panel_tool(call_name, args)
+            elif call_name in _LATENCY_TOOL_NAMES:
+                result_text, is_error = self._execute_latency_tool(args)
             elif call_name in _BRAIN_TOOL_NAMES:
                 self._live_transcript = stats.transcript
                 result_text, is_error = await self._execute_brain_tool(call_name, args)
             else:
                 result_text, is_error = await self._executor.execute(call_name, args)
+            self._trace.tool(call_name, time.monotonic() - call_started)
             tool_hook = getattr(self, "_ui_tool_hook", None)
             if tool_hook is not None:
                 tool_hook(call_name, result_text, is_error)
@@ -1900,6 +1934,21 @@ class RealtimeEngine:
             verb = "open" if name == "open_settings_panel" else "close"
             return f"couldn't {verb} the settings panel: {err}", True
 
+    def _execute_latency_tool(self, args: dict[str, Any]) -> tuple[str, bool]:
+        """'How fast were you today?' — medians straight out of the turn log."""
+        if self._latency is None:
+            return "I'm not keeping a turn latency log right now", True
+        spec = str(args.get("since", "") or "today")
+        window = _spec_window(spec, time.time())
+        if isinstance(window, str):
+            return window, True
+        since, until = window
+        try:
+            rows = self._latency.read(since=since, until=until)
+        except Exception as err:  # noqa: BLE001 — an unreadable log is a spoken sentence
+            return f"I couldn't read my turn log: {err}", True
+        return latency_report(rows, since_label(spec)), False
+
     def _execute_journal_tool(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
         now = time.time()
         if name == "journal_search":
@@ -2027,12 +2076,22 @@ class RealtimeEngine:
     # ── live voice conversation ─────────────────────────────────────────────
 
     async def run_conversation(
-        self, mic: Any, speaker: Any, wake: Any, ui: Any, *, announce: bool = False
+        self,
+        mic: Any,
+        speaker: Any,
+        wake: Any,
+        ui: Any,
+        *,
+        announce: bool = False,
+        trace: TurnTrace | None = None,
     ) -> SessionStats:
         """One wake-to-close conversation. `mic` must be a 24 kHz source.
         announce=True opens the session with HER speaking a queued
-        announcement (nobody said the wake word) and closes right after."""
+        announcement (nobody said the wake word) and closes right after.
+        `trace` is the runner's stopwatch, started at the wake; without one
+        the timings are kept in memory and written nowhere."""
         stats = SessionStats()
+        self._trace = trace if trace is not None else TurnTrace()
         speaking = False
         response_active = False
         closing = False
@@ -2128,12 +2187,14 @@ class RealtimeEngine:
                 nonlocal quick_close_armed, quick_close_window, quick_close_reason
                 while True:
                     frame = await mic.get_frame()
+                    heard_at = time.monotonic()
                     if speaking and not self._talk_over:
                         # Half-duplex: don't feed our own voice back. But keep
                         # watching for the wake phrase = instant barge-in.
                         if wake is not None and wake.detect(downsample_24k_to_16k(frame)):
                             interrupted = True
                             speaker.clear()
+                            self._trace.interrupted(time.monotonic() - heard_at)
                             if response_active:
                                 await connection.send({"type": "response.cancel"})
                             speaking = False
@@ -2159,6 +2220,7 @@ class RealtimeEngine:
             async def finish_playback(close_after: bool, listening: bool = True) -> None:
                 nonlocal speaking
                 await speaker.wait_idle()
+                self._trace.playback_done()
                 if (close_after or wrapup_heard) and not interrupted:
                     # (a barge-in during the audio keeps the session open: he
                     # wanted to say something)
@@ -2200,6 +2262,7 @@ class RealtimeEngine:
                     last_activity = time.monotonic()
                     if kind.endswith("audio.delta") and "transcript" not in kind:
                         speaking = True
+                        self._trace.audio_delta()
                         speaker.enqueue(base64.b64decode(event.delta))
                     elif kind == "response.created":
                         response_active = True
@@ -2214,6 +2277,7 @@ class RealtimeEngine:
                         heard += getattr(event, "delta", "") or ""
                         ui.user_partial(heard)
                     elif kind == "conversation.item.input_audio_transcription.completed":
+                        self._trace.transcribed()
                         heard = ""
                         said = getattr(event, "transcript", "")
                         stats.transcript.append(("you", said))
@@ -2230,6 +2294,7 @@ class RealtimeEngine:
                             stats.ended_by = "stop command"
                             ended.set()
                     elif kind == "input_audio_buffer.speech_started":
+                        self._trace.speech_started()  # a new turn rolls the log row
                         speech_segments += 1
                         if speech_segments > 1:
                             # they kept talking — it's a conversation now
@@ -2244,6 +2309,7 @@ class RealtimeEngine:
                             ui.interrupted()
                         ui.user_speaking()
                     elif kind == "input_audio_buffer.speech_stopped":
+                        self._trace.speech_stopped()
                         if self._cues is not None:
                             self._cues.end(speaker)
                     elif kind == "response.done":

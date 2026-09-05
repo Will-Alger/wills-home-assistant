@@ -43,13 +43,21 @@ async def wait_for_trigger(
     announcer: Any = None,
     restart: Callable[[], bool] | None = None,
     reconfigure: Callable[[], bool] | None = None,
+    on_score: Callable[[float, bool], None] | None = None,
 ) -> str:
     """Block until the wake phrase is heard ("wake"), an announcement is
     ready to be spoken ("announce"), a restart was requested ("restart"),
-    or the audio devices changed ("reconfigure")."""
+    or the audio devices changed ("reconfigure").
+
+    `on_score` sees every idle frame's wake score and whether it fired — that
+    is how the latency log times the wake and keeps the near misses."""
     while True:
         frame = await source.get_frame()
-        if wake.detect(frame):
+        fired = wake.detect(frame)
+        if on_score is not None:
+            with contextlib.suppress(Exception):  # measuring never blocks a wake
+                on_score(float(getattr(wake, "last_score", 0.0)), fired)
+        if fired:
             return "wake"
         if announcer is not None and announcer.due():
             return "announce"
@@ -60,11 +68,18 @@ async def wait_for_trigger(
 
 
 async def record_session(
-    sessions: Any, journal: Any, stats: Any, row: Any, reflector: Any
+    sessions: Any,
+    journal: Any,
+    stats: Any,
+    row: Any,
+    reflector: Any,
+    timings: dict[str, Any] | None = None,
 ) -> Any | None:
     """Close the session's row, journal it, then let reflection add the
     one-line summary (its fallback is the first thing the owner said).
-    Sequential on purpose: the row exists before the summary updates it."""
+    Sequential on purpose: the row exists before the summary updates it.
+    `timings` is the last turn's latency row, kept on the session so "how
+    fast were you?" never has to re-read the log."""
     first = next((text for role, text in stats.transcript if role == "you"), "")
     if sessions is not None and row is not None:
         with contextlib.suppress(Exception):
@@ -76,6 +91,7 @@ async def record_session(
                 announced=getattr(stats, "announced", []),
                 responses=stats.responses,
                 cost_usd=stats.cost_usd,
+                timings=timings or {},
             )
     if journal is not None:
         with contextlib.suppress(Exception):
