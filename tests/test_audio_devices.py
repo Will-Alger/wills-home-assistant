@@ -17,14 +17,21 @@ from assistant.status import AssistantStatus
 from tests.test_app import NOISE, Source, Wake
 from tests.test_panel import FakeView, make_engine
 
+HANDS_FREE = "Headset (@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free%0 ;(Will's AirPods Pro))"
 FAKE_DEVICES = [
     {"name": "Microphone (Blue Snowball)", "max_input_channels": 1, "max_output_channels": 0, "hostapi": 0},
     {"name": "Speakers (Realtek)", "max_input_channels": 0, "max_output_channels": 2, "hostapi": 0},
     {"name": "Headphones (Will's AirPods Pro)", "max_input_channels": 0, "max_output_channels": 2, "hostapi": 0},
     {"name": "Microphone (Blue Snowball)", "max_input_channels": 1, "max_output_channels": 0, "hostapi": 2},
     {"name": "Headphones (Will's AirPods Pro)", "max_input_channels": 0, "max_output_channels": 2, "hostapi": 2},
-    {"name": "Headset (Will's AirPods Pro)", "max_input_channels": 1, "max_output_channels": 0, "hostapi": 2},
+    {"name": HANDS_FREE, "max_input_channels": 1, "max_output_channels": 0, "hostapi": 2},
     {"name": "Stereo Mix (Realtek)", "max_input_channels": 2, "max_output_channels": 0, "hostapi": 3},
+    # MME's 31-character truncation of a longer name, and its default aliases
+    {"name": "Speakers (Steam Streaming Speak", "max_input_channels": 0, "max_output_channels": 2, "hostapi": 0},
+    {"name": "Speakers (Steam Streaming Speakers)", "max_input_channels": 0, "max_output_channels": 2, "hostapi": 2},
+    {"name": "Primary Sound Driver", "max_input_channels": 0, "max_output_channels": 2, "hostapi": 1},
+    {"name": "Microsoft Sound Mapper - Input", "max_input_channels": 2, "max_output_channels": 0, "hostapi": 0},
+    {"name": "Headphones ()", "max_input_channels": 0, "max_output_channels": 2, "hostapi": 3},
 ]
 FAKE_APIS = [{"name": "MME"}, {"name": "Windows DirectSound"}, {"name": "Windows WASAPI"}, {"name": "Windows WDM-KS"}]
 
@@ -46,11 +53,18 @@ def patch_sd(monkeypatch) -> None:
 
 def test_names_collapse_host_apis_and_prefer_wasapi(monkeypatch) -> None:
     patch_sd(monkeypatch)
-    assert devices.names("output") == ["System default", "Headphones (Will's AirPods Pro)", "Speakers (Realtek)"]
+    assert devices.names("output") == [
+        "System default", "Headphones (Will's AirPods Pro)", "Speakers (Steam Streaming Speakers)",
+        "Speakers (Realtek)", "Headphones (unnamed)",
+    ]  # one row per device: the truncated MME twin and the default aliases are gone
     assert devices.names("input") == [
-        "System default", "Headset (Will's AirPods Pro)", "Microphone (Blue Snowball)", "Stereo Mix (Realtek)",
+        "System default", "Microphone (Blue Snowball)", "Will's AirPods Pro (hands-free)",
+        "Stereo Mix (Realtek)",
     ]
+    assert devices.pretty(HANDS_FREE) == "Will's AirPods Pro (hands-free)"
     assert devices.find("airpods", "output") == 4  # the WASAPI entry, not MME's index 2
+    assert devices.find("airpods", "input") == 5  # the readable name matches too
+    assert devices.find("Will's AirPods Pro (hands-free)", "input") == 5
     assert devices.find("snowball", "input") == 3 and devices.find("3", "input") == 3
     assert devices.find("", "output") is None and devices.find("System default", "input") is None
     assert devices.find("bose", "output") is None
@@ -95,7 +109,7 @@ def test_panel_switches_devices_live_and_saves_them(tmp_path: Path, monkeypatch)
         on_refresh_devices=lambda: rescans.append(True),
         devices=devices,
     )
-    assert panel.microphone_choices()[1] == "Headset (Will's AirPods Pro)"
+    assert panel.microphone_choices()[2] == "Will's AirPods Pro (hands-free)"
     assert panel.speaker_choices() == devices.names("output")
 
     text = panel.save(speaker="airpods")
@@ -104,9 +118,9 @@ def test_panel_switches_devices_live_and_saves_them(tmp_path: Path, monkeypatch)
     assert PanelOverrides(tmp_path / "panel.json").speaker == "airpods"
     assert panel.snapshot()["saved_speaker"] == "airpods"
 
-    text = panel.save(microphone="Headset (Will's AirPods Pro)", speaker="System default")
-    assert text.startswith("saved microphone Headset (Will's AirPods Pro), speaker System default")
-    assert changes[-1] == ("Headset (Will's AirPods Pro)", "")  # default = no override
+    text = panel.save(microphone="Will's AirPods Pro (hands-free)", speaker="System default")
+    assert text.startswith("saved microphone Will's AirPods Pro (hands-free), speaker System default")
+    assert changes[-1] == ("Will's AirPods Pro (hands-free)", "")  # default = no override
     assert PanelOverrides(tmp_path / "panel.json").speaker == ""
 
     text = panel.save(speaker="bose")
