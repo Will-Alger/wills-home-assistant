@@ -108,6 +108,16 @@ class Microphone:
         return stream
 
     async def __aenter__(self) -> Self:
+        return await self.open()
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.close()
+
+    @property
+    def is_open(self) -> bool:
+        return self._stream is not None
+
+    async def open(self) -> Self:
         self._loop = asyncio.get_running_loop()
         missing = self._device is None and not devices.is_default(self._spec)
         if missing:
@@ -170,7 +180,7 @@ class Microphone:
                 return self
             raise
 
-    async def __aexit__(self, *exc_info: object) -> None:
+    async def close(self) -> None:
         if self._stream is not None:
             with contextlib.suppress(Exception):
                 self._stream.stop()

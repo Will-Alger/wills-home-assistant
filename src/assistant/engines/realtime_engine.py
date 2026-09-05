@@ -2133,9 +2133,23 @@ class RealtimeEngine:
                         # watching for the wake phrase = instant barge-in.
                         if wake is not None and wake.detect(downsample_24k_to_16k(frame)):
                             interrupted = True
+                            item = getattr(speaker, "current_item", "")
+                            heard_ms = speaker.played_ms(item) if item and hasattr(speaker, "played_ms") else 0
                             speaker.clear()
                             if response_active:
                                 await connection.send({"type": "response.cancel"})
+                            if item and heard_ms > 0:
+                                # Over WebSocket the server has no idea how much
+                                # he heard: tell it, so the unheard tail (and its
+                                # transcript) leaves the model's memory.
+                                await connection.send(
+                                    {
+                                        "type": "conversation.item.truncate",
+                                        "item_id": item,
+                                        "content_index": 0,
+                                        "audio_end_ms": heard_ms,
+                                    }
+                                )
                             speaking = False
                             mic.drain()
                             ui.interrupted()
@@ -2200,6 +2214,9 @@ class RealtimeEngine:
                     last_activity = time.monotonic()
                     if kind.endswith("audio.delta") and "transcript" not in kind:
                         speaking = True
+                        begin = getattr(speaker, "begin_item", None)
+                        if begin is not None:  # per-item playback accounting (truncate needs it)
+                            begin(getattr(event, "item_id", "") or "")
                         speaker.enqueue(base64.b64decode(event.delta))
                     elif kind == "response.created":
                         response_active = True

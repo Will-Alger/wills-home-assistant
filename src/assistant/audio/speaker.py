@@ -16,11 +16,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import threading
+import time
 from typing import Self
 
 import sounddevice as sd
 
 from assistant.audio import devices
+
+_STALL_S = 1.0  # audio waiting, no callback for this long: the device is gone
 
 # Outputs nobody hears in the room: Steam's streaming endpoints and their
 # "Wave" twins, loopbacks, a headset's phone-quality hands-free link.
@@ -48,6 +51,16 @@ def output_candidates() -> list[int]:
 
 
 class Speaker:
+    """One output stream, kept open across idle and conversation (the runner
+    owns it): chimes and her voice share it, so nothing races to open a
+    device, and a Bluetooth speaker never sees a fresh stream mid-sentence.
+
+    Per-item accounting: `begin_item(id)` marks where an assistant item's
+    audio starts in the byte stream; `played_ms(id)` says how much of it the
+    callback has actually consumed — what he heard, not what was generated.
+    That number is what `conversation.item.truncate` needs after a barge-in.
+    """
+
     def __init__(self, samplerate: int = 24_000, device: str = "") -> None:
         self._samplerate = samplerate
         self._spec = device or ""
@@ -57,16 +70,38 @@ class Speaker:
         self._stream: sd.RawOutputStream | None = None
         self.device_note: str | None = None  # set when the chosen speaker was not used
         self.device_in_use = ""  # the speaker actually opened (the panel shows it)
+        self._enqueued = 0  # bytes ever enqueued (minus what clear() dropped)
+        self._consumed = 0  # bytes the callback has played
+        self._items: dict[str, tuple[int, int]] = {}  # item id -> (start, end) byte offsets
+        self.current_item = ""  # the assistant item whose audio is being enqueued
+        self._last_callback = time.monotonic()
+
+    @property
+    def is_open(self) -> bool:
+        return self._stream is not None
+
+    @property
+    def stalled(self) -> bool:
+        """Audio is waiting but the device stopped asking for it (a Bluetooth
+        speaker that walked away): the runner should reopen."""
+        with self._lock:
+            waiting = bool(self._buffer)
+        return self.is_open and waiting and time.monotonic() - self._last_callback > _STALL_S
+
+    def _consume(self, need: int) -> bytes:
+        """The callback's read: the next `need` bytes, silence-padded."""
+        self._last_callback = time.monotonic()
+        with self._lock:
+            chunk = bytes(self._buffer[:need])
+            del self._buffer[: len(chunk)]
+            self._consumed += len(chunk)
+        if len(chunk) < need:
+            chunk += b"\x00" * (need - len(chunk))  # underflow = silence
+        return chunk
 
     def _open(self, device: int | None) -> sd.RawOutputStream:
         def callback(outdata, frames: int, _time, _status) -> None:  # PortAudio thread
-            need = frames * 2  # int16 mono
-            with self._lock:
-                chunk = bytes(self._buffer[:need])
-                del self._buffer[: len(chunk)]
-            outdata[: len(chunk)] = chunk
-            if len(chunk) < need:
-                outdata[len(chunk) :] = b"\x00" * (need - len(chunk))  # underflow = silence
+            outdata[:] = self._consume(frames * 2)  # int16 mono
 
         stream = sd.RawOutputStream(
             samplerate=self._samplerate,
@@ -87,6 +122,12 @@ class Speaker:
         return True
 
     async def __aenter__(self) -> Self:
+        return await self.open()
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.close()
+
+    async def open(self) -> Self:
         chosen = self._device
         problems: list[str] = []
         if chosen is None and not devices.is_default(self._spec):
@@ -115,7 +156,7 @@ class Speaker:
         self.device_note = "; ".join(problems) + " — using the default" if problems else None
         return self
 
-    async def __aexit__(self, *exc_info: object) -> None:
+    async def close(self) -> None:
         if self._stream is not None:
             with contextlib.suppress(Exception):
                 self._stream.stop()
@@ -125,10 +166,44 @@ class Speaker:
     def enqueue(self, pcm: bytes) -> None:
         with self._lock:
             self._buffer.extend(pcm)
+            self._enqueued += len(pcm)
+            if self.current_item:
+                start, _end = self._items.get(self.current_item, (self._enqueued - len(pcm), 0))
+                self._items[self.current_item] = (start, self._enqueued)
+
+    def begin_item(self, item_id: str) -> None:
+        """Audio for this assistant item starts here (idempotent for the same id)."""
+        if not item_id or item_id == self.current_item:
+            return
+        with self._lock:
+            self.current_item = item_id
+            self._items.setdefault(item_id, (self._enqueued, self._enqueued))
+            if len(self._items) > 50:  # a long session: forget the oldest
+                for old in list(self._items)[:-25]:
+                    del self._items[old]
+
+    def played_ms(self, item_id: str = "") -> int:
+        """How much of the item he has actually heard, in milliseconds
+        (0 when the item is unknown)."""
+        item_id = item_id or self.current_item
+        with self._lock:
+            span = self._items.get(item_id)
+            if span is None:
+                return 0
+            start, end = span
+            heard = min(max(self._consumed - start, 0), end - start)
+        return int(heard * 1000 / (2 * self._samplerate))
 
     def clear(self) -> None:
+        """Drop everything not yet played (a barge-in). The current item's
+        recorded end moves back to what was heard, so played_ms stays honest."""
         with self._lock:
+            dropped = len(self._buffer)
             self._buffer.clear()
+            self._enqueued -= dropped
+            if self.current_item in self._items:
+                start, end = self._items[self.current_item]
+                self._items[self.current_item] = (start, max(start, min(end, self._enqueued)))
 
     @property
     def pending_seconds(self) -> float:
@@ -136,7 +211,12 @@ class Speaker:
             return len(self._buffer) / 2 / self._samplerate
 
     async def wait_idle(self, tail_s: float = 0.1) -> None:
-        """Return once queued audio has (approximately) finished playing."""
+        """Return once queued audio has (approximately) finished playing — or
+        once the device has stopped taking it, so a vanished speaker can
+        never hang a conversation."""
         while self.pending_seconds > 0:
+            if self.stalled:
+                self.clear()
+                return
             await asyncio.sleep(0.05)
         await asyncio.sleep(tail_s)

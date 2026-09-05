@@ -11,6 +11,7 @@ the journal, and reflection.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import time
 from collections.abc import Callable
@@ -43,13 +44,27 @@ async def wait_for_trigger(
     announcer: Any = None,
     restart: Callable[[], bool] | None = None,
     reconfigure: Callable[[], bool] | None = None,
+    convert: Callable[[bytes], bytes] | None = None,
+    stall_s: float | None = None,
 ) -> str:
     """Block until the wake phrase is heard ("wake"), an announcement is
     ready to be spoken ("announce"), a restart was requested ("restart"),
-    or the audio devices changed ("reconfigure")."""
+    the audio devices changed ("reconfigure"), or no frame arrived for
+    `stall_s` seconds ("stalled" — an unplugged microphone gives no error,
+    only silence). `convert` turns a source frame into what the detector
+    expects (the session mic runs at 24 kHz, the wake model wants 16 kHz)
+    so one microphone serves idle and talk — and whatever he says right
+    after the wake phrase queues on that same stream and reaches the
+    session first."""
     while True:
-        frame = await source.get_frame()
-        if wake.detect(frame):
+        if stall_s is not None:
+            try:
+                frame = await asyncio.wait_for(source.get_frame(), timeout=stall_s)
+            except TimeoutError:
+                return "stalled"
+        else:
+            frame = await source.get_frame()
+        if wake.detect(convert(frame) if convert is not None else frame):
             return "wake"
         if announcer is not None and announcer.due():
             return "announce"

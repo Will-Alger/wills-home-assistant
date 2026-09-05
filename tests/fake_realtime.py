@@ -50,6 +50,7 @@ class FakeConnection:
         self._events.put_nowait(
             SimpleNamespace(
                 type="response.output_audio.delta",
+                item_id="item_1",
                 delta=base64.b64encode(b"\x00\x00" * 240).decode("ascii"),
             )
         )
@@ -104,17 +105,30 @@ class NeverMic:
 
 
 class InstantSpeaker:
-    def __init__(self) -> None:
+    def __init__(self, played_ms: int = 0, drain_s: float = 0.0) -> None:
         self.chunks: list[bytes] = []
+        self.items: list[str] = []  # begin_item calls, in order
+        self.current_item = ""
+        self._played_ms = played_ms  # what played_ms() reports for any item
+        self._drain_s = drain_s  # >0: pretend the audio takes this long to play out
 
     def enqueue(self, pcm: bytes) -> None:
         self.chunks.append(pcm)
 
+    def begin_item(self, item_id: str) -> None:
+        if item_id and item_id != self.current_item:
+            self.current_item = item_id
+            self.items.append(item_id)
+
+    def played_ms(self, item_id: str = "") -> int:
+        return self._played_ms
+
     def clear(self) -> None:
         self.chunks.clear()
+        self._drain_s = 0.0  # a barge-in: nothing left to play out
 
     async def wait_idle(self, tail_s: float = 0.0) -> None:
-        await asyncio.sleep(0)
+        await asyncio.sleep(self._drain_s)
 
 
 class QuietUi:
