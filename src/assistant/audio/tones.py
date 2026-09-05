@@ -77,7 +77,17 @@ def pcm(kind: str, rate: int) -> bytes:
 # sleep. error: low, brief, minor-ish.
 _SOUNDS = {kind: _chime(**recipe) for kind, recipe in _RECIPES.items()}
 
+_OUTPUT: int | None = None  # the chosen speaker's index; None = the default
+
+
+def set_output(spec: str) -> None:
+    """Route the fire-and-forget chimes to the saved speaker (see devices.py)."""
+    global _OUTPUT
+    from assistant.audio import devices
+
+    _OUTPUT = devices.find(spec, "output")
+
 
 def play(kind: str) -> None:
     with contextlib.suppress(Exception):
-        sd.play(_SOUNDS[kind], _RATE, blocking=False)
+        sd.play(_SOUNDS[kind], _RATE, blocking=False, device=_OUTPUT)

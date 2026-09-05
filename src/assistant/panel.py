@@ -24,7 +24,7 @@ import json
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from assistant.config import wake_phrase
 
@@ -66,6 +66,14 @@ class PanelOverrides:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
+    # panel keyword -> settings field it overrides
+    FIELDS: ClassVar[dict[str, str]] = {
+        "voice": "realtime_voice",
+        "wake_model": "wake_model",
+        "microphone": "audio_input_device",
+        "speaker": "audio_output_device",
+    }
+
     @property
     def voice(self) -> str:
         return self._read().get("realtime_voice", "")
@@ -74,26 +82,38 @@ class PanelOverrides:
     def wake_model(self) -> str:
         return self._read().get("wake_model", "")
 
-    def set(self, *, voice: str = "", wake_model: str = "") -> dict[str, str]:
+    @property
+    def microphone(self) -> str:
+        return self._read().get("audio_input_device", "")
+
+    @property
+    def speaker(self) -> str:
+        return self._read().get("audio_output_device", "")
+
+    def set(
+        self, *, voice: str = "", wake_model: str = "", microphone: str = "", speaker: str = ""
+    ) -> dict[str, str]:
         data = self._read()
-        if voice:
-            data["realtime_voice"] = voice
-        if wake_model:
-            data["wake_model"] = wake_model
+        for key, value in (
+            ("voice", voice), ("wake_model", wake_model), ("microphone", microphone), ("speaker", speaker)
+        ):
+            if value:
+                data[self.FIELDS[key]] = value
         self._write(data)
         return data
 
     def clear(self, field: str) -> None:
         data = self._read()
-        if data.pop(field, None) is not None:
+        if data.pop(self.FIELDS.get(field, field), None) is not None:
             self._write(data)
 
     def apply(self, settings: Any) -> list[str]:
         """Fold the overrides over freshly loaded settings; returns what
         actually changed, for the boot log."""
         changed = []
-        for field, attr in (("realtime_voice", "realtime_voice"), ("wake_model", "wake_model")):
-            value = self._read().get(field, "")
+        saved = self._read()
+        for attr in self.FIELDS.values():
+            value = saved.get(attr, "")
             if value and value != getattr(settings, attr, value):
                 setattr(settings, attr, value)
                 changed.append(f"{attr}={value}")
@@ -113,6 +133,9 @@ class SettingsPanel:
         models_dir: Path | None = None,
         view_factory: Callable[[SettingsPanel], Any] | None = None,
         log: Callable[[str], None] | None = None,
+        on_audio_change: Callable[[str, str], None] | None = None,
+        on_refresh_devices: Callable[[], None] | None = None,
+        devices: Any | None = None,
     ) -> None:
         self._status = status
         self._overrides = overrides
@@ -120,6 +143,13 @@ class SettingsPanel:
         self._models_dir = Path(models_dir) if models_dir else None
         self._view_factory = view_factory or _tk_view
         self._log = log
+        self._on_audio_change = on_audio_change  # the app applies it to the next conversation
+        self._on_refresh_devices = on_refresh_devices  # the app re-scans between idle cycles
+        if devices is None:
+            from assistant.audio import devices as audio_devices
+
+            devices = audio_devices
+        self._devices = devices
         self._view: Any | None = None
 
     # ── opened and closed by voice ────────────────────────────────────────
@@ -173,10 +203,25 @@ class SettingsPanel:
                     choices[f"{wake_phrase(model.name)} (custom)"] = str(model)
         return choices
 
+    def microphone_choices(self) -> list[str]:
+        """'System default' plus every distinct input device plugged in now."""
+        try:
+            return list(self._devices.names("input"))
+        except Exception:  # noqa: BLE001
+            return [self._devices.DEFAULT]
+
+    def speaker_choices(self) -> list[str]:
+        try:
+            return list(self._devices.names("output"))
+        except Exception:  # noqa: BLE001
+            return [self._devices.DEFAULT]
+
     def snapshot(self) -> dict[str, object]:
         data = self._status.snapshot() if self._status is not None else {}
         data["saved_voice"] = self._overrides.voice
         data["saved_wake_word"] = self._overrides.wake_model
+        data["saved_microphone"] = self._overrides.microphone
+        data["saved_speaker"] = self._overrides.speaker
         return data
 
     def note(self, text: str) -> None:
@@ -189,9 +234,12 @@ class SettingsPanel:
 
     # ── the controls ──────────────────────────────────────────────────────
 
-    def save(self, *, voice: str = "", wake_word: str = "") -> str:
-        """Store a new voice and/or wake word. Both apply on the next start,
-        which is what the restart button is for."""
+    def save(
+        self, *, voice: str = "", wake_word: str = "", microphone: str = "", speaker: str = ""
+    ) -> str:
+        """Store a new voice and/or wake word (both apply on the next start,
+        which is what the restart button is for) and/or the microphone and
+        speaker (saved, and used from the next conversation on — no restart)."""
         voice = voice.strip()
         if voice and voice not in VOICES:
             return f"'{voice}' isn't one of her voices"
@@ -202,15 +250,74 @@ class SettingsPanel:
             model = choices.get(label) or (label if label in choices.values() else "")
             if not model:
                 return f"'{label}' isn't a wake word she can load"
-        if not voice and not model:
+        audio = self._resolve_audio(microphone, speaker)
+        if isinstance(audio, str):
+            return audio
+        mic_spec, speaker_spec = audio
+        if not voice and not model and mic_spec is None and speaker_spec is None:
             return "nothing to save"
-        self._overrides.set(voice=voice, wake_model=model)
-        saved = ", ".join(
-            part for part in (f"voice {voice}" if voice else "", f"wake word {wake_phrase(model)}" if model else "")
-            if part
-        )
-        self.note(f"saved {saved} — restart to apply")
-        return f"saved {saved} — restart to apply"
+        parts: list[str] = []
+        if voice or model:
+            self._overrides.set(voice=voice, wake_model=model)
+            parts.append(
+                ", ".join(
+                    p for p in (f"voice {voice}" if voice else "", f"wake word {wake_phrase(model)}" if model else "")
+                    if p
+                )
+                + " — restart to apply"
+            )
+        if mic_spec is not None or speaker_spec is not None:
+            for key, spec in (("microphone", mic_spec), ("speaker", speaker_spec)):
+                if spec is None:
+                    continue
+                if self._devices.is_default(spec):
+                    self._overrides.clear(key)
+                else:
+                    self._overrides.set(**{key: spec})
+            if self._on_audio_change is not None:
+                with contextlib.suppress(Exception):
+                    self._on_audio_change(self._overrides.microphone, self._overrides.speaker)
+            parts.append(
+                ", ".join(
+                    p
+                    for p in (
+                        f"microphone {mic_spec}" if mic_spec is not None else "",
+                        f"speaker {speaker_spec}" if speaker_spec is not None else "",
+                    )
+                    if p
+                )
+                + " — used from the next conversation"
+            )
+        message = "saved " + "; ".join(parts)
+        self.note(message)
+        return message
+
+    def _resolve_audio(self, microphone: str, speaker: str) -> tuple[str | None, str | None] | str:
+        """Turn what he typed or said into saved specs: an exact picker entry,
+        'System default', or a name fragment that matches a device now."""
+        out: list[str | None] = []
+        for kind, wanted in (("input", microphone.strip()), ("output", speaker.strip())):
+            if not wanted:
+                out.append(None)
+                continue
+            if self._devices.is_default(wanted):
+                out.append(self._devices.DEFAULT)
+                continue
+            if self._devices.find(wanted, kind) is None:
+                available = ", ".join(self._devices.names(kind)[1:]) or "none"
+                what = "microphone" if kind == "input" else "speaker"
+                return f"no {what} matches '{wanted}' — plugged in right now: {available}"
+            out.append(wanted)
+        return out[0], out[1]
+
+    def refresh_devices(self) -> str:
+        """A headset just paired: ask the app to re-scan between idle cycles."""
+        if self._on_refresh_devices is None:
+            return "re-scanning isn't wired up in this session"
+        with contextlib.suppress(Exception):
+            self._on_refresh_devices()
+        self.note("re-scanning audio devices")
+        return "re-scanning audio devices — the lists update in a few seconds"
 
     def restart(self) -> str:
         if self._restart is None:
@@ -282,7 +389,10 @@ class _TkPanel:
 
         self._values: dict[str, Any] = {}
         for row, (key, label) in enumerate(
-            (("mic", "Microphone"), ("listening", "Listening"), ("summary", "Status"))
+            (
+                ("mic", "Microphone in use"), ("speaker", "Speaker in use"),
+                ("listening", "Listening"), ("summary", "Status"),
+            )
         ):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=2)
             value = ttk.Label(frame, text="…", wraplength=380, justify="left")
@@ -295,44 +405,64 @@ class _TkPanel:
         self._voice = tk.StringVar(
             value=str(snapshot.get("saved_voice") or snapshot.get("voice", ""))
         )
-        ttk.Label(frame, text="Voice").grid(row=3, column=0, sticky="w", pady=2)
+        ttk.Label(frame, text="Voice").grid(row=4, column=0, sticky="w", pady=2)
         ttk.Combobox(
             frame, textvariable=self._voice, values=self._panel.voice_choices(),
             state="readonly", width=18,
-        ).grid(row=3, column=1, sticky="w", pady=2)
+        ).grid(row=4, column=1, sticky="w", pady=2)
 
         self._wake_choices = self._panel.wake_choices()
         current = str(snapshot.get("saved_wake_word") or snapshot.get("wake_word", ""))
         self._wake = tk.StringVar(
             value=next((k for k, v in self._wake_choices.items() if v == current), current)
         )
-        ttk.Label(frame, text="Wake word").grid(row=4, column=0, sticky="w", pady=2)
+        ttk.Label(frame, text="Wake word").grid(row=5, column=0, sticky="w", pady=2)
         ttk.Combobox(
             frame, textvariable=self._wake, values=list(self._wake_choices),
             state="readonly", width=18,
-        ).grid(row=4, column=1, sticky="w", pady=2)
+        ).grid(row=5, column=1, sticky="w", pady=2)
+
+        # the audio devices: saved by name, used from the next conversation
+        default = self._panel._devices.DEFAULT
+        self._mic_choice = tk.StringVar(value=str(snapshot.get("saved_microphone") or default))
+        ttk.Label(frame, text="Microphone").grid(row=6, column=0, sticky="w", pady=2)
+        self._mic_box = ttk.Combobox(
+            frame, textvariable=self._mic_choice, values=self._panel.microphone_choices(),
+            state="readonly", width=42,
+        )
+        self._mic_box.grid(row=6, column=1, columnspan=2, sticky="w", pady=2)
+        self._speaker_choice = tk.StringVar(value=str(snapshot.get("saved_speaker") or default))
+        ttk.Label(frame, text="Speaker").grid(row=7, column=0, sticky="w", pady=2)
+        self._speaker_box = ttk.Combobox(
+            frame, textvariable=self._speaker_choice, values=self._panel.speaker_choices(),
+            state="readonly", width=42,
+        )
+        self._speaker_box.grid(row=7, column=1, columnspan=2, sticky="w", pady=2)
 
         buttons = ttk.Frame(frame)
-        buttons.grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 4))
+        buttons.grid(row=8, column=0, columnspan=3, sticky="w", pady=(10, 4))
         ttk.Button(buttons, text="Save", command=self._on_save).pack(side="left")
-        ttk.Button(buttons, text="Restart assistant", command=self._on_restart).pack(
+        ttk.Button(buttons, text="Refresh devices", command=self._on_refresh_devices).pack(
             side="left", padx=6
         )
-        ttk.Button(buttons, text="Close", command=self._on_x).pack(side="left")
+        ttk.Button(buttons, text="Restart assistant", command=self._on_restart).pack(side="left")
+        ttk.Button(buttons, text="Close", command=self._on_x).pack(side="left", padx=6)
 
         self._message = ttk.Label(
-            frame, text="Voice and wake word take effect on the next start.",
+            frame,
+            text="Voice and wake word take effect on the next start; microphone and "
+            "speaker on the next conversation. Just paired something? Refresh devices.",
             wraplength=520, justify="left",
         )
-        self._message.grid(row=6, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        self._message.grid(row=9, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
-        ttk.Label(frame, text="Live log").grid(row=7, column=0, sticky="w")
+        ttk.Label(frame, text="Live log").grid(row=10, column=0, sticky="w")
         self._feed = tk.Text(frame, height=14, width=64, wrap="none", state="disabled")
-        self._feed.grid(row=8, column=0, columnspan=3, sticky="nsew")
+        self._feed.grid(row=11, column=0, columnspan=3, sticky="nsew")
         scroll = ttk.Scrollbar(frame, orient="vertical", command=self._feed.yview)
-        scroll.grid(row=8, column=3, sticky="ns")
+        scroll.grid(row=11, column=3, sticky="ns")
         self._feed.configure(yscrollcommand=scroll.set)
-        frame.rowconfigure(8, weight=1)
+        frame.rowconfigure(11, weight=1)
         frame.columnconfigure(2, weight=1)
 
         self._refresh()
@@ -340,7 +470,22 @@ class _TkPanel:
     # callbacks (Tk thread)
 
     def _on_save(self) -> None:
-        self._message.configure(text=self._panel.save(voice=self._voice.get(), wake_word=self._wake.get()))
+        self._message.configure(
+            text=self._panel.save(
+                voice=self._voice.get(), wake_word=self._wake.get(),
+                microphone=self._mic_choice.get(), speaker=self._speaker_choice.get(),
+            )
+        )
+
+    def _on_refresh_devices(self) -> None:
+        self._message.configure(text=self._panel.refresh_devices())
+        # the app re-scans between idle cycles; re-read the lists once it has
+        self._root.after(3000, self._reload_device_lists)
+
+    def _reload_device_lists(self) -> None:
+        with contextlib.suppress(Exception):
+            self._mic_box.configure(values=self._panel.microphone_choices())
+            self._speaker_box.configure(values=self._panel.speaker_choices())
 
     def _on_restart(self) -> None:
         self._message.configure(text=self._panel.restart())
@@ -355,6 +500,7 @@ class _TkPanel:
             return
         snapshot = self._panel.snapshot()
         self._values["mic"].configure(text=str(snapshot.get("mic", "unknown")))
+        self._values["speaker"].configure(text=str(snapshot.get("speaker") or "system default"))
         self._values["listening"].configure(
             text="● yes — she is hearing you" if snapshot.get("listening") else "○ no"
         )

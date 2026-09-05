@@ -965,10 +965,12 @@ PANEL_TOOLS: list[dict[str, Any]] = [
         "description": (
             "Put your Settings panel on the desktop screen — 'open the "
             "settings panel', 'show me your settings'. It shows which "
-            "microphone you are on, whether you are listening right now, "
-            "your voice, your wake word, a status line and a live log, and "
-            "it has controls to change your voice or wake word and to "
-            "restart you. It never turns listening on or off."
+            "microphone and speaker you are on, whether you are listening "
+            "right now, your voice, your wake word, a status line and a live "
+            "log, and it has controls to change your voice or wake word, to "
+            "pick the microphone and speaker (saved, applied at the next "
+            "conversation), to re-scan devices, and to restart you. It never "
+            "turns listening on or off."
         ),
         "parameters": {"type": "object", "properties": {}},
     },
@@ -976,6 +978,40 @@ PANEL_TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "name": "close_settings_panel",
         "description": "Take the Settings panel off the screen — 'close the settings panel'.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "list_audio_devices",
+        "description": (
+            "The microphones and speakers plugged in right now, and which are "
+            "saved — 'what audio devices do you see?', or before switching."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "use_audio_device",
+        "description": (
+            "Switch and SAVE the microphone and/or speaker she uses — 'use my "
+            "AirPods', 'switch the mic to the Snowball', 'back to the default "
+            "speaker'. A name fragment is enough (\"airpods\"); 'System default' "
+            "means whatever Windows prefers. Takes effect from the next "
+            "conversation, no restart. If nothing matches, the reply lists what "
+            "is plugged in — read that back."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "microphone": {"type": "string"},
+                "speaker": {"type": "string"},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "name": "refresh_audio_devices",
+        "description": "Re-scan the audio devices after something was just paired or plugged in.",
         "parameters": {"type": "object", "properties": {}},
     },
 ]
@@ -1321,7 +1357,7 @@ class RealtimeEngine:
             elif call_name in _JOURNAL_TOOL_NAMES:
                 result_text, is_error = self._execute_journal_tool(call_name, args)
             elif call_name in _PANEL_TOOL_NAMES:
-                result_text, is_error = self._execute_panel_tool(call_name)
+                result_text, is_error = self._execute_panel_tool(call_name, args)
             elif call_name in _BRAIN_TOOL_NAMES:
                 self._live_transcript = stats.transcript
                 result_text, is_error = await self._execute_brain_tool(call_name, args)
@@ -1771,13 +1807,35 @@ class RealtimeEngine:
             return "I haven't announced anything in that window", False
         return json.dumps(rows), False
 
-    def _execute_panel_tool(self, name: str) -> tuple[str, bool]:
+    def _execute_panel_tool(self, name: str, args: dict[str, Any] | None = None) -> tuple[str, bool]:
+        args = args or {}
         if self._panel is None:
             return "the settings panel isn't available in this session", True
         try:
             if name == "open_settings_panel":
                 return self._panel.open(), False
-            return self._panel.close(), False
+            if name == "close_settings_panel":
+                return self._panel.close(), False
+            if name == "list_audio_devices":
+                return json.dumps(
+                    {
+                        "microphones": self._panel.microphone_choices(),
+                        "speakers": self._panel.speaker_choices(),
+                        "saved": {
+                            "microphone": self._panel.snapshot().get("saved_microphone") or "System default",
+                            "speaker": self._panel.snapshot().get("saved_speaker") or "System default",
+                        },
+                    }
+                ), False
+            if name == "use_audio_device":
+                text = self._panel.save(
+                    microphone=str(args.get("microphone", "") or ""),
+                    speaker=str(args.get("speaker", "") or ""),
+                )
+                return text, not text.startswith("saved")
+            if name == "refresh_audio_devices":
+                return self._panel.refresh_devices(), False
+            return f"unknown panel tool {name}", True
         except Exception as err:  # noqa: BLE001 — a window that won't open is a spoken sentence
             verb = "open" if name == "open_settings_panel" else "close"
             return f"couldn't {verb} the settings panel: {err}", True

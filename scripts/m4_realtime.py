@@ -25,7 +25,7 @@ from rich.markup import render
 
 from assistant.announce import Announcer
 from assistant.app import record_session, wait_for_trigger
-from assistant.audio import tones
+from assistant.audio import devices, tones
 from assistant.audio.cues import VoiceCues
 from assistant.audio.mic import Microphone, describe_device
 from assistant.audio.speaker import Speaker
@@ -243,8 +243,10 @@ def build_engine(fake: bool):
             name=settings.assistant_name,
             owner=settings.owner_name,
         )
+    tones.set_output(settings.audio_output_device)  # chimes follow the chosen speaker
     status = AssistantStatus(
         mic=describe_device(settings.audio_input_device),
+        speaker=devices.describe(settings.audio_output_device, "output"),
         voice=settings.realtime_voice,
         wake_word=settings.wake_phrase,
         home="fake apartment" if fake else settings.ha_url,
@@ -260,12 +262,25 @@ def build_engine(fake: bool):
     if board is not None:
         board.on_restart = request_restart  # a background merge landed: restart when idle
 
+    def apply_audio(microphone: str, speaker: str) -> None:
+        # saved by the panel or by voice: the idle mic reopens on the new
+        # device at the next cycle, the next session's speaker follows too
+        settings.audio_input_device = microphone
+        settings.audio_output_device = speaker
+        tones.set_output(speaker)
+        engine.audio_reconfigure = True
+
+    def rescan_audio() -> None:
+        engine.audio_reconfigure = True  # PortAudio re-enumerates between idle cycles
+
     panel = SettingsPanel(
         status,
         overrides,
         restart=request_restart,
         models_dir=code_root() / "models",
         log=lambda m: console.print(f"[dim]{m}[/dim]"),
+        on_audio_change=apply_audio,
+        on_refresh_devices=rescan_audio,
     )
     engine = RealtimeEngine(
         api_key=settings.openai_api_key,
@@ -314,6 +329,7 @@ def build_engine(fake: bool):
     engine.cues = cues
     engine.panel = panel
     engine.overrides = overrides
+    engine.audio_reconfigure = False  # set when the mic/speaker choice changes
     pusher = None
     if settings.phone_notify_service and not fake:
         pusher = PhonePusher(home, settings.phone_notify_service, name=settings.assistant_name, journal=journal)
@@ -454,13 +470,17 @@ async def voice(fake: bool) -> int:
     wake, session_wake = load_wake_detectors(settings, getattr(engine, "overrides", None))
     total_cost = 0.0
     mic_name = describe_device(settings.audio_input_device)
+    speaker_name = devices.describe(settings.audio_output_device, "output")
     if status is not None:
-        status.configure(mic=mic_name, voice=settings.realtime_voice, wake_word=settings.wake_phrase)
+        status.configure(
+            mic=mic_name, speaker=speaker_name,
+            voice=settings.realtime_voice, wake_word=settings.wake_phrase,
+        )
         status.set_state("idle")
     say(
         status,
         f"Voice online. “{settings.wake_phrase}” to talk to {settings.assistant_name} · "
-        f"voice: {settings.realtime_voice} · mic: {mic_name} · "
+        f"voice: {settings.realtime_voice} · mic: {mic_name} · speaker: {speaker_name} · "
         f"home: {'fake apartment' if fake else settings.ha_url} · Ctrl+C quits.",
     )
     failures = 0
@@ -505,9 +525,21 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
     status = getattr(engine, "status", None)
     cues = getattr(engine, "cues", None)
     announcer = getattr(engine, "announcer", None)
+    if getattr(engine, "audio_reconfigure", False):
+        # the mic or speaker choice changed (or he paired something): nothing
+        # is open right now, so PortAudio can re-scan and the new choice applies
+        engine.audio_reconfigure = False
+        devices.refresh()
+        tones.set_output(settings.audio_output_device)
+        say(
+            status,
+            f"audio: mic {describe_device(settings.audio_input_device)} · "
+            f"speaker {devices.describe(settings.audio_output_device, 'output')}",
+            "dim",
+        )
     # Something to say already? Skip the mic and speak. Otherwise IDLE:
     # wake-gate on a 16 kHz mic (local, free, private) while watching the
-    # announcement queue and the restart flag.
+    # announcement queue, the restart flag and the audio-change flag.
     trigger = "announce" if announcer is not None and announcer.due() else ""
     if not trigger:
         async with Microphone(settings.audio_input_device) as mic16:
@@ -519,9 +551,11 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
                 status.set_state("idle")
             console.print("[dim]○ idle — say the wake phrase[/dim]")
             trigger = await wait_for_trigger(
-                mic16, wake, announcer, restart=lambda: engine.restart_requested
+                mic16, wake, announcer,
+                restart=lambda: engine.restart_requested,
+                reconfigure=lambda: getattr(engine, "audio_reconfigure", False),
             )
-    if trigger == "restart":
+    if trigger in ("restart", "reconfigure"):
         return total_cost
     announcing = trigger == "announce"
     if not announcing and cues is not None:
@@ -534,8 +568,13 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
             samplerate=REALTIME_RATE,
             frame_samples=FRAME_SAMPLES_24K,
         ) as mic24,
-        Speaker(REALTIME_RATE) as speaker,
+        Speaker(REALTIME_RATE, device=settings.audio_output_device) as speaker,
     ):
+        if speaker.device_note and speaker.device_note != getattr(engine, "_speaker_note", None):
+            engine._speaker_note = speaker.device_note
+            say(status, speaker.device_note, "yellow")
+        if status is not None:
+            status.configure(speaker=speaker.device_in_use)  # the speaker she is really on
         if announcing:
             say(status, "◆ announcing", "cyan")
             with contextlib.suppress(Exception):

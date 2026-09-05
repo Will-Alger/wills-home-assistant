@@ -3,9 +3,10 @@
 While idle, the app watches every 80 ms mic frame for the wake word AND
 checks whether an announcement is due — the two things that can start a
 conversation. `wait_for_trigger` returns which one happened (or "restart"
-when something else — a phone approve — asked for one). `record_session`
-is the bookkeeping after a conversation: the session log, the journal, and
-reflection.
+when something else — a phone approve — asked for one, or "reconfigure" when
+the microphone or speaker was changed and the idle mic must be reopened).
+`record_session` is the bookkeeping after a conversation: the session log,
+the journal, and reflection.
 """
 
 from __future__ import annotations
@@ -20,9 +21,11 @@ async def wait_for_trigger(
     wake: Any,
     announcer: Any = None,
     restart: Callable[[], bool] | None = None,
+    reconfigure: Callable[[], bool] | None = None,
 ) -> str:
     """Block until the wake phrase is heard ("wake"), an announcement is
-    ready to be spoken ("announce"), or a restart was requested ("restart")."""
+    ready to be spoken ("announce"), a restart was requested ("restart"),
+    or the audio devices changed ("reconfigure")."""
     while True:
         frame = await source.get_frame()
         if wake.detect(frame):
@@ -31,6 +34,8 @@ async def wait_for_trigger(
             return "announce"
         if restart is not None and restart():
             return "restart"
+        if reconfigure is not None and reconfigure():
+            return "reconfigure"
 
 
 async def record_session(

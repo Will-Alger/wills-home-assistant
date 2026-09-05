@@ -142,6 +142,7 @@ class Settings(BaseSettings):
     wake_model: str = "alexa"
     wake_threshold: float = 0.5  # raise if false wakes, lower if it misses you
     audio_input_device: str = ""  # "" = default mic; index or name substring
+    audio_output_device: str = ""  # "" = default speaker; index or name substring
     stt_provider: str = "deepgram"
     deepgram_api_key: str = ""
     # 0 = provider default. Raise toward ~0.85 if it ends your turn at
