@@ -91,6 +91,32 @@ def entries(kind: str) -> list[dict[str, Any]]:
     return [{"name": pretty(raw), "raw": raw, "index": index} for raw, (_rank_, index) in rows]
 
 
+def _same_device(a: str, b: str) -> bool:
+    """Equal names, or one is MME's 31-character cut of the other."""
+    if a == b:
+        return True
+    short, long_ = sorted((a, b), key=len)
+    return len(short) == _MME_NAME_LIMIT and long_.startswith(short)
+
+
+def twins(index: int, kind: str) -> list[int]:
+    """The same device through the other host APIs, best API first, `index`
+    excluded. WASAPI's shared mode refuses a sample rate the device's mix
+    format lacks ("Invalid sample rate"); MME resamples — so a twin is the
+    same device, not a fallback."""
+    found, apis = _query()
+    key = "max_input_channels" if kind == "input" else "max_output_channels"
+    if not 0 <= index < len(found):
+        return []
+    mine = str(found[index].get("name", ""))
+    rows = [
+        (_rank(dev, apis), i)
+        for i, dev in enumerate(found)
+        if i != index and int(dev.get(key, 0) or 0) > 0 and _same_device(str(dev.get("name", "")), mine)
+    ]
+    return [i for _, i in sorted(rows)]
+
+
 def names(kind: str) -> list[str]:
     """What a picker shows: the default first, then every distinct device."""
     return [DEFAULT, *(row["name"] for row in entries(kind))]

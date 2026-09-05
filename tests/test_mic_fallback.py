@@ -26,6 +26,7 @@ DEVICES = [
     {"name": "Headset (Will's AirPods Pro #2 - Find My)", "max_input_channels": 1, "max_output_channels": 0, "hostapi": 2},
 ]
 SNOWBALL = {"name": "Microphone (Blue Snowball)", "max_input_channels": 1, "max_output_channels": 0, "hostapi": 2}
+SNOWBALL_MME = {"name": "Microphone (Blue Snowball)", "max_input_channels": 1, "max_output_channels": 0, "hostapi": 0}
 APIS = [{"name": "MME"}, {"name": "Windows DirectSound"}, {"name": "Windows WASAPI"}, {"name": "Windows WDM-KS"}]
 
 
@@ -104,6 +105,15 @@ async def test_the_saved_microphone_wins_when_it_is_back(monkeypatch) -> None:
     rig.default = 6  # a real default needs no second-guessing
     async with Microphone("") as mic:
         assert rig.opened == [None] and not mic.fallback and mic.device_note is None
+
+
+async def test_a_rate_refusal_opens_the_same_microphone_through_mme(monkeypatch) -> None:
+    """WASAPI's shared mode refuses 16 kHz on a 48 kHz Snowball; MME resamples.
+    Same microphone: no note, no fallback, no 30 s re-scan churn."""
+    rig = Rig(monkeypatch, devices_=[*DEVICES, SNOWBALL, SNOWBALL_MME], default=1, failing={6})
+    async with Microphone("Snowball") as mic:
+        assert rig.opened == [7] and mic.device_note is None and not mic.fallback
+        assert mic.device_in_use == "Microphone (Blue Snowball)"
 
 
 def test_rescan_clock_fires_once_per_period_only_while_on_a_fallback() -> None:

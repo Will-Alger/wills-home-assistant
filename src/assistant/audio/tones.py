@@ -89,5 +89,7 @@ def set_output(spec: str) -> None:
 
 
 def play(kind: str) -> None:
-    with contextlib.suppress(Exception):
-        sd.play(_SOUNDS[kind], _RATE, blocking=False, device=_OUTPUT)
+    for device in dict.fromkeys((_OUTPUT, None)):  # the chosen speaker, then the default
+        with contextlib.suppress(Exception):
+            sd.play(_SOUNDS[kind], _RATE, blocking=False, device=device)
+            return

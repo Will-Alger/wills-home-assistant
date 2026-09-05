@@ -157,8 +157,9 @@ async def test_speaker_falls_back_to_the_default_with_a_note(monkeypatch) -> Non
 
     monkeypatch.setattr(speaker_module.sd, "RawOutputStream", FakeStream)
     async with Speaker(24_000, device="airpods") as spk:
-        assert "would not open" in (spk.device_note or "")
-        assert spk.device_in_use == "Speakers (Realtek)" and opened == [None]
+        # WASAPI refused: the same AirPods through MME (index 2) — not a fallback, no note
+        assert spk.device_note is None
+        assert spk.device_in_use == "Headphones (Will's AirPods Pro)" and opened == [2]
     async with Speaker(24_000, device="bose") as spk:
         assert "isn't plugged in" in (spk.device_note or "") and spk.device_in_use == "Speakers (Realtek)"
     async with Speaker(24_000) as spk:

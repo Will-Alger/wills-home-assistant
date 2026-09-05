@@ -142,6 +142,17 @@ class Microphone:
             self.device_in_use = describe_device("" if self._device is None else str(self._device))
             return self
         except sd.PortAudioError as err:
+            # The chosen entry refused — WASAPI's shared mode will not resample
+            # to 16 kHz — so the same microphone through another host API
+            # first: that is the device he asked for, not a fallback.
+            if self._device is not None:
+                for index in devices.twins(self._device, "input"):
+                    try:
+                        self._stream = self._open(index)
+                    except sd.PortAudioError:
+                        continue
+                    self.device_in_use = describe_device(str(index))
+                    return self
             # The configured/default input won't open (typical: a Bluetooth
             # headset just became Windows' default input). Try real mics
             # instead of looping on the error — she must keep hearing the room.
