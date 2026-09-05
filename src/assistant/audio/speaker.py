@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import threading
 import time
+from collections.abc import Callable
 from typing import Self
 
 import sounddevice as sd
@@ -75,6 +76,7 @@ class Speaker:
         self._items: dict[str, tuple[int, int]] = {}  # item id -> (start, end) byte offsets
         self.current_item = ""  # the assistant item whose audio is being enqueued
         self._last_callback = time.monotonic()
+        self._marks: list[tuple[int, Callable[[], None]]] = []  # (byte position, callback)
 
     @property
     def is_open(self) -> bool:
@@ -88,13 +90,40 @@ class Speaker:
             waiting = bool(self._buffer)
         return self.is_open and waiting and time.monotonic() - self._last_callback > _STALL_S
 
+    @property
+    def enqueued(self) -> int:
+        """Bytes enqueued so far: a position to hand to notify_when_played."""
+        with self._lock:
+            return self._enqueued
+
+    def notify_when_played(self, position: int, fn: Callable[[], None]) -> None:
+        """Call `fn` (from the audio thread, once) the instant the callback
+        pulls the byte at `position` — the moment a chime could be heard,
+        not the moment it was queued. Dropped by clear() if never reached."""
+        with self._lock:
+            if position < self._consumed:
+                fire = True
+            else:
+                self._marks.append((position, fn))
+                fire = False
+        if fire:
+            with contextlib.suppress(Exception):
+                fn()
+
     def _consume(self, need: int) -> bytes:
         """The callback's read: the next `need` bytes, silence-padded."""
         self._last_callback = time.monotonic()
+        due: list[Callable[[], None]] = []
         with self._lock:
             chunk = bytes(self._buffer[:need])
             del self._buffer[: len(chunk)]
             self._consumed += len(chunk)
+            if self._marks and chunk:
+                due = [fn for pos, fn in self._marks if pos < self._consumed]
+                self._marks = [(pos, fn) for pos, fn in self._marks if pos >= self._consumed]
+        for fn in due:
+            with contextlib.suppress(Exception):
+                fn()
         if len(chunk) < need:
             chunk += b"\x00" * (need - len(chunk))  # underflow = silence
         return chunk
@@ -201,6 +230,7 @@ class Speaker:
             dropped = len(self._buffer)
             self._buffer.clear()
             self._enqueued -= dropped
+            self._marks = [(pos, fn) for pos, fn in self._marks if pos < self._enqueued]
             if self.current_item in self._items:
                 start, end = self._items[self.current_item]
                 self._items[self.current_item] = (start, max(start, min(end, self._enqueued)))

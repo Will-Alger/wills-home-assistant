@@ -101,6 +101,22 @@ class FakeConnection:
     fail_recv_after: int | None = None  # the socket dies on this recv (1-based)
     _recv_count = 0
 
+    def push(self, event_type: str, **fields: Any) -> None:
+        """One scripted event, at the moment the test chooses — so a test can
+        put real delays between the steps of a turn and time them."""
+        self._events.put_nowait(SimpleNamespace(type=event_type, **fields))
+
+    def push_response_done(self, *calls: tuple[str, str, dict[str, Any]]) -> None:
+        """A finished response, optionally with function calls to execute:
+        each is (call_id, name, arguments)."""
+        output = [
+            SimpleNamespace(
+                type="function_call", call_id=call_id, name=name, arguments=json.dumps(args)
+            )
+            for call_id, name, args in calls
+        ]
+        self.push("response.done", response=SimpleNamespace(output=output, usage=None))
+
     async def recv(self) -> Any:
         self._recv_count += 1
         if self.fail_recv_after is not None and self._recv_count >= self.fail_recv_after:

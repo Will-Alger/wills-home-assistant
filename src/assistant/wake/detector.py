@@ -42,12 +42,17 @@ class WakeDetector:
         self.threshold = threshold
         self._cooldown_s = cooldown_s
         self._last_fired = 0.0
+        # What the last frame scored — read after detect() by the latency log,
+        # which records the wakes that almost happened. Inference is not free:
+        # scoring the frame a second time to find out is not an option.
+        self.last_score = 0.0
 
     def score(self, frame: bytes) -> float:
         """Raw max score (0..1) for this frame across the loaded model(s)."""
         samples = np.frombuffer(frame, dtype=np.int16)
         prediction = self._model.predict(samples)
-        return max(prediction.values()) if prediction else 0.0
+        self.last_score = max(prediction.values()) if prediction else 0.0
+        return self.last_score
 
     def detect(self, frame: bytes) -> bool:
         fired = self.score(frame) >= self.threshold

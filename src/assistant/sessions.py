@@ -33,6 +33,9 @@ class SessionRow:
     announced: list[int] = field(default_factory=list)
     responses: int = 0
     cost_usd: float = 0.0
+    # The last turn's latency row (see latency.py), seconds from the wake:
+    # kept here so "how fast were you?" can be answered off this row alone.
+    timings: dict[str, Any] = field(default_factory=dict)
 
     @property
     def about(self) -> str:
@@ -104,6 +107,7 @@ class SessionLog:
         announced: Iterable[int] = (),
         responses: int = 0,
         cost_usd: float = 0.0,
+        timings: dict[str, Any] | None = None,
     ) -> SessionRow | None:
         row = self.get(row_id)
         if row is None:
@@ -115,6 +119,7 @@ class SessionLog:
         row.announced = [int(i) for i in announced]
         row.responses = int(responses)
         row.cost_usd = float(cost_usd)
+        row.timings = dict(timings or {})
         self._save()
         return row
 
@@ -160,6 +165,7 @@ class SessionLog:
                 "kind": r.kind,
                 "ended_by": r.ended_by,
                 **({"tools": r.tools} if r.tools else {}),
+                **({"timings": r.timings} if r.timings else {}),
             }
             for r in rows[:limit]
         ]

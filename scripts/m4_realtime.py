@@ -45,6 +45,7 @@ from assistant.followups import FollowUpStore
 from assistant.home import HomeAssistantClient
 from assistant.home.fake import FakeHome
 from assistant.journal import Journal
+from assistant.latency import LatencyLog
 from assistant.learning import Reflector
 from assistant.llm.anthropic_provider import AnthropicProvider
 from assistant.memory import MemoryStore
@@ -186,6 +187,7 @@ def build_engine(fake: bool):
             journal=journal,
         )
     delivery = DeliverySettings(root / "data" / "delivery.json")
+    latency = LatencyLog(root / "logs" / "turns.jsonl")  # one row per turn, timings only
     announcer.policy = DeliveryPolicy(
         quiet=announcer.is_quiet,
         presence=presence,
@@ -320,6 +322,7 @@ def build_engine(fake: bool):
         ),
         cues=cues,
         panel=panel,
+        latency=latency,
     )
     scheduler._executor = engine._executor  # scheduled actions run through her tools
     scheduler.briefing = compose_briefing(calendar, board, scheduler, announcer, settings.owner_name)
@@ -331,6 +334,7 @@ def build_engine(fake: bool):
     engine.status = status  # what the settings panel shows
     engine.cues = cues
     engine.panel = panel
+    engine.latency = latency
     engine.overrides = overrides
     engine.audio_reconfigure = False  # set when the mic/speaker choice changes
     pusher = None
@@ -536,6 +540,8 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
     audio: AudioIO | None = engine.__dict__.get("_audio")
     if audio is None:
         audio = engine._audio = AudioIO(settings, rate=REALTIME_RATE, frame_samples=FRAME_SAMPLES_24K)
+    latency = engine.latency  # the turn log; its stopwatch starts at the wake
+    trace = None
     quiet = False  # a periodic re-scan while on a fallback mic: repeat nothing unless it changed
     if getattr(engine, "audio_reconfigure", False) or not audio.is_open:
         engine.audio_reconfigure = False
@@ -579,6 +585,16 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
                 return True
             return False
 
+        def on_score(score: float, fired: bool) -> None:
+            # The wake starts the stopwatch; the near misses (loud
+            # enough to be someone trying, too quiet to fire) are
+            # kept so the threshold can be argued from real audio.
+            nonlocal trace
+            if fired:
+                trace = latency.wake(score)
+            else:
+                latency.near_miss(score, settings.wake_threshold)
+
         mic.drain()  # whatever the mic caught since the last conversation ended
         trigger = await wait_for_trigger(
             mic, wake, announcer,
@@ -586,6 +602,7 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
             reconfigure=rescan_due,
             convert=downsample_24k_to_16k,
             stall_s=MIC_STALL_S,
+            on_score=on_score,
         )
     if trigger == "stalled":
         # an unplugged microphone gives no error, only silence: reopen
@@ -595,8 +612,17 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
     if trigger in ("restart", "reconfigure"):
         return total_cost
     announcing = trigger == "announce"
+    if trace is None:
+        trace = latency.wake(None)  # she opened this one: no wake word, no score
     if not announcing and cues is not None:
-        cues.start(speaker)  # the wake ding through the stream already open: no race, no wait
+        # The wake ding through the stream already open: no race, no wait.
+        # The log wants both moments — queued, and when it could be heard,
+        # which the speaker reports the instant its callback pulls that byte.
+        chime_at = speaker.enqueued
+        cues.start(speaker)
+        trace.stamp("chime_enqueued")
+        speaker.notify_when_played(chime_at, trace.audible)
+    trace.stamp("mic_ready")  # both streams were open before the wake word
     session_wake.reset()
     if announcing:
         say(status, "◆ announcing", "cyan")
@@ -612,6 +638,7 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
     stats = await engine.run_conversation(
         mic, speaker, session_wake,
         ConsoleUi(settings.assistant_name, status), announce=announcing,
+        trace=trace,
     )
     with contextlib.suppress(Exception):
         if cues is not None:
@@ -635,13 +662,20 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
         "no reply": "asked, no reply — back to sleep",
         "interrupted announcement": "you cut in — closed after quiet",
     }.get(stats.ended_by, stats.ended_by)
+    with contextlib.suppress(Exception):  # the log is an instrument, never a blocker
+        trace.finish(stats.ended_by, session=getattr(row, "id", None))
+    timed = trace.console_note()  # 'first audio 0.9 s' for the last turn
     say(
         status,
         f"conversation closed ({reason}) · {stats.responses} replies · "
-        f"tools: {stats.tool_calls or 'none'} · ${stats.cost_usd:.4f} "
-        f"(${total_cost:.4f} session)",
+        f"tools: {stats.tool_calls or 'none'} · "
+        + (f"{timed} · " if timed else "")
+        + f"${stats.cost_usd:.4f} (${total_cost:.4f} session)",
     )
-    await record_session(sessions, getattr(engine, "journal", None), stats, row, None)
+    await record_session(
+        sessions, getattr(engine, "journal", None), stats, row, None,
+        timings=trace.compact(),
+    )
     if reflector is not None and stats.transcript:
         # Reflection is a Claude CLI call (seconds). It used to run here, in
         # line, with the wake-word mic closed: "hey alexa" right after a

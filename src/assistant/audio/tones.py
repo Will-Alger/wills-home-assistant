@@ -12,6 +12,10 @@ no sound, never a crash.
 from __future__ import annotations
 
 import contextlib
+import threading
+import time
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 import sounddevice as sd
@@ -88,8 +92,38 @@ def set_output(spec: str) -> None:
     _OUTPUT = devices.find(spec, "output")
 
 
-def play(kind: str) -> None:
+def play(kind: str, on_audible: Callable[[], None] | None = None) -> None:
+    """Fire and forget. `on_audible` (the latency log's stopwatch) is called
+    once the chime is actually coming out of the speaker."""
+    before = getattr(sd, "_last_callback", None)
     for device in dict.fromkeys((_OUTPUT, None)):  # the chosen speaker, then the default
         with contextlib.suppress(Exception):
             sd.play(_SOUNDS[kind], _RATE, blocking=False, device=device)
+            if on_audible is not None:
+                _watch_audible(before, on_audible)
             return
+
+
+def _watch_audible(before: Any, stamp: Callable[[], None]) -> None:
+    """When could it be heard, rather than when did we queue it.
+
+    sounddevice's play() hands the array to a PortAudio callback that counts
+    the frames it has consumed — `_CallbackContext.frame`, checked against the
+    installed sounddevice 0.5.6 source. Watching that counter leave zero is the
+    only place the moment exists. A short daemon thread watches it, not the
+    event loop, which is busy opening the session microphone right then.
+    """
+    context = getattr(sd, "_last_callback", None)
+    if context is None or context is before or not hasattr(context, "frame"):
+        return  # nothing started, or a sounddevice that keeps its books elsewhere
+
+    def watch() -> None:
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if getattr(context, "frame", 0) > 0:
+                with contextlib.suppress(Exception):
+                    stamp()
+                return
+            time.sleep(0.002)
+
+    threading.Thread(target=watch, name="chime-audible", daemon=True).start()
