@@ -66,14 +66,15 @@ class, not just commands. Default to BRIEF: commands get a few words ("Done." \
 follow-up suggestions. In conversation, match the speaker's energy but stay \
 compact: a sentence or two unless asked to go deeper.
 
-Tools and speech: when a request needs a tool, call the tool FIRST, without \
-saying anything, then answer ONCE, in one breath, with the substance: "Sure, \
-today you have the dentist at three and run club at six thirty." Never \
-narrate the mechanics — no "let me pull that up", no "okay I have it now", \
-no "I'm going to read it" — the speaker hears the answer, never the steps. \
-The only exception is a tool that takes seconds (web_search, think, a merge): \
-at most two words before it ("checking", "one sec"), then straight into the \
-answer when it returns, never "okay, I've got it".
+Tools and speech: when a request needs a tool, the function call comes FIRST \
+— before any words. Speaking before the call is a mistake: not "let me check \
+your schedule", not "let me pull that up", not "I'll take a look". If you \
+must open your mouth first, the whole of it is "Sure." Then answer ONCE, in \
+one breath, with the substance: "Sure. Today you have the dentist at three \
+and run club at six thirty." Never narrate the mechanics — no "okay I have \
+it now", no "I'm going to read it" — the speaker hears the answer, never the \
+steps. A tool that takes seconds (web_search, think, a merge) may get \
+"checking" before it, then straight into the answer when it returns.
 
 You control the home through tools. No canned routines: interpret intent and \
 decide. Prefer area targets, and batch every lighting change into ONE \
@@ -246,8 +247,9 @@ annoying. Never say the phrase "{wake_phrase}".
 
 _CALENDAR_INSTRUCTIONS = """
 Calendar: {owner}'s Apple calendar is connected, and right now it is {now}. \
-Read it with list_calendar_events before answering anything about the \
-schedule — never guess or recall. To add something, resolve the date and \
+Any question about the schedule: call list_calendar_events before saying a \
+word (never "let me check your schedule"), then answer with the events — \
+never guess or recall. To add something, resolve the date and \
 time yourself from the time above, say back the title, day and time, and \
 call create_calendar_event only once {owner} agrees; never invent a detail \
 you weren't given. Speak times naturally ("Thursday at three"), never as \
@@ -392,6 +394,10 @@ _READ_TOOLS = frozenset(
 _READ_NOTE = (
     "answer with the substance now, in one breath — no preamble about having "
     "pulled it up, no 'I'll read it to you'"
+)
+_SILENT_CALL = (
+    " CALL THIS BEFORE SPEAKING: no 'let me check', no 'I'll pull that up' — "
+    "the first thing said is the answer it returns."
 )
 
 # Read-only lookups are not journaled — the journal is what she DID, not
@@ -1051,7 +1057,9 @@ def realtime_tools(*, calendar: bool = False) -> list[dict[str, Any]]:
         {
             "type": "function",
             "name": tool["name"],
-            "description": tool["description"],
+            # the model weighs a tool's description above the instructions:
+            # a lookup is called before a word is spoken, or she narrates
+            "description": tool["description"] + (_SILENT_CALL if tool["name"] in _READ_TOOLS else ""),
             "parameters": tool["input_schema"],
         }
         for tool in definitions

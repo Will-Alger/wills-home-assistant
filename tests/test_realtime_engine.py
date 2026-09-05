@@ -119,7 +119,12 @@ async def test_read_tools_are_answered_in_one_breath(tmp_path) -> None:
     output = json.loads(next(e for e in connection.sent if e["type"] == "conversation.item.create")["item"]["output"])
     assert "end_conversation" in output["note"]
     text = (await engine._session_config(None))["instructions"]
-    assert "call the tool FIRST" in text and "let me pull that up" in text
+    assert "the function call comes FIRST" in text and "let me check your schedule" in text
+    # the lookups themselves say so — the model weighs a tool's description above the prose
+    by_name = {tool["name"]: tool["description"] for tool in realtime_tools(calendar=True)}
+    assert by_name["list_calendar_events"].endswith("the first thing said is the answer it returns.")
+    assert "CALL THIS BEFORE SPEAKING" in by_name["get_lights"] and "BEFORE SPEAKING" in by_name["web_search"]
+    assert "BEFORE SPEAKING" not in by_name["set_lights"]  # commands are confirmed after, not narrated before
 
 
 def test_command_tools_cover_home_actions_only() -> None:
