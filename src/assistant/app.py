@@ -12,8 +12,29 @@ the journal, and reflection.
 from __future__ import annotations
 
 import contextlib
+import time
 from collections.abc import Callable
 from typing import Any
+
+
+class RescanClock:
+    """While she is on a fallback microphone (the saved one unplugged, or the
+    default a virtual input), the idle loop re-scans the devices every
+    `every_s` so the real microphone is picked up the moment it is back —
+    no restart, no voice command she could not hear anyway. `due()` is polled
+    from the idle loop and fires once per period; inactive clocks never fire."""
+
+    def __init__(self, active: bool, every_s: float = 30.0, now: Callable[[], float] = time.monotonic) -> None:
+        self._active = active
+        self._every = every_s
+        self._now = now
+        self._next = now() + every_s
+
+    def due(self) -> bool:
+        if not self._active or self._now() < self._next:
+            return False
+        self._next = self._now() + self._every
+        return True
 
 
 async def wait_for_trigger(

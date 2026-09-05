@@ -29,23 +29,35 @@ def describe_device(spec: str) -> str:
 _NOT_A_MIC = ("headset", "hands-free", "steam", "stereo mix", "line in", "loopback")
 
 
+def not_a_mic(name: str) -> bool:
+    """A virtual or hands-free input: it opens fine and hears nothing."""
+    return any(word in name.lower() for word in _NOT_A_MIC)
+
+
+def default_input_name() -> str:
+    """What Windows calls the default input right now ("" when there is none)."""
+    with contextlib.suppress(Exception):
+        return " ".join(str(sd.query_devices(kind="input")["name"]).split())
+    return ""
+
+
 def input_candidates() -> list[int]:
     """Input devices worth trying when the configured one will not open:
     real microphones first (WASAPI before the others), then anything else
     with an input channel that isn't a known non-microphone."""
     try:
-        devices = sd.query_devices()
+        found = sd.query_devices()
         apis = [str(api.get("name", "")).lower() for api in sd.query_hostapis()]
     except Exception:  # noqa: BLE001 — no PortAudio, no candidates
         return []
     wasapi = next((i for i, name in enumerate(apis) if "wasapi" in name), -1)
     mics: list[tuple[int, int]] = []
     rest: list[tuple[int, int]] = []
-    for index, dev in enumerate(devices):
+    for index, dev in enumerate(found):
         if int(dev.get("max_input_channels", 0) or 0) <= 0:
             continue
-        name = str(dev.get("name", "")).lower()
-        if any(word in name for word in _NOT_A_MIC):
+        name = " ".join(str(dev.get("name", "")).split()).lower()
+        if not_a_mic(name) or name in devices._ALIASES:  # Sound Mapper is the default again
             continue
         rank = 0 if dev.get("hostapi") == wasapi else 1
         (mics if "mic" in name else rest).append((rank, index))
@@ -76,6 +88,7 @@ class Microphone:
         self._loop: asyncio.AbstractEventLoop | None = None
         self.device_note: str | None = None  # set when a fallback device was used
         self.device_in_use = ""  # the mic actually opened (the panel shows it)
+        self.fallback = False  # not the device asked for: the runner keeps re-scanning
 
     def _open(self, device: int | str | None) -> sd.RawInputStream:
         def callback(indata, _frames, _time, _status) -> None:  # PortAudio thread
@@ -96,9 +109,34 @@ class Microphone:
 
     async def __aenter__(self) -> Self:
         self._loop = asyncio.get_running_loop()
-        if self._device is None and not devices.is_default(self._spec):
+        missing = self._device is None and not devices.is_default(self._spec)
+        if missing:
             # the saved microphone isn't plugged in right now: the default, and say so
             self.device_note = f"microphone '{self._spec.strip()}' isn't plugged in — using the default"
+            self.fallback = True
+        default = default_input_name() if self._device is None else ""
+        if default and not_a_mic(default):
+            # Windows' default input is Steam's streaming mic or a headset's
+            # hands-free endpoint: it opens without a murmur and she is deaf.
+            # A real microphone first; the default only as the last resort.
+            lead = f"microphone '{self._spec.strip()}' isn't plugged in and " if missing else ""
+            self.fallback = True
+            for index in input_candidates():
+                try:
+                    self._stream = self._open(index)
+                except sd.PortAudioError:
+                    continue
+                self.device_in_use = describe_device(str(index))
+                self.device_note = (
+                    f"{lead}the default input '{devices.pretty(default)}' isn't a microphone "
+                    f"— using '{self.device_in_use}'"
+                )
+                return self
+            self.device_note = (
+                f"{lead}the default input '{devices.pretty(default)}' isn't a microphone and no "
+                "other microphone would open — she can't hear the room until one is plugged in "
+                "or picked in settings"
+            )
         try:
             self._stream = self._open(self._device)
             self.device_in_use = describe_device("" if self._device is None else str(self._device))
@@ -117,6 +155,7 @@ class Microphone:
                 name = describe_device(str(index))
                 self.device_in_use = name
                 self.device_note = f"mic fallback: using '{name}' — the default input would not open ({err})"
+                self.fallback = True
                 return self
             raise
 

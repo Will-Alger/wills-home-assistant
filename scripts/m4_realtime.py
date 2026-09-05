@@ -24,7 +24,7 @@ from rich.console import Console
 from rich.markup import render
 
 from assistant.announce import Announcer
-from assistant.app import record_session, wait_for_trigger
+from assistant.app import RescanClock, record_session, wait_for_trigger
 from assistant.audio import devices, tones
 from assistant.audio.cues import VoiceCues
 from assistant.audio.mic import Microphone, describe_device
@@ -59,6 +59,7 @@ from assistant.wake.detector import WakeDetector
 from assistant.web import WebSearch
 
 console = Console()
+RESCAN_S = 30.0  # on a fallback microphone: how often the idle loop looks for the real one again
 
 
 def say(status, text: str, style: str = "") -> None:
@@ -525,18 +526,22 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
     status = getattr(engine, "status", None)
     cues = getattr(engine, "cues", None)
     announcer = getattr(engine, "announcer", None)
+    quiet = False  # a periodic re-scan while on a fallback mic: repeat nothing unless it changed
     if getattr(engine, "audio_reconfigure", False):
         # the mic or speaker choice changed (or he paired something): nothing
         # is open right now, so PortAudio can re-scan and the new choice applies
         engine.audio_reconfigure = False
+        quiet = getattr(engine, "_rescan", False)
+        engine._rescan = False
         devices.refresh()
         tones.set_output(settings.audio_output_device)
-        say(
-            status,
+        line = (
             f"audio: mic {describe_device(settings.audio_input_device)} · "
-            f"speaker {devices.describe(settings.audio_output_device, 'output')}",
-            "dim",
+            f"speaker {devices.describe(settings.audio_output_device, 'output')}"
         )
+        if not quiet or line != getattr(engine, "_audio_line", ""):
+            say(status, line, "dim")
+        engine._audio_line = line
     # Something to say already? Skip the mic and speak. Otherwise IDLE:
     # wake-gate on a 16 kHz mic (local, free, private) while watching the
     # announcement queue, the restart flag and the audio-change flag.
@@ -546,14 +551,30 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
             if mic16.device_note and mic16.device_note != getattr(engine, "_mic_note", None):
                 engine._mic_note = mic16.device_note  # say it once per fallback, not per cycle
                 say(status, mic16.device_note, "yellow")
+            elif not mic16.device_note and getattr(engine, "_mic_note", None):
+                engine._mic_note = None  # the real microphone is back
+                say(status, f"microphone back: {mic16.device_in_use}", "green")
             if status is not None:
                 status.configure(mic=mic16.device_in_use)  # the mic she is really on
                 status.set_state("idle")
-            console.print("[dim]○ idle — say the wake phrase[/dim]")
+            if not quiet or mic16.device_in_use != getattr(engine, "_mic_in_use", ""):
+                console.print("[dim]○ idle — say the wake phrase[/dim]")
+            engine._mic_in_use = mic16.device_in_use
+            rescan = RescanClock(mic16.fallback, every_s=RESCAN_S)
+
+            def rescan_due() -> bool:
+                if getattr(engine, "audio_reconfigure", False):
+                    return True
+                if rescan.due():  # on a fallback mic: look again for the real one
+                    engine.audio_reconfigure = True
+                    engine._rescan = True
+                    return True
+                return False
+
             trigger = await wait_for_trigger(
                 mic16, wake, announcer,
                 restart=lambda: engine.restart_requested,
-                reconfigure=lambda: getattr(engine, "audio_reconfigure", False),
+                reconfigure=rescan_due,
             )
     if trigger in ("restart", "reconfigure"):
         return total_cost

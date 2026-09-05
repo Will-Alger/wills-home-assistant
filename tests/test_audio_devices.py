@@ -32,6 +32,9 @@ FAKE_DEVICES = [
     {"name": "Primary Sound Driver", "max_input_channels": 0, "max_output_channels": 2, "hostapi": 1},
     {"name": "Microsoft Sound Mapper - Input", "max_input_channels": 2, "max_output_channels": 0, "hostapi": 0},
     {"name": "Headphones ()", "max_input_channels": 0, "max_output_channels": 2, "hostapi": 3},
+    # a truncated MME name that ends in a space (cleanup shortens it to 30 characters)
+    {"name": "Headset (Will's AirPods Pro #2 ", "max_input_channels": 1, "max_output_channels": 0, "hostapi": 0},
+    {"name": "Headset (Will's AirPods Pro #2 - Find My)", "max_input_channels": 1, "max_output_channels": 0, "hostapi": 2},
 ]
 FAKE_APIS = [{"name": "MME"}, {"name": "Windows DirectSound"}, {"name": "Windows WASAPI"}, {"name": "Windows WDM-KS"}]
 
@@ -58,13 +61,13 @@ def test_names_collapse_host_apis_and_prefer_wasapi(monkeypatch) -> None:
         "Speakers (Realtek)", "Headphones (unnamed)",
     ]  # one row per device: the truncated MME twin and the default aliases are gone
     assert devices.names("input") == [
-        "System default", "Microphone (Blue Snowball)", "Will's AirPods Pro (hands-free)",
-        "Stereo Mix (Realtek)",
-    ]
+        "System default", "Headset (Will's AirPods Pro #2 - Find My)", "Microphone (Blue Snowball)",
+        "Will's AirPods Pro (hands-free)", "Stereo Mix (Realtek)",
+    ]  # one AirPods #2 row: the space-ending MME cut is merged into the full name
     assert devices.pretty(HANDS_FREE) == "Will's AirPods Pro (hands-free)"
     assert devices.find("airpods", "output") == 4  # the WASAPI entry, not MME's index 2
-    assert devices.find("airpods", "input") == 5  # the readable name matches too
-    assert devices.find("Will's AirPods Pro (hands-free)", "input") == 5
+    assert devices.find("airpods", "input") == 13  # the first AirPods row, by fragment
+    assert devices.find("Will's AirPods Pro (hands-free)", "input") == 5  # the readable name, exactly
     assert devices.find("snowball", "input") == 3 and devices.find("3", "input") == 3
     assert devices.find("", "output") is None and devices.find("System default", "input") is None
     assert devices.find("bose", "output") is None
@@ -109,7 +112,7 @@ def test_panel_switches_devices_live_and_saves_them(tmp_path: Path, monkeypatch)
         on_refresh_devices=lambda: rescans.append(True),
         devices=devices,
     )
-    assert panel.microphone_choices()[2] == "Will's AirPods Pro (hands-free)"
+    assert panel.microphone_choices()[3] == "Will's AirPods Pro (hands-free)"
     assert panel.speaker_choices() == devices.names("output")
 
     text = panel.save(speaker="airpods")

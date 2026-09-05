@@ -69,19 +69,23 @@ def entries(kind: str) -> list[dict[str, Any]]:
     devices, apis = _query()
     key = "max_input_channels" if kind == "input" else "max_output_channels"
     best: dict[str, tuple[int, int]] = {}  # raw name -> (rank, index)
+    truncated: set[str] = set()  # names MME cut at 31 characters (before whitespace cleanup)
     for index, dev in enumerate(devices):
         if int(dev.get(key, 0) or 0) <= 0:
             continue
-        raw = " ".join(str(dev.get("name", "")).split())
+        original = str(dev.get("name", ""))
+        raw = " ".join(original.split())
         if not raw or raw.lower() in _ALIASES:
             continue
+        if len(original) == _MME_NAME_LIMIT:
+            truncated.add(raw)
         rank = _rank(dev, apis)
         if raw not in best or rank < best[raw][0]:
             best[raw] = (rank, index)
     # an MME-truncated name is the same device as the longer name it prefixes
     names = list(best)
     for raw in names:
-        if len(raw) == _MME_NAME_LIMIT and any(other != raw and other.startswith(raw) for other in names):
+        if raw in truncated and any(other != raw and other.startswith(raw) for other in names):
             del best[raw]
     rows = sorted(best.items(), key=lambda kv: (kv[1][0], pretty(kv[0]).lower()))
     return [{"name": pretty(raw), "raw": raw, "index": index} for raw, (_rank_, index) in rows]
