@@ -178,6 +178,9 @@ class Settings(BaseSettings):
     # 1.5 s, nothing does and she resumes where she paused. The wake phrase
     # still interrupts instantly. Turn off if the room makes her stall.
     realtime_tentative_interrupt: bool = True
+    # Server-side noise reduction before VAD and the model: far_field for a
+    # desk microphone at speaking distance, near_field for a headset, "" off.
+    realtime_noise_reduction: str = "far_field"
 
     # Milestone 6: Apple Calendar over iCloud CalDAV. The password MUST be an
     # app-specific one (appleid.apple.com); the Apple ID password is rejected.

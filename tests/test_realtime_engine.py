@@ -127,6 +127,20 @@ async def test_read_tools_are_answered_in_one_breath(tmp_path) -> None:
     assert "BEFORE SPEAKING" not in by_name["set_lights"]  # commands are confirmed after, not narrated before
 
 
+async def test_noise_reduction_is_sent_only_when_configured() -> None:
+    import json
+
+    from assistant.engines.realtime_engine import RealtimeEngine
+    from assistant.home.fake import FakeHome
+
+    plain = RealtimeEngine(api_key="k", model="m", voice="v", home=FakeHome(), owner="Will")
+    assert "noise_reduction" not in json.dumps(await plain._session_config(None))
+    desk = RealtimeEngine(api_key="k", model="m", voice="v", home=FakeHome(), owner="Will", noise_reduction="far_field")
+    assert '"noise_reduction": {"type": "far_field"}' in json.dumps(await desk._session_config(None))
+    odd = RealtimeEngine(api_key="k", model="m", voice="v", home=FakeHome(), owner="Will", noise_reduction="loud")
+    assert "noise_reduction" not in json.dumps(await odd._session_config(None))  # never an invalid value
+
+
 def test_wrapup_phrases_are_recognised_whole_not_by_fragment() -> None:
     from assistant.engines.realtime_engine import is_wrapup
 

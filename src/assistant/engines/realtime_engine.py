@@ -1231,6 +1231,7 @@ class RealtimeEngine:
         info_close_s: float = 15.0,
         talk_over: bool = False,
         tentative_interrupt: bool = False,
+        noise_reduction: str = "",
         eagerness: str = "high",
         extra_instructions: str = "",
         memory: MemoryStore | None = None,
@@ -1283,6 +1284,10 @@ class RealtimeEngine:
         # Loudspeakers: while she talks, a sustained rise of the mic above her
         # own echo pauses playback and probes the server for real speech.
         self._tentative = tentative_interrupt
+        # Server-side noise reduction, applied before VAD and the model:
+        # "far_field" for a desk mic at speaking distance, "near_field" for
+        # a headset, "" for none. (SDK-verified: NoiseReductionType.)
+        self._noise_reduction = noise_reduction.strip().lower()
         self._eagerness = eagerness  # semantic VAD: how fast it decides you're done
         self._extra_instructions = extra_instructions
         self._memory = memory
@@ -1352,6 +1357,8 @@ class RealtimeEngine:
         }
         if transcription_model:
             audio_in["transcription"] = {"model": transcription_model}
+        if self._noise_reduction in ("near_field", "far_field"):
+            audio_in["noise_reduction"] = {"type": self._noise_reduction}
         tools = realtime_tools(calendar=self._calendar is not None) + (
             MEMORY_TOOLS if self._memory else []
         )
