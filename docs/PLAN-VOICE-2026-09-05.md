@@ -1,5 +1,20 @@
 # Plan: dependable activation, interruption, ending and reactivation
 
+## Progress (updated 2026-09-05, 20:15)
+
+| Phase | State | Where |
+|---|---|---|
+| 0 ship the fixes | done | `3b363ec` `211bdd5` `238ba13` |
+| 1 measure | task 12 merged (`e8e9197`); task 19 replay tests building | `logs/turns.jsonl`, "how fast were you today?" |
+| 2 output ownership | done | `210d83b` — `audio/io.py`, one mic and one speaker across idle and talk |
+| 3 receiver, playback, closing | done | `ad460cf` — supervised tasks, "since" note, delivered = played, farewell first |
+| 4 tentative interruption | done, tuning by ear | `762927d` — `REALTIME_TENTATIVE_INTERRUPT`, levels in the log |
+| 5 detection tuning | far_field committed (`e50fa81`); task 10 awaits Will; task 14 next filler | |
+| 6 continuity | tasks 21, 22 drafted | |
+| 7 conversation quality | not started | |
+
+Also drafted: task 20 (follow-ups and notifications count only when spoken, phase 3's board item).
+
 2026-09-05, 12:46. Inputs reconciled: `wills-home-assistant-audit.md` (ChatGPT Astra, 11
 findings + a 7-step delivery order + an 18-item voice acceptance script),
 `docs/VOICE-UX-RESEARCH-2026-09-05.md` (my research, 9 ranked changes), her task board
