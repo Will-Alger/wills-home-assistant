@@ -34,6 +34,8 @@ from openai import AsyncOpenAI
 from scipy.signal import resample_poly
 
 from assistant.audio.fallbacks import SpokenFallbacks
+from assistant.audio.level import LevelMeter
+from assistant.audio.level import rms as _rms
 from assistant.brain.outcome import ToolOutcome, adapt
 from assistant.brain.tools import CALENDAR_TOOLS, TOOL_DEFINITIONS, ToolExecutor
 from assistant.calendar.base import CalendarApi, spoken_now
@@ -610,11 +612,6 @@ _ECHO_FACTOR = 2.5  # the mic must rise this far above her own echo
 _QUIET_FACTOR = 4.0  # ...and above the room while nobody spoke
 _ABS_FLOOR = 400.0  # int16 RMS: below this nothing is speech at a desk mic
 _FALSE_ALARM_S = 1.5  # held this long with no server speech detection: resume
-
-
-def _rms(frame: bytes) -> float:
-    samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
-    return float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
 
 
 class _Levels:
@@ -2691,6 +2688,7 @@ class RealtimeEngine:
             thinking_until = 0.0  # "let me think": patient until this moment
             possible_since: float | None = None  # playback held for a possible talk-over since
             levels = _Levels()  # the room's level, and her echo during each reply
+            meter = LevelMeter()  # the same frames, smoothed, for the panel's bar
             onset: list[bytes] = []  # frames above the threshold, waiting to become an onset
             user_turns = 0  # finished user transcripts so far (a tool learns what he said meanwhile)
             audio_in_response = False  # the current response produced speech
@@ -2823,7 +2821,7 @@ class RealtimeEngine:
                     quick_close_window = self._info_close_s
                     quick_close_reason = "interrupted announcement"
 
-            async def consider(frame: bytes, heard_at: float) -> None:
+            async def consider(frame: bytes, heard_at: float, level: float) -> None:
                 """Tentative talk-over on loudspeakers. Her first moments of a
                 reply teach us her echo; a sustained rise above it HOLDS
                 playback (nothing is thrown away) and streams the mic to the
@@ -2831,7 +2829,6 @@ class RealtimeEngine:
                 or, within a bounded window, nothing does and she resumes
                 exactly where she paused, the probe audio cleared."""
                 nonlocal possible_since
-                level = _rms(frame)
                 note_fn = getattr(ui, "note", None)
                 if possible_since is None:
                     if levels.calibrating(heard_at):
@@ -2875,16 +2872,25 @@ class RealtimeEngine:
                 while True:
                     frame = await mic.get_frame()
                     heard_at = time.monotonic()
-                    if speaking and not self._talk_over:
+                    level = _rms(frame)
+                    muted = speaking and not self._talk_over
+                    if self._cues is not None:
+                        # The panel's bar, straight off the frames: it rises
+                        # with his voice and falls flat about a second after
+                        # he stops, whatever the server has decided by then.
+                        # Muted, the meter only falls — her own voice is not
+                        # him, and must never move his bar.
+                        self._cues.level(meter.idle() if muted else meter.push(level))
+                    if muted:
                         # Half-duplex: don't feed our own voice back. But keep
                         # watching for the wake phrase = instant barge-in, and
                         # (on loudspeakers) for him simply talking over her.
                         if wake is not None and wake.detect(downsample_24k_to_16k(frame)):
                             await barge_in(heard_at, "wake phrase")
                         elif self._tentative:
-                            await consider(frame, heard_at)
+                            await consider(frame, heard_at, level)
                         continue
-                    levels.quiet(_rms(frame))  # the room, while he can talk freely
+                    levels.quiet(level)  # the room, while he can talk freely
                     await send_audio(frame)
 
             async def finish_playback(

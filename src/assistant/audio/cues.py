@@ -7,7 +7,8 @@ While she is off running a tool and the room would hear nothing at all, a
 soft low tick repeats (the engine decides when: realtime_engine.working_cue).
 A failure never plays the listening ding and clears the listening flag, so
 neither the tone nor the Settings panel can tell you she's listening when
-she isn't.
+she isn't. The live microphone level rides the same path (`level`), so the
+panel's bar can only move inside a window the flag says is open.
 
 Two rules learned the hard way on Windows: a tone goes through the session
 speaker whenever one is open (a fresh sd.play stream loses the race against a
@@ -80,6 +81,15 @@ class VoiceCues:
         self._sound("listen_end", speaker)
         self._state("working")
         return True
+
+    def level(self, value: float) -> None:
+        """How loud the room is right now (0..1), for the panel's bar. Sound-
+        less and cheap — the engine calls it once per 80 ms frame. The status
+        drops it flat with the listening flag, so the bar cannot outlive the
+        window it belongs to."""
+        if self._status is not None:
+            with contextlib.suppress(Exception):
+                self._status.set_level(value)
 
     def working(self, speaker: Any | None = None) -> None:
         """She is away doing something and the room would otherwise be silent:
