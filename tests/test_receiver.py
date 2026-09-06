@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from assistant.announce import Announcer
+from assistant.brain.outcome import ToolOutcome, ok
 from assistant.engines.realtime_engine import RealtimeEngine
 from assistant.home.fake import FakeHome
 from tests.fake_realtime import FakeClient, InstantSpeaker, NeverMic, QuietUi
@@ -38,11 +39,11 @@ class StampingUi(QuietUi):
 async def test_a_correction_is_heard_while_a_slow_tool_runs() -> None:
     engine, client = make_engine(idle_timeout_s=0.8)
 
-    async def slow(name: str, args: dict) -> tuple[str, bool]:
+    async def slow(name: str, args: dict) -> ToolOutcome:
         await asyncio.sleep(0.5)
-        return "lights: hallway on, bedroom off", False
+        return ok("lights: hallway on, bedroom off")
 
-    engine._executor.execute = slow  # type: ignore[method-assign]
+    engine._executor.run = slow  # type: ignore[method-assign]
     conn = client.connection
     stamps: list[tuple[str, float]] = []
     original_send = conn.send
@@ -69,7 +70,7 @@ async def test_a_correction_is_heard_while_a_slow_tool_runs() -> None:
     output = next(e for e in conn.sent if e["type"] == "conversation.item.create")["item"]
     assert output["type"] == "function_call_output"
     payload = json.loads(output["output"])
-    assert "never mind" in payload["since"] and payload["result"].startswith("lights:")
+    assert "never mind" in payload["since"] and payload["summary"].startswith("lights:")
     assert stats.ended_by == "idle timeout"
 
 

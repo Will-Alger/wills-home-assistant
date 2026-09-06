@@ -13,6 +13,7 @@ import json
 from datetime import datetime, timedelta
 from typing import Any
 
+from assistant.brain.outcome import NeedsClarification, ToolOutcome, ok, unavailable
 from assistant.calendar.base import (
     CalendarApi,
     CalendarEvent,
@@ -411,8 +412,9 @@ class ToolExecutor:
         self._home = home
         self._calendar = calendar
 
-    async def execute(self, name: str, tool_input: dict[str, Any]) -> tuple[str, bool]:
-        """Returns (result_text, is_error)."""
+    async def run(self, name: str, tool_input: dict[str, Any]) -> ToolOutcome:
+        """Every tool answers in one shape — status, summary, details,
+        reversible, follow_up (brain/outcome.py)."""
         self.last_routines = []
         self.last_entities = []
         if self._routines is not None and isinstance(tool_input, dict):
@@ -421,9 +423,9 @@ class ToolExecutor:
                 self.last_routines = [r.description for r in applied]
             except Exception:  # noqa: BLE001 — a routine must never break a command
                 self.last_routines = []
-        result, is_error = await self._dispatch(name, tool_input)
+        outcome = await self._dispatch(name, tool_input)
         acted = bool(self.last_entities) or name not in _NEEDS_A_TARGET
-        if not is_error and acted and name in _ONE_WAY_TOOLS:
+        if not outcome.is_error and acted and name in _ONE_WAY_TOOLS:
             # It worked and it has no inverse: the ledger records that too, so
             # "undo that" can name what she just did instead of guessing.
             self._receipts.record(
@@ -433,16 +435,20 @@ class ToolExecutor:
                     outcomes=[EntityOutcome(eid, label) for eid, label in self.last_entities],
                 )
             )
-        return result, is_error
+        return outcome
 
-    async def _dispatch(self, name: str, tool_input: dict[str, Any]) -> tuple[str, bool]:
+    async def execute(self, name: str, tool_input: dict[str, Any]) -> tuple[str, bool]:
+        """The old (result_text, is_error) pair, for the callers still on it."""
+        return (await self.run(name, tool_input)).as_pair()
+
+    async def _dispatch(self, name: str, tool_input: dict[str, Any]) -> ToolOutcome:
         try:
             if name == "get_lights":
-                return json.dumps([_light_state_view(x) for x in await self._home.get_lights()]), False
+                return ok(json.dumps([_light_state_view(x) for x in await self._home.get_lights()]))
             if name == "set_lights":
-                return await self._set_lights(tool_input), False
+                return await self._set_lights(tool_input)
             if name == "undo_last":
-                return await self._undo_last(), False
+                return await self._undo_last()
             if name == "play_music":
                 player = await self._resolve_player(tool_input.get("player"), kind="music")
                 woke = await self._wake_tv_if_off()
@@ -462,43 +468,55 @@ class ToolExecutor:
                     # A failed play is usually a name the library can't resolve.
                     # Hand back what actually exists so the retry can succeed.
                     detail = str(err) or type(err).__name__
-                    return f"play failed: {detail}.{await self._media_hint(media_id, media_type)}", True
+                    return unavailable(
+                        f"play failed: {detail}.{await self._media_hint(media_id, media_type)}"
+                    )
                 self.last_entities = [(player.entity_id, player.name)]
                 note = "Woke the TV first. " if woke else ""
-                return (
+                return ok(
                     f"{note}Started on {player.name} (audio may take a few seconds to begin).",
-                    False,
+                    details={"player": player.name, "media_id": media_id},
                 )
             if name == "browse_music":
                 media_type = str(tool_input.get("media_type", "playlist"))
                 search = tool_input.get("search")
                 if tool_input.get("scope") == "catalog":
                     if not search:
-                        return "catalog scope needs a search term", True
+                        return unavailable("catalog scope needs a search term")
                     items = await self._home.music_search(
                         str(search), media_type=media_type,
                         limit=int(tool_input.get("limit", 8)),
                     )
                     if not items:
-                        return "the catalog found nothing for that — try different words", False
-                    return json.dumps(items)[:2500], False
+                        # A search that found nothing ran fine; the empty
+                        # answer is the answer, not a failure to retry.
+                        return unavailable(
+                            "the catalog found nothing for that — try different words",
+                            is_error=False,
+                        )
+                    return ok(json.dumps(items)[:2500])
                 items = await self._home.music_library(
                     media_type=media_type,
                     search=search,
                     limit=int(tool_input.get("limit", 50)),
                 )
                 if not items:
-                    return (
+                    return unavailable(
                         "the owner's library has nothing matching that — "
                         "browse_music with scope='catalog' searches all of "
-                        "Apple Music instead"
-                    ), False
-                return json.dumps(items)[:2500], False
+                        "Apple Music instead",
+                        is_error=False,
+                    )
+                return ok(json.dumps(items)[:2500])
             if name == "media_control":
                 action = str(tool_input["action"])
                 player = await self._media_target(tool_input.get("player"), action)
                 if player is None:
-                    return "nothing is playing right now — say what to play instead", False
+                    # A refusal she simply says — never a tool failure.
+                    return unavailable(
+                        "nothing is playing right now — say what to play instead",
+                        is_error=False,
+                    )
                 await self._home.media_command(
                     player.entity_id,
                     action,
@@ -517,29 +535,34 @@ class ToolExecutor:
                         if tvs:
                             await self._home.media_command(tvs[0].entity_id, "turn_on")
                             kept_awake = " Kept the TV awake."
-                return f"Done ({action} on {player.name} [{player.entity_id}]).{kept_awake}", False
+                return ok(
+                    f"Done ({action} on {player.name} [{player.entity_id}]).{kept_awake}",
+                    details={"player": player.name, "action": action},
+                )
             if name == "web_search":
                 if self._web is None:
-                    return "web search isn't configured (it needs OPENAI_API_KEY)", True
+                    return unavailable("web search isn't configured (it needs OPENAI_API_KEY)")
                 answer = await self._web.search(str(tool_input.get("query", "")))
-                return str(answer)[:2000], False
+                return ok(str(answer)[:2000])
             if name == "search_entities":
                 found = await self._home.search_entities(str(tool_input["query"]))
                 if not found:
                     # Literal search missed (words like "temperature" often do).
                     # Hand back the whole inventory — the model matches meaning.
                     inventory = await self._home.search_entities("")
-                    return json.dumps(
-                        {
-                            "note": "no literal matches — full home inventory follows; "
-                            "pick semantically",
-                            "entities": inventory,
-                        }
-                    ), False
-                return json.dumps(found), False
+                    return ok(
+                        json.dumps(
+                            {
+                                "note": "no literal matches — full home inventory follows; "
+                                "pick semantically",
+                                "entities": inventory,
+                            }
+                        )
+                    )
+                return ok(json.dumps(found))
             if name == "get_entity":
                 detail = await self._home.get_entity(str(tool_input["entity_id"]))
-                return json.dumps(detail)[:1500], False
+                return ok(json.dumps(detail)[:1500])
             if name == "ha_call_service":
                 domain = str(tool_input["domain"]).lower()
                 service = str(tool_input["service"]).lower()
@@ -548,38 +571,42 @@ class ToolExecutor:
                     or (domain, service) in _DENIED_SERVICES
                     or service.startswith("reload")
                 ):
-                    return f"service {domain}.{service} is not allowed from voice", True
+                    return unavailable(f"service {domain}.{service} is not allowed from voice")
                 data = dict(tool_input.get("data") or {})
                 await self._home.generic_call(domain, service, data)
                 target = data.get("entity_id")
                 ids = [target] if isinstance(target, str) else list(target or [])
                 self.last_entities = [(str(i), str(i)) for i in ids if i]
-                return f"called {domain}.{service}", False
+                return ok(f"called {domain}.{service}")
             if name in _CALENDAR_TOOL_NAMES:
-                return await self._calendar_tool(name, tool_input), False
+                return await self._calendar_tool(name, tool_input)
             if name == "show_me":
-                return self._show_me(tool_input), False
+                return ok(self._show_me(tool_input))
             if name == "project_status":
-                return await self._project_status(), False
+                return ok(await self._project_status())
             if name == "read_roadmap":
                 roadmap = (CODE_ROOT / "docs" / "FEATURES.md").read_text(encoding="utf-8")
-                return roadmap[:10_000], False
+                return ok(roadmap[:10_000])
             if name == "read_history":
                 history = (CODE_ROOT / "docs" / "HISTORY.md").read_text(encoding="utf-8")
-                return history[:10_000], False
+                return ok(history[:10_000])
             if name == "launch_app":
                 player = await self._resolve_player(tool_input.get("player"), kind="tv")
                 await self._wake_tv_if_off()
                 await self._home.launch_app(player.entity_id, str(tool_input["app"]))
                 self.last_entities = [(player.entity_id, player.name)]
-                return f"Opened {tool_input['app']} on {player.name}.", False
-            return f"Unknown tool: {name}", True
+                return ok(f"Opened {tool_input['app']} on {player.name}.")
+            return unavailable(f"Unknown tool: {name}")
+        except NeedsClarification as ask:
+            # It cannot act until the owner answers: the message IS the
+            # question, so it goes back word for word, unwrapped.
+            return ToolOutcome("needs_clarification", str(ask), is_error=True)
         except Exception as err:  # noqa: BLE001 — any tool failure must become an
-            # is_error tool_result the model can react to, never a crashed loop
+            # outcome the model can react to, never a crashed loop
             # (str(err) can be empty — httpx timeouts — so include the type)
-            return f"Tool failed: {str(err) or type(err).__name__}", True
+            return unavailable(f"Tool failed: {str(err) or type(err).__name__}")
 
-    async def _set_lights(self, tool_input: dict[str, Any]) -> str:
+    async def _set_lights(self, tool_input: dict[str, Any]) -> ToolOutcome:
         lights = await self._home.get_lights()
         commands: list[LightCommand] = []
         for change in tool_input.get("changes", []):
@@ -631,14 +658,33 @@ class ToolExecutor:
         # "it" and "that" bind to what actually changed, not what was aimed at.
         self.last_entities = [(o.entity_id, o.name) for o in receipt.changed]
         summary = receipt.summary("light")
+        details = {
+            "changed": [o.name or o.entity_id for o in receipt.changed],
+            "unresponsive": [o.name or o.entity_id for o in receipt.failed],
+        }
         if receipt.failed and receipt.changed:
-            summary += " Say so plainly; undo_last would put the rest back."
-        elif receipt.failed:
+            # The status carries the half-worked news; the model must not
+            # round it up, and the summary already names who went silent.
+            return ToolOutcome(
+                "partial",
+                summary,
+                details,
+                reversible=True,
+                follow_up=(
+                    "name the light that did not respond and never say it is done; "
+                    "undo_last would put the rest back"
+                ),
+            )
+        if receipt.failed:
             # Nothing worked at all: the reason is usually the whole story
             # (a bad token, an unreachable hub), so hand it over rather than
             # leaving her to guess at five silent bulbs.
-            summary += f" ({receipt.failed[0].error[:200]})"
-        return summary
+            return unavailable(
+                f"{summary} ({receipt.failed[0].error[:200]})",
+                details=details,
+                is_error=False,  # she says it; there is nothing to retry blindly
+            )
+        return ok(summary, details=details, reversible=True)
 
     async def _snapshot(self, entity_ids: list[str]) -> dict[str, dict[str, Any]]:
         """What these lights look like right now — the before-state a receipt
@@ -664,10 +710,11 @@ class ToolExecutor:
             return str(err) or type(err).__name__
         return ""
 
-    async def _undo_last(self) -> str:
+    async def _undo_last(self) -> ToolOutcome:
         receipt, refusal = self._receipts.for_undo()
         if receipt is None:
-            return refusal
+            # "That can't be undone" is an answer she reads out, not a failure.
+            return unavailable(refusal, is_error=False)
         lights = {light.entity_id: light for light in await self._home.get_lights()}
         outcomes: list[EntityOutcome] = []
         for entry in receipt.restorable():
@@ -694,16 +741,30 @@ class ToolExecutor:
             ActionReceipt(tool="undo_last", note=_undo_note(outcomes), outcomes=outcomes)
         )
         self.last_entities = [(o.entity_id, o.name) for o in undo.changed]
+        details = {
+            "restored": [o.name or o.entity_id for o in undo.changed],
+            "unresponsive": [o.name or o.entity_id for o in undo.failed],
+        }
         if not undo.failed:
-            return f"Put {_names(undo.changed)} back the way {_they_were(undo.changed)}."
+            return ok(
+                f"Put {_names(undo.changed)} back the way {_they_were(undo.changed)}.",
+                details=details,
+            )
         if not undo.changed:
-            return f"Could not put it back — {_names(undo.failed)} did not respond."
-        return (
+            return unavailable(
+                f"Could not put it back — {_names(undo.failed)} did not respond.",
+                details=details,
+                is_error=False,
+            )
+        return ToolOutcome(
+            "partial",
             f"Put {len(undo.changed)} of {len(outcomes)} back; "
-            f"{_names(undo.failed)} did not respond."
+            f"{_names(undo.failed)} did not respond.",
+            details,
+            follow_up="name what did not go back; never say it is all back",
         )
 
-    async def _calendar_tool(self, name: str, tool_input: dict[str, Any]) -> str:
+    async def _calendar_tool(self, name: str, tool_input: dict[str, Any]) -> ToolOutcome:
         if self._calendar is None:
             raise ValueError(
                 "the calendar isn't connected — it needs an iCloud Apple ID and "
@@ -723,16 +784,18 @@ class ToolExecutor:
             if end <= start:
                 raise ValueError("that range ends before it starts")
             events = await self._calendar.list_events(start, end, calendar=target)
-            return json.dumps(
-                {
-                    "now": spoken_now(now),
-                    "events": [_event_view(event) for event in events[:_MAX_EVENTS_REPORTED]],
-                }
+            return ok(
+                json.dumps(
+                    {
+                        "now": spoken_now(now),
+                        "events": [_event_view(event) for event in events[:_MAX_EVENTS_REPORTED]],
+                    }
+                )
             )
 
         if name == "delete_calendar_event":
             if not tool_input.get("confirmed"):
-                raise ValueError(
+                raise NeedsClarification(
                     "not deleted: restate exactly which event (title and time) to "
                     "the owner and get an explicit yes, then retry with confirmed=true"
                 )
@@ -740,7 +803,7 @@ class ToolExecutor:
             if not uid:
                 raise ValueError("deleting needs the event's uid — list_calendar_events shows them")
             await self._calendar.delete_event(uid, calendar=target)
-            return "deleted — it's off the calendar"
+            return ok("deleted — it's off the calendar")
 
         summary = str(tool_input.get("summary") or "").strip()
         if not summary:
@@ -764,7 +827,10 @@ class ToolExecutor:
             location=str(tool_input.get("location") or "").strip() or None,
             description=str(tool_input.get("description") or "").strip() or None,
         )
-        return f'Added "{created.summary}" to {created.calendar}: {spoken_when(created)}.'
+        return ok(
+            f'Added "{created.summary}" to {created.calendar}: {spoken_when(created)}.',
+            details={"uid": created.uid, "calendar": created.calendar},
+        )
 
     def _show_me(self, tool_input: dict[str, Any]) -> str:
         import html
@@ -892,14 +958,14 @@ class ToolExecutor:
             matches = [p for p in players if needle in p.name.lower() or needle in p.entity_id]
             if len(matches) == 1:
                 return matches[0]
-            raise ValueError(
+            raise NeedsClarification(
                 f"player {spec!r} is ambiguous or unknown; players: "
                 f"{[(p.entity_id, p.name, p.kind) for p in players]}"
             )
         preferred = [p for p in players if kind is None or p.kind == kind]
         if len(preferred) == 1 or (preferred and kind is not None):
             return preferred[0]
-        raise ValueError(
+        raise NeedsClarification(
             "specify which player; players: "
             f"{[(p.entity_id, p.name, p.kind) for p in players]}"
         )

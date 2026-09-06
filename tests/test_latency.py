@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 from assistant.app import wait_for_trigger
+from assistant.brain.outcome import ToolOutcome, ok
 from assistant.engines.realtime_engine import RealtimeEngine
 from assistant.home.fake import FakeHome
 from assistant.latency import LatencyLog, TurnTrace, latency_report, since_label
@@ -38,11 +39,11 @@ async def test_a_scripted_turn_lands_in_the_log_with_its_delays(tmp_path: Path) 
     log = LatencyLog(tmp_path / "turns.jsonl")
     engine, client = make_engine(log, info_close_s=0.3)
 
-    async def slow_tool(name: str, args: dict) -> tuple[str, bool]:
+    async def slow_tool(name: str, args: dict) -> ToolOutcome:
         await asyncio.sleep(0.3)  # a light command takes about this long in the house
-        return "the hallway is on", False
+        return ok("the hallway is on")
 
-    engine._executor.execute = slow_tool
+    engine._executor.run = slow_tool
 
     trace = log.wake(0.71)
     trace.stamp("chime_enqueued")
