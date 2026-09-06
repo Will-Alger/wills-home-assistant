@@ -25,7 +25,8 @@ from assistant.calendar.base import (
 )
 from assistant.config import code_root, home_dir
 from assistant.dispatch import NO_WINDOW
-from assistant.home.base import HomeApi, Light, LightCommand
+from assistant.home.base import RGB_CAPABLE_MODES, HomeApi, Light, LightCommand
+from assistant.receipts import ActionReceipt, EntityOutcome, ReceiptBook
 
 # Her own codebase: the checkout this code runs from (main or a staged
 # worktree) for docs and git; the HOME dir for anything written to data/.
@@ -81,6 +82,18 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "Current live state of every light (on/off, brightness). Call this "
             "only when the answer depends on current state; the device list in "
             "your instructions already covers names, areas, and capabilities."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "undo_last",
+        "description": (
+            "Put the last thing you changed back the way it was — for \"undo "
+            "that\", \"no, put it back\", \"never mind\". Lights only for now; "
+            "it tells you plainly when the last action has no undo (a media "
+            "command, a calendar delete), and that sentence is your answer. "
+            "Not for corrections that keep part of the change ('keep the "
+            "brightness but make it blue') — those are one new set_lights."
         ),
         "input_schema": {"type": "object", "properties": {}},
     },
@@ -384,9 +397,13 @@ class ToolExecutor:
         calendar: CalendarApi | None = None,
         web: Any | None = None,
         routines: Any | None = None,
+        receipts: ReceiptBook | None = None,
     ) -> None:
         self._web = web  # WebSearch, or None when no key is configured
         self._routines = routines  # RoutineStore: deterministic defaults/overrides
+        # Every mutation leaves a receipt here; undo_last reads the last one.
+        # Without a path it is still a working ledger, just not a durable one.
+        self._receipts = receipts if receipts is not None else ReceiptBook()
         self.last_routines: list[str] = []  # descriptions applied on the last call
         # (entity_id, friendly name) the last call actually touched — the
         # working context binds "it" and "that" to these (context.py).
@@ -404,11 +421,28 @@ class ToolExecutor:
                 self.last_routines = [r.description for r in applied]
             except Exception:  # noqa: BLE001 — a routine must never break a command
                 self.last_routines = []
+        result, is_error = await self._dispatch(name, tool_input)
+        acted = bool(self.last_entities) or name not in _NEEDS_A_TARGET
+        if not is_error and acted and name in _ONE_WAY_TOOLS:
+            # It worked and it has no inverse: the ledger records that too, so
+            # "undo that" can name what she just did instead of guessing.
+            self._receipts.record(
+                ActionReceipt(
+                    tool=name,
+                    note=_one_way_note(name, tool_input, self.last_entities),
+                    outcomes=[EntityOutcome(eid, label) for eid, label in self.last_entities],
+                )
+            )
+        return result, is_error
+
+    async def _dispatch(self, name: str, tool_input: dict[str, Any]) -> tuple[str, bool]:
         try:
             if name == "get_lights":
                 return json.dumps([_light_state_view(x) for x in await self._home.get_lights()]), False
             if name == "set_lights":
                 return await self._set_lights(tool_input), False
+            if name == "undo_last":
+                return await self._undo_last(), False
             if name == "play_music":
                 player = await self._resolve_player(tool_input.get("player"), kind="music")
                 woke = await self._wake_tv_if_off()
@@ -568,11 +602,106 @@ class ToolExecutor:
                         transition=change.get("transition_seconds"),
                     )
                 )
-        await self._home.apply(commands)
-        by_id = {light.entity_id: light.name for light in lights}
-        touched = dict.fromkeys(c.entity_id for c in commands)  # ordered, deduped
-        self.last_entities = [(eid, by_id.get(eid, eid)) for eid in touched]
-        return f"Done: {len(commands)} light(s) updated."
+        by_id = {light.entity_id: light for light in lights}
+        touched = list(dict.fromkeys(c.entity_id for c in commands))  # ordered, deduped
+        before = await self._snapshot(touched)
+        # One entity at a time: a bulb that never answers must not take the
+        # rest of the room down with it, and each gets its own verdict.
+        outcomes: dict[str, EntityOutcome] = {}
+        for command in commands:
+            entity_id = command.entity_id
+            error = await self._try_apply(command)
+            prior = outcomes.get(entity_id)
+            outcomes[entity_id] = EntityOutcome(
+                entity_id=entity_id,
+                name=by_id[entity_id].name if entity_id in by_id else entity_id,
+                before=prior.before if prior else before.get(entity_id, {}),
+                requested=_requested(command),
+                ok=not error and (prior is None or prior.ok),
+                error=error or (prior.error if prior else ""),
+            )
+        receipt = self._receipts.record(
+            ActionReceipt(
+                tool="set_lights",
+                note=_light_note(list(outcomes.values())),
+                outcomes=list(outcomes.values()),
+                reversible=True,  # a bulb's before-state fully describes it
+            )
+        )
+        # "it" and "that" bind to what actually changed, not what was aimed at.
+        self.last_entities = [(o.entity_id, o.name) for o in receipt.changed]
+        summary = receipt.summary("light")
+        if receipt.failed and receipt.changed:
+            summary += " Say so plainly; undo_last would put the rest back."
+        elif receipt.failed:
+            # Nothing worked at all: the reason is usually the whole story
+            # (a bad token, an unreachable hub), so hand it over rather than
+            # leaving her to guess at five silent bulbs.
+            summary += f" ({receipt.failed[0].error[:200]})"
+        return summary
+
+    async def _snapshot(self, entity_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """What these lights look like right now — the before-state a receipt
+        needs. Fetched together, because one round trip per bulb before every
+        command is exactly the dead air the tool design avoids."""
+        details = await asyncio.gather(
+            *(self._home.get_entity(entity_id) for entity_id in entity_ids),
+            return_exceptions=True,
+        )
+        found: dict[str, dict[str, Any]] = {}
+        for entity_id, detail in zip(entity_ids, details, strict=True):
+            if isinstance(detail, dict):
+                state = _before_state(detail)
+                if state:
+                    found[entity_id] = state
+        return found
+
+    async def _try_apply(self, command: LightCommand) -> str:
+        """Apply one command; the error string if the bulb did not take it."""
+        try:
+            await self._home.apply([command])
+        except Exception as err:  # noqa: BLE001 — one dead bulb is an outcome, not a crash
+            return str(err) or type(err).__name__
+        return ""
+
+    async def _undo_last(self) -> str:
+        receipt, refusal = self._receipts.for_undo()
+        if receipt is None:
+            return refusal
+        lights = {light.entity_id: light for light in await self._home.get_lights()}
+        outcomes: list[EntityOutcome] = []
+        for entry in receipt.restorable():
+            light = lights.get(entry.entity_id)
+            if light is None:
+                outcomes.append(
+                    EntityOutcome(
+                        entry.entity_id, entry.name, ok=False, error="it is no longer in the house"
+                    )
+                )
+                continue
+            error = await self._try_apply(_restore_command(light, entry.before))
+            outcomes.append(
+                EntityOutcome(
+                    entity_id=light.entity_id,
+                    name=light.name,
+                    before=entry.requested,  # the state we are undoing, for the record
+                    requested=entry.before,
+                    ok=not error,
+                    error=error,
+                )
+            )
+        undo = self._receipts.record(
+            ActionReceipt(tool="undo_last", note=_undo_note(outcomes), outcomes=outcomes)
+        )
+        self.last_entities = [(o.entity_id, o.name) for o in undo.changed]
+        if not undo.failed:
+            return f"Put {_names(undo.changed)} back the way {_they_were(undo.changed)}."
+        if not undo.changed:
+            return f"Could not put it back — {_names(undo.failed)} did not respond."
+        return (
+            f"Put {len(undo.changed)} of {len(outcomes)} back; "
+            f"{_names(undo.failed)} did not respond."
+        )
 
     async def _calendar_tool(self, name: str, tool_input: dict[str, Any]) -> str:
         if self._calendar is None:
@@ -774,6 +903,135 @@ class ToolExecutor:
             "specify which player; players: "
             f"{[(p.entity_id, p.name, p.kind) for p in players]}"
         )
+
+
+def _requested(command: LightCommand) -> dict[str, Any]:
+    """What a command asked of one bulb — the receipt's "after", as intended."""
+    asked: dict[str, Any] = {"on": command.turn == "on"}
+    if command.brightness_pct is not None:
+        asked["brightness_pct"] = command.brightness_pct
+    if command.rgb_color:
+        asked["rgb_color"] = list(command.rgb_color)
+    if command.color_temp_kelvin:
+        asked["color_temp_kelvin"] = command.color_temp_kelvin
+    return asked
+
+
+def _before_state(detail: dict[str, Any]) -> dict[str, Any]:
+    """A light's live state, reduced to what it takes to put it back. HA
+    reports rgb_color and color_temp_kelvin side by side, but a bulb is in
+    ONE colour mode at a time and asking for both at once is rejected — so
+    color_mode decides which of the two is the truth worth keeping."""
+    state = str(detail.get("state", ""))
+    if state in ("", "unavailable", "unknown"):
+        return {}  # unknown before-state = nothing honest to restore
+    before: dict[str, Any] = {"on": state == "on"}
+    if not before["on"]:
+        return before
+    attributes = detail.get("attributes") or {}
+    brightness = attributes.get("brightness")  # HA reports 0-255 when on
+    if brightness:
+        before["brightness_pct"] = max(1, round(float(brightness) / 255 * 100))
+    mode = str(attributes.get("color_mode") or "")
+    rgb = attributes.get("rgb_color")
+    kelvin = attributes.get("color_temp_kelvin")
+    if kelvin and mode not in RGB_CAPABLE_MODES:
+        before["color_temp_kelvin"] = int(kelvin)
+    elif isinstance(rgb, (list, tuple)) and len(rgb) == 3:
+        before["rgb_color"] = [int(channel) for channel in rgb]
+    return before
+
+
+def _restore_command(light: Light, before: dict[str, Any]) -> LightCommand:
+    if not before.get("on"):
+        return LightCommand(entity_id=light.entity_id, turn="off")
+    rgb = before.get("rgb_color")
+    kelvin = before.get("color_temp_kelvin")
+    return LightCommand(
+        entity_id=light.entity_id,
+        turn="on",
+        brightness_pct=before.get("brightness_pct"),
+        rgb_color=tuple(rgb) if rgb and light.supports_rgb else None,
+        color_temp_kelvin=kelvin if kelvin and light.supports_color_temp else None,
+    )
+
+
+def _names(outcomes: list[EntityOutcome]) -> str:
+    labels = [o.name or o.entity_id for o in outcomes]
+    if len(labels) > 3:
+        return f"{len(labels)} lights"
+    if len(labels) <= 1:
+        return labels[0] if labels else "nothing"
+    return ", ".join(labels[:-1]) + f" and {labels[-1]}"
+
+
+def _they_were(outcomes: list[EntityOutcome]) -> str:
+    return "it was" if len(outcomes) == 1 else "they were"
+
+
+def _light_note(outcomes: list[EntityOutcome]) -> str:
+    changed = [o for o in outcomes if o.ok]
+    if not changed:
+        return f"try to change {_names(outcomes)}"
+    return f"changed {_names(changed)}"
+
+
+def _undo_note(outcomes: list[EntityOutcome]) -> str:
+    changed = [o for o in outcomes if o.ok]
+    if not changed:
+        return f"try to put {_names(outcomes)} back"
+    return f"put {_names(changed)} back the way {_they_were(changed)}"
+
+
+# Mutations with no reliable inverse. They still go in the ledger, so "undo
+# that" can name what she actually just did instead of guessing.
+_ONE_WAY_TOOLS = frozenset(
+    {
+        "media_control",
+        "play_music",
+        "launch_app",
+        "ha_call_service",
+        "create_calendar_event",
+        "delete_calendar_event",
+    }
+)
+
+# media_control can decline to act ("nothing is playing right now"); a ledger
+# entry for something she did not do would make "undo that" misstate the last
+# action, so no target means no receipt.
+_NEEDS_A_TARGET = frozenset({"media_control"})
+
+_MEDIA_PAST = {
+    "pause": "paused",
+    "resume": "resumed",
+    "next": "skipped a track on",
+    "previous": "went back a track on",
+    "stop": "stopped",
+    "volume_set": "set the volume on",
+    "turn_on": "turned on",
+    "turn_off": "turned off",
+}
+
+
+def _one_way_note(name: str, args: dict[str, Any], entities: list[tuple[str, str]]) -> str:
+    """The action in past tense, so the refusal reads as one sentence:
+    "the last thing I did was <note>, and that can't be undone"."""
+    target = entities[0][1] if entities else ""
+    where = f" on {target}" if target else ""
+    if name == "media_control":
+        verb = _MEDIA_PAST.get(str(args.get("action", "")), "sent a command to")
+        return f"{verb} {target or 'the player'}"
+    if name == "play_music":
+        return f"started {args.get('media_id') or 'music'}{where}"
+    if name == "launch_app":
+        return f"opened {args.get('app') or 'an app'}{where}"
+    if name == "ha_call_service":
+        return f"called {args.get('domain')}.{args.get('service')}{where}"
+    if name == "create_calendar_event":
+        return f'added "{args.get("summary") or "an event"}" to the calendar'
+    if name == "delete_calendar_event":
+        return "deleted a calendar event"
+    return f"used {name}"
 
 
 def _resolve_target(target: str, lights: list[Light]) -> list[Light]:

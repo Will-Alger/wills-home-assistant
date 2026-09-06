@@ -7,6 +7,7 @@ exists) and by the eval suite (assert tool behavior without real bulbs).
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from typing import Any
 
 from assistant.home.base import Light, LightCommand, MediaPlayer
 
@@ -17,6 +18,15 @@ _SEED = [
     Light("light.hallway", "Hallway Light", "Hallway", ("color_temp",), on=True, brightness_pct=80),
     Light("light.kitchen_strip", "Kitchen Strip", "Kitchen", ("rgb",), on=False),
 ]
+
+
+# Colour is not on the Light dataclass (the brain only ever needed on/off and
+# brightness there), but a receipt has to be able to put a bulb back exactly
+# as it was — so the fake house tracks it the way Home Assistant reports it.
+_COLOR_SEED: dict[str, dict[str, Any]] = {
+    "light.living_room_ceiling": {"color_mode": "color_temp", "color_temp_kelvin": 2700},
+    "light.hallway": {"color_mode": "color_temp", "color_temp_kelvin": 3000},
+}
 
 
 _MEDIA_SEED = [
@@ -37,6 +47,11 @@ class FakeHome:
         default_factory=lambda: {light.entity_id: light for light in _SEED}
     )
     applied: list[LightCommand] = field(default_factory=list)
+    colors: dict[str, dict[str, Any]] = field(
+        default_factory=lambda: {k: dict(v) for k, v in _COLOR_SEED.items()}
+    )
+    # Bulbs that never answer — how a test fails the second of three lights.
+    unresponsive: set[str] = field(default_factory=set)
     players: list[MediaPlayer] = field(default_factory=lambda: list(_MEDIA_SEED))
     played: list[dict] = field(default_factory=list)
     media_commands: list[tuple[str, str]] = field(default_factory=list)
@@ -58,6 +73,8 @@ class FakeHome:
         for cmd in commands:
             if cmd.entity_id not in self.lights:
                 raise KeyError(f"unknown entity: {cmd.entity_id}")
+            if cmd.entity_id in self.unresponsive:
+                raise TimeoutError(f"{cmd.entity_id} did not respond")
             self.applied.append(cmd)
             current = self.lights[cmd.entity_id]
             if cmd.turn == "off":
@@ -72,6 +89,16 @@ class FakeHome:
                         else current.brightness_pct or 100
                     ),
                 )
+                if cmd.rgb_color:
+                    self.colors[cmd.entity_id] = {
+                        "color_mode": "rgb",
+                        "rgb_color": list(cmd.rgb_color),
+                    }
+                elif cmd.color_temp_kelvin:
+                    self.colors[cmd.entity_id] = {
+                        "color_mode": "color_temp",
+                        "color_temp_kelvin": cmd.color_temp_kelvin,
+                    }
 
     def entities_touched(self) -> set[str]:
         return {cmd.entity_id for cmd in self.applied}
@@ -143,10 +170,22 @@ class FakeHome:
         ]
         return items[:limit]
 
+    def _light_attributes(self, light: Light) -> dict[str, Any]:
+        """Shaped like Home Assistant's: brightness 0-255, and the colour of
+        whichever mode the bulb is actually in."""
+        attributes: dict[str, Any] = {"supported_color_modes": list(light.color_modes)}
+        if not light.on:
+            return attributes
+        if light.brightness_pct is not None:
+            attributes["brightness"] = round(light.brightness_pct * 255 / 100)
+        attributes.update(self.colors.get(light.entity_id, {}))
+        return attributes
+
     def _all_entities(self) -> list[dict]:
         rows = [
             {"entity_id": light.entity_id, "name": light.name,
-             "state": "on" if light.on else "off", "domain": "light", "attributes": {}}
+             "state": "on" if light.on else "off", "domain": "light",
+             "attributes": self._light_attributes(light)}
             for light in self.lights.values()
         ]
         rows += [

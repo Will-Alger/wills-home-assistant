@@ -53,6 +53,7 @@ from assistant.memory import MemoryStore
 from assistant.panel import PanelOverrides, SettingsPanel
 from assistant.presence import Presence
 from assistant.push import PhoneActions, PhonePusher
+from assistant.receipts import ReceiptBook
 from assistant.routines import RoutineStore
 from assistant.scheduler import Scheduler
 from assistant.sessions import SessionLog
@@ -237,6 +238,7 @@ def build_engine(fake: bool):
     )
     watches = WatchStore(root / "data" / "watches.json")
     routines = RoutineStore(root / "data" / "routines.json")
+    receipts = ReceiptBook(root / "data" / "receipts.json")
     scheduler = Scheduler(root / "data" / "schedule.json", announcer=announcer, journal=journal)
     followups = FollowUpStore(root / "data" / "followups.json", announcer=announcer, journal=journal)
     thinker = None
@@ -314,6 +316,7 @@ def build_engine(fake: bool):
         watches=watches,
         scheduler=scheduler,
         routines=routines,
+        receipts=receipts,
         journal=journal,
         sessions=sessions,
         context=context,
