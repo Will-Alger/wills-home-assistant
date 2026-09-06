@@ -92,6 +92,12 @@ def set_output(spec: str) -> None:
     _OUTPUT = devices.find(spec, "output")
 
 
+def output_device() -> int | None:
+    """The speaker the fire-and-forget sounds go to (None = the default) —
+    the spoken fallbacks follow the chimes rather than choose again."""
+    return _OUTPUT
+
+
 def play(kind: str, on_audible: Callable[[], None] | None = None) -> None:
     """Fire and forget. `on_audible` (the latency log's stopwatch) is called
     once the chime is actually coming out of the speaker."""

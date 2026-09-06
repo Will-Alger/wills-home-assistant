@@ -33,6 +33,7 @@ import numpy as np
 from openai import AsyncOpenAI
 from scipy.signal import resample_poly
 
+from assistant.audio.fallbacks import SpokenFallbacks
 from assistant.brain.outcome import ToolOutcome, adapt
 from assistant.brain.tools import CALENDAR_TOOLS, TOOL_DEFINITIONS, ToolExecutor
 from assistant.calendar.base import CalendarApi, spoken_now
@@ -1452,6 +1453,7 @@ class RealtimeEngine:
         panel: Any | None = None,
         latency: LatencyLog | None = None,
         receipts: Any | None = None,
+        fallbacks: SpokenFallbacks | None = None,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
         self._journal = journal  # what she did and saw, by day
@@ -1512,6 +1514,11 @@ class RealtimeEngine:
         self._announcer = announcer  # queued things she says on her own
         self.announcer = announcer  # the runner's idle loop polls it too
         self._cues = cues  # listening earcons: start / end / error
+        # The four pre-rendered lines that need no network. Shared with the
+        # runner, so a collapse both of them see is spoken once (audio/
+        # fallbacks.py); "moment" is rendered and waiting for a caller.
+        self._fallbacks = fallbacks if fallbacks is not None else SpokenFallbacks()
+        self._speaker: Any | None = None  # the open output while a session runs
         self._latency = latency  # logs/turns.jsonl: how long each step took
         self._trace = TurnTrace()  # replaced per conversation; this one writes nothing
         self._panel = panel  # the desktop Settings panel she opens by voice
@@ -1848,7 +1855,18 @@ class RealtimeEngine:
         elif name in _BRAIN_TOOL_NAMES:
             pair = await self._execute_brain_tool(name, args)
         else:
-            return await self._executor.run(name, args)
+            outcome = await self._executor.run(name, args)
+            if outcome.details.get("home_unreachable") and self._fallbacks.say(
+                "home_down", self._speaker
+            ):
+                # Said at once, off the disk, while the model is still
+                # reading the failure — and it must not be said twice.
+                outcome.follow_up = _also(
+                    outcome.follow_up,
+                    "you have ALREADY said \"The home isn't answering\" out loud; say what "
+                    "he asked for around it, never that sentence again",
+                )
+            return outcome
         text, is_error = pair
         status = ""
         if is_error and text.startswith(_NEEDS_A_YES):
@@ -2610,6 +2628,7 @@ class RealtimeEngine:
         the timings are kept in memory and written nowhere."""
         stats = SessionStats()
         self._trace = trace if trace is not None else TurnTrace()
+        self._speaker = speaker  # where a spoken fallback goes while this runs
         self._session_opened = time.time()  # older promises are hers to keep
         self._conversations += 1
         self._live_conversation = self._conversations  # a thought asked here may interrupt
@@ -2634,6 +2653,9 @@ class RealtimeEngine:
                 stats.ended_by = f"session error: {err}"[:160]
                 with contextlib.suppress(Exception):
                     ui.error(str(err))
+                # She is about to go silent mid-conversation. One line off
+                # the disk says so; the log has the rest.
+                self._fallbacks.say("failed", speaker)
                 ended.set()
 
         def spawn(coro: Any) -> asyncio.Task:
