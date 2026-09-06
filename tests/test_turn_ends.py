@@ -83,6 +83,69 @@ async def test_a_fragment_followed_by_the_rest_drops_the_reply_to_the_fragment()
     assert stats.ended_by != "unknown"
 
 
+async def test_turns_end_on_silence_by_default_and_let_me_think_widens_it() -> None:
+    engine, client, _cues, ui = make(idle_timeout_s=0.5)
+    conn = client.connection
+    on = (await engine._session_config(None))["audio"]["input"]["turn_detection"]
+    assert on == {"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 800}
+    assert engine._turn_detection(False) is None  # push to talk: the client commits
+    semantic = RealtimeEngine(
+        api_key="k", model="m", voice="v", home=FakeHome(), owner="Will", turn_detection="semantic_vad", eagerness="high"
+    )
+    assert (await semantic._session_config(None))["audio"]["input"]["turn_detection"] == {
+        "type": "semantic_vad", "eagerness": "high"
+    }
+
+    async def owner() -> None:
+        await asyncio.sleep(0.15)
+        conn.user_says("let me think", reply="Sure.")
+        await asyncio.sleep(0.2)
+        conn.user_says("okay, the hallway", reply="Hallway it is.")
+
+    turn = asyncio.create_task(owner())
+    await asyncio.wait_for(engine.run_conversation(NeverMic(), InstantSpeaker(), None, ui), 6)
+    await turn
+    silences = [
+        e["session"]["audio"]["input"]["turn_detection"]["silence_duration_ms"]
+        for e in conn.sent
+        if e["type"] == "session.update" and "audio" in e["session"] and "turn_detection" in e["session"]["audio"]["input"]
+    ]
+    assert silences[-2:] == [2500, 800]  # patient, then back
+
+
+async def test_the_mic_still_hot_after_a_commit_drops_the_reply_from_local_frames() -> None:
+    import numpy as np
+
+    class LoudMic:
+        """He never stopped talking: every frame is a voice at the desk."""
+
+        async def get_frame(self) -> bytes:
+            await asyncio.sleep(0.01)
+            return np.full(1920, 2500, dtype=np.int16).tobytes()
+
+        def drain(self) -> None: ...
+
+    engine, client, _cues, ui = make(idle_timeout_s=0.6)
+    conn = client.connection
+    conn.ack_cancel = True
+
+    async def owner() -> None:
+        await asyncio.sleep(0.15)
+        conn.push("input_audio_buffer.speech_started")
+        conn.push("input_audio_buffer.speech_stopped")
+        conn.push("input_audio_buffer.committed")  # the server thinks he is done; the mic says otherwise
+        conn.push("conversation.item.input_audio_transcription.completed", transcript="Something just fine first.")
+        conn.push("response.created")
+        await asyncio.sleep(0.4)
+        conn.user_says("for like cleaning my apartment.", reply="Cleaning music coming up.")
+
+    turn = asyncio.create_task(owner())
+    await asyncio.wait_for(engine.run_conversation(LoudMic(), InstantSpeaker(), None, ui), 6)
+    await turn
+    assert conn.kinds().count("response.cancel") == 1  # once, from the frames — the server never had to notice
+    assert any("still talking after the turn ended" in n for n in ui.notes)
+
+
 async def test_a_real_second_turn_after_her_reply_is_not_a_fragment() -> None:
     engine, client, _cues, ui = make(idle_timeout_s=0.6)
     conn = client.connection

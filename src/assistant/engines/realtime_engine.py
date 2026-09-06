@@ -629,6 +629,8 @@ _THINKING_S = 30.0  # after "let me think": no clock closes the conversation, VA
 # The server ended his turn and he spoke again within this long, before she
 # said anything: one sentence split at a pause, not two turns.
 _CONTINUATION_S = 1.2
+_STILL_TALKING_FRAMES = 2  # mic frames still hot right after a commit: he was cut off
+_PATIENT_SILENCE_MS = 2500  # "let me think" on server_vad: silence that ends a turn
 
 # Tentative talk-over on loudspeakers (docs/PLAN-VOICE-2026-09-05.md phase 4).
 _TENTATIVE_COOLDOWN_S = 0.8  # the first moments of a reply: learn her echo, never interrupt
@@ -1476,6 +1478,8 @@ class RealtimeEngine:
         talk_over: bool = False,
         tentative_interrupt: bool = False,
         noise_reduction: str = "",
+        turn_detection: str = "server_vad",
+        silence_ms: int = 800,
         eagerness: str = "high",
         extra_instructions: str = "",
         memory: MemoryStore | None = None,
@@ -1554,6 +1558,8 @@ class RealtimeEngine:
         # a headset, "" for none. (SDK-verified: NoiseReductionType.)
         self._noise_reduction = noise_reduction.strip().lower()
         self._eagerness = eagerness  # semantic VAD: how fast it decides you're done
+        self._turn_mode = "semantic_vad" if turn_detection.strip().lower() == "semantic_vad" else "server_vad"
+        self._silence_ms = int(silence_ms)  # server_vad: silence that ends a turn
         self._extra_instructions = extra_instructions
         self._memory = memory
         self._board = task_board  # her own Jira: specs, builds, approvals
@@ -1584,11 +1590,25 @@ class RealtimeEngine:
         """The voice actually in use — a gated one falls back on connect."""
         return self._voice
 
-    def _turn_detection(self, on: bool) -> dict[str, Any] | None:
+    def _turn_detection(self, on: bool, *, patient: bool = False) -> dict[str, Any] | None:
         """Who decides a turn has ended. None is push to talk: the API reads
         it as "the client will commit and ask for the response itself"
-        (SDK-verified: RealtimeAudioConfigInput.turn_detection is Optional)."""
-        return {"type": "semantic_vad", "eagerness": self._eagerness} if on else None
+        (SDK-verified: RealtimeAudioConfigInput.turn_detection is Optional).
+
+        server_vad ends a turn on SILENCE only, for `silence_ms` — nothing
+        about the words. semantic_vad also guesses from the words, and that
+        guess is what cut him off mid-sentence ("Something just fine first"
+        sounds finished). `patient` ("let me think") widens either one."""
+        if not on:
+            return None
+        if self._turn_mode == "semantic_vad":
+            return {"type": "semantic_vad", "eagerness": "low" if patient else self._eagerness}
+        return {
+            "type": "server_vad",
+            "threshold": 0.5,
+            "prefix_padding_ms": 300,
+            "silence_duration_ms": _PATIENT_SILENCE_MS if patient else self._silence_ms,
+        }
 
     def audio_input_update(self, *, turn_detection: bool) -> dict[str, Any]:
         """The `audio.input` block of the last session.update with turn
@@ -2770,6 +2790,8 @@ class RealtimeEngine:
             wrapup_heard = False  # he said "that's all": close after her goodbye, tool or no tool
             thinking_until = 0.0  # "let me think": patient until this moment
             last_commit_at = -1e9  # when the server last ended his turn (a fragment is one that ends early)
+            fragment_cancelled = False  # the reply to a cut-off fragment was dropped (once per response)
+            hot_after_commit = 0  # mic frames still hot right after a commit
             possible_since: float | None = None  # playback held for a possible talk-over since
             levels = _Levels()  # the room's level, and her echo during each reply
             meter = LevelMeter()  # the same frames, smoothed, for the panel's bar
@@ -2961,7 +2983,7 @@ class RealtimeEngine:
                         note_fn("false alarm — resuming")
 
             async def pump_mic() -> None:
-                nonlocal ptt_frames, ptt_peak
+                nonlocal ptt_frames, ptt_peak, fragment_cancelled, hot_after_commit
                 while True:
                     frame = await mic.get_frame()
                     heard_at = time.monotonic()
@@ -2987,6 +3009,27 @@ class RealtimeEngine:
                             # the hotkey is the only way to cut in.
                             await consider(frame, heard_at, level)
                         continue
+                    if (
+                        response_active
+                        and not speaking
+                        and not fragment_cancelled
+                        and heard_at - last_commit_at < _CONTINUATION_S
+                    ):
+                        # The server just ended his turn and is composing a
+                        # reply — but the microphone says he is STILL talking.
+                        # He was cut off. Drop that reply now, from the local
+                        # frames, without waiting for the server to notice him
+                        # again; the next reply sees the whole sentence.
+                        hot_after_commit = hot_after_commit + 1 if level > 2 * _ABS_FLOOR else 0
+                        if hot_after_commit >= _STILL_TALKING_FRAMES:
+                            fragment_cancelled = True
+                            await connection.send({"type": "response.cancel"})
+                            note_fn = getattr(ui, "note", None)
+                            if note_fn is not None:
+                                note_fn(
+                                    f"still talking after the turn ended (mic {level:.0f}) — "
+                                    "the reply to the fragment is dropped"
+                                )
                     levels.quiet(level)  # the room, while he can talk freely
                     if ptt_session and not ptt_active:
                         # Push to talk with nobody holding: the buffer must
@@ -3285,16 +3328,18 @@ class RealtimeEngine:
                 nonlocal quick_close_window, quick_close_reason, announcing, announcing_opener
                 nonlocal tool_busy, interrupted, wrapup_heard, user_turns, audio_in_response
                 nonlocal thinking_until, quiet_since, working_ticks, last_commit_at
+                nonlocal fragment_cancelled, hot_after_commit
                 heard = ""  # live accumulation of the user's words
 
-                async def set_eagerness(value: str) -> None:
+                async def set_patience(patient: bool) -> None:
+                    """Widen (or restore) how long the server waits for his turn to end."""
                     await connection.send(
                         {
                             "type": "session.update",
                             "session": {
                                 "audio": {
                                     "input": {
-                                        "turn_detection": {"type": "semantic_vad", "eagerness": value}
+                                        "turn_detection": self._turn_detection(True, patient=patient)
                                     }
                                 }
                             },
@@ -3318,6 +3363,8 @@ class RealtimeEngine:
                     elif kind == "response.created":
                         response_active = True
                         audio_in_response = False
+                        fragment_cancelled = False
+                        hot_after_commit = 0
                         if quiet_since is None:
                             # The wait starts here and is NOT restarted by the
                             # response a tool's result asks for: the ticks keep
@@ -3346,13 +3393,13 @@ class RealtimeEngine:
                             # patience: no clock closes the conversation for a
                             # while, and the server waits longer for his turn
                             thinking_until = time.monotonic() + _THINKING_S
-                            await set_eagerness("low")
+                            await set_patience(True)
                             note_fn = getattr(ui, "note", None)
                             if note_fn is not None:
                                 note_fn(f"taking his time — patient for {_THINKING_S:.0f} s")
                         elif thinking_until:
                             thinking_until = 0.0  # he came back: normal pace again
-                            await set_eagerness(self._eagerness)
+                            await set_patience(False)
                         if is_wrapup(said):
                             wrapup_heard = True  # the engine closes after her goodbye
                         if is_stop_command(said):
@@ -3371,6 +3418,7 @@ class RealtimeEngine:
                         elif (
                             response_active
                             and not speaking
+                            and not fragment_cancelled
                             and time.monotonic() - last_commit_at < _CONTINUATION_S
                         ):
                             # The server ended his turn at a pause and he kept
@@ -3378,6 +3426,7 @@ class RealtimeEngine:
                             # Drop the reply to the fragment; the next reply sees
                             # both pieces. (Had she started speaking, the
                             # talk-over path owns it.)
+                            fragment_cancelled = True
                             await connection.send({"type": "response.cancel"})
                             note_fn = getattr(ui, "note", None)
                             if note_fn is not None:

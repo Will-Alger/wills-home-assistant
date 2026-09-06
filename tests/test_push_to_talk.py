@@ -108,6 +108,7 @@ def make_engine(**kw) -> tuple[RealtimeEngine, FakeClient]:
         api_key="test-key",
         model="m",
         voice="v",
+        turn_detection="semantic_vad",  # this suite asserts the semantic shape it was written against
         home=FakeHome(),
         owner="Will",
         name="Alexa",
@@ -350,7 +351,7 @@ async def test_a_hotkey_session_still_gets_noise_reduction_and_the_vocabulary() 
     spoken one."""
     engine = RealtimeEngine(
         api_key="k", model="m", voice="v", home=FakeHome(), owner="Will",
-        name="Alexa", noise_reduction="far_field",
+        name="Alexa", noise_reduction="far_field", turn_detection="semantic_vad",
     )
     audio_in = (await engine._session_config("whisper-1", turn_detection=False))["audio"]["input"]
     assert audio_in["turn_detection"] is None

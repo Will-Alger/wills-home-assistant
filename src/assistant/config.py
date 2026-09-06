@@ -180,7 +180,14 @@ class Settings(BaseSettings):
     realtime_tentative_interrupt: bool = True
     # Server-side noise reduction before VAD and the model: far_field for a
     # desk microphone at speaking distance, near_field for a headset, "" off.
-    realtime_noise_reduction: str = "far_field"
+    # Off by default: it went live 2026-09-05 and the mid-sentence cut-offs
+    # were logged after it — an unvalidated trial, not a default.
+    realtime_noise_reduction: str = ""
+    # Who decides a turn has ended. server_vad: SILENCE only, for
+    # REALTIME_SILENCE_MS — nothing about the words. semantic_vad also guesses
+    # from the words (eagerness above), and that guess cut him off mid-sentence.
+    realtime_turn_detection: str = "server_vad"
+    realtime_silence_ms: int = 800
 
     # Push to talk: hold this system-wide hotkey and speak; letting go ends
     # the turn (turn detection is off while it is held, so a pause can never

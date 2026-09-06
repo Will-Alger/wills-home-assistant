@@ -341,6 +341,8 @@ def build_engine(fake: bool):
         talk_over=settings.realtime_talk_over,
         tentative_interrupt=settings.realtime_tentative_interrupt,
         noise_reduction=settings.realtime_noise_reduction,
+        turn_detection=settings.realtime_turn_detection,
+        silence_ms=settings.realtime_silence_ms,
         eagerness=settings.realtime_eagerness,
         extra_instructions=settings.assistant_extra_instructions,
         memory=memory,

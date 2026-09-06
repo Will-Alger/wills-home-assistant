@@ -24,7 +24,7 @@ async def test_let_me_think_holds_every_clock_then_his_next_turn_restores_pace(m
     monkeypatch.setattr(mod, "_THINKING_S", 0.9)
     engine = RealtimeEngine(
         api_key="k", model="m", voice="v", home=FakeHome(), owner="Will", name="Alexa", wake_phrase="alexa",
-        info_close_s=0.2, idle_timeout_s=0.4, eagerness="high",
+        info_close_s=0.2, idle_timeout_s=0.4, eagerness="high", turn_detection="semantic_vad",
     )
     client = FakeClient()
     engine._client = client
@@ -57,7 +57,7 @@ async def test_his_next_sentence_restores_the_normal_pace(monkeypatch) -> None:
     monkeypatch.setattr(mod, "_THINKING_S", 5.0)
     engine = RealtimeEngine(
         api_key="k", model="m", voice="v", home=FakeHome(), owner="Will", name="Alexa", wake_phrase="alexa",
-        idle_timeout_s=0.4, eagerness="high",
+        idle_timeout_s=0.4, eagerness="high", turn_detection="semantic_vad",
     )
     client = FakeClient()
     engine._client = client
