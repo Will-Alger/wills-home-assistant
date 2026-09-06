@@ -127,6 +127,20 @@ async def test_read_tools_are_answered_in_one_breath(tmp_path) -> None:
     assert "BEFORE SPEAKING" not in by_name["set_lights"]  # commands are confirmed after, not narrated before
 
 
+async def test_spoken_reply_rules_are_in_the_instructions() -> None:
+    """Endings and reading aloud: no dead-end yes/no, plant a seed instead,
+    and machine forms like "18:30" get spoken, not read out."""
+    from assistant.engines.realtime_engine import RealtimeEngine
+    from assistant.home.fake import FakeHome
+
+    engine = RealtimeEngine(api_key="k", model="m", voice="v", home=FakeHome(), owner="Will")
+    text = (await engine._session_config(None))["instructions"]
+    assert 'not "want me to explain more?"' in text and "plant a seed instead" in text
+    assert "Speaking aloud" in text and '"six thirty", not "18:30"' in text
+    assert "the id as the plain name of the thing" in text
+    assert "a sentence or two unless asked to go deeper" in text  # brevity rules untouched
+
+
 async def test_noise_reduction_is_sent_only_when_configured() -> None:
     import json
 
