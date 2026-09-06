@@ -226,3 +226,69 @@ def test_downsample_preserves_a_tone() -> None:
     tone = (10_000 * np.sin(2 * np.pi * 440 * t)).astype(np.int16)
     out = np.frombuffer(downsample_24k_to_16k(tone.tobytes()), dtype=np.int16)
     assert out.astype(np.float32).std() > 1000  # energy survived the resample
+
+
+async def test_a_correction_is_one_call_and_leaves_one_answer(tmp_path) -> None:
+    """The voice test: 3000 kelvin, then "actually make that 2700" — one
+    answer afterwards, in the tools and in the instructions."""
+    from assistant.engines.realtime_engine import MEMORY_TOOLS, RealtimeEngine
+    from assistant.home.fake import FakeHome
+    from assistant.memory import MemoryStore
+
+    memory = MemoryStore(tmp_path / "m.json")
+    engine = RealtimeEngine(
+        api_key="k", model="m", voice="v", home=FakeHome(), owner="Will", memory=memory
+    )
+    said, is_error = engine._execute_memory(
+        "remember",
+        {"kind": "preference", "text": "the living room at 3000 kelvin", "subject": "lights"},
+    )
+    assert not is_error and engine._instructions_stale
+    stored = memory.items("preference")[0]
+
+    said, is_error = engine._execute_memory(
+        "update_memory", {"id": stored.id, "text": "the living room at 2700 kelvin"}
+    )
+    assert not is_error and "retired" in said
+
+    listed, is_error = engine._execute_memory("list_memories", {"subject": "lights"})
+    assert not is_error and "2700" in listed and "3000" not in listed
+    instructions = (await engine._session_config(None))["instructions"]
+    assert "the living room at 2700 kelvin" in instructions and "3000" not in instructions
+
+    # A house default is stored and rendered apart from his own preference.
+    engine._execute_memory(
+        "remember",
+        {"kind": "house", "text": "the porch light goes off at midnight", "subject": "house"},
+    )
+    instructions = (await engine._session_config(None))["instructions"]
+    assert "House defaults" in instructions and "porch light goes off" in instructions
+
+    names = [tool["name"] for tool in MEMORY_TOOLS]
+    assert "update_memory" in names  # advertised, or the model falls back to two steps
+    missing, is_error = engine._execute_memory("update_memory", {"id": 99, "text": "x"})
+    assert is_error and "99" in missing  # an invented id is an honest error, not a write
+
+
+async def test_instructions_carry_the_subjects_in_play(tmp_path) -> None:
+    from assistant.engines.realtime_engine import RealtimeEngine
+    from assistant.home.fake import FakeHome
+    from assistant.memory import INJECT_WHOLE_BELOW, MemoryStore
+
+    memory = MemoryStore(tmp_path / "m.json")
+    # An old preference about the lights, buried under a pile of newer ones.
+    memory.add("preference", "the reading lamp at 2350 kelvin", subject="lights")
+    for i in range(INJECT_WHOLE_BELOW + 4):
+        memory.add("preference", f"a calendar rule numbered {i}", subject="calendar")
+    engine = RealtimeEngine(
+        api_key="k", model="m", voice="v", home=FakeHome(), owner="Will", memory=memory
+    )
+
+    cold = (await engine._session_config(None))["instructions"]
+    assert "a calendar rule numbered 0" not in cold  # a big store is never recited
+    assert "2350" not in cold  # nothing about lights is in play yet
+
+    engine._tools_in_play.append("set_lights")
+    warm = (await engine._session_config(None))["instructions"]
+    assert "2350" in warm  # touch a lamp and the lights preference is retrieved
+    assert "a calendar rule numbered 0" not in warm

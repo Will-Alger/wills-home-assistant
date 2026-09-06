@@ -22,6 +22,7 @@ import contextlib
 import json
 import re
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -37,7 +38,7 @@ from assistant.calendar.base import CalendarApi, spoken_now
 from assistant.context import WorkingContext
 from assistant.home.base import HomeApi, device_table, media_table
 from assistant.latency import LatencyLog, TurnTrace, latency_report, since_label
-from assistant.memory import MemoryStore
+from assistant.memory import MemoryStore, subjects_in_play
 from assistant.tasks import TaskBoard
 from assistant.thoughts import ThoughtBook
 from assistant.thoughts import announcement as thought_announcement
@@ -159,8 +160,15 @@ Lights:
 Media players:
 {media}
 
-Standing preferences ({owner}'s, apply them automatically, no announcement):
+Standing preferences — {owner}'s own, apply them automatically, no \
+announcement. These are the ones that fit what you are doing right now plus \
+the newest few, NOT everything you know: before telling him you remember \
+nothing about something, call list_memories with that subject:
 {preferences}
+
+House defaults — how this home runs for anyone in it, {owner} or a guest; \
+apply them the same way, and a personal preference above wins over one here:
+{house}
 
 Standing routines (applied to your tool calls automatically by the engine — \
 you don't have to remember them, but honor them when you explain choices):
@@ -177,13 +185,23 @@ to make one a standing preference (if yes: remember it as a preference, then \
 forget the observation's id; if no: just forget it):
 {observations}
 
-Memory: when the speaker states a durable preference ("from now on…", \
-"I always want…", "call me…"), store it with remember(kind="preference"). \
-If a new preference updates or contradicts a stored one, forget the old id \
-first and store the new — never keep both versions. \
+Memory: when the speaker states a durable preference of his own ("remember I \
+like…", "from now on…", "I always want…", "call me…"), store it with \
+remember(kind="preference"). When he sets it for the home rather than for \
+himself ("make that the house default", "that's how the house should be", \
+"for anyone here"), remember(kind="house") — same effect, shared with \
+guests. Every memory takes a subject (lights, music, climate, tv, calendar, \
+house, will): it is how it comes back to you in a later conversation about \
+that thing. \
+A change of mind about something already stored ("actually make that 2700") \
+is ONE call — update_memory with the old id and the new wording. It writes \
+the new version and retires the old together; never forget-then-remember, \
+and never leave two versions of the same thing standing. forget is only for \
+something he wants gone entirely. \
 Things they ask you to keep for later go in remember(kind="fact"); answer \
-"what do you remember?" via list_memories, and delete with forget after \
-checking ids. Store only what the speaker deliberately tells you — never \
+"what do you remember about the lights?" via list_memories with that subject \
+— your instructions carry only what is in play, so check before saying you \
+have nothing. Store only what the speaker deliberately tells you — never \
 ambient chatter.
 
 Working context — the last few minutes, carried across the close so "it", \
@@ -332,22 +350,61 @@ you weren't given. Speak times naturally ("Thursday at three"), never as \
 timestamps, and read back the events that matter, not every field.
 """
 
+_SUBJECT_PARAM = {
+    "type": "string",
+    "description": (
+        "the short scope this belongs to — lights, music, climate, tv, "
+        "calendar, house, will; it is how the memory is found again later"
+    ),
+}
+
 MEMORY_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "name": "remember",
         "description": (
-            "Store a lasting memory. kind='preference' for standing "
-            "instructions applied automatically in every future conversation; "
-            "kind='fact' for things to recall later on request."
+            "Store a lasting memory. kind='preference' for the OWNER's own "
+            "standing instructions ('remember I like…', 'from now on…'); "
+            "kind='house' for a shared default for everyone in the home "
+            "('make that the house default'); kind='fact' for things to "
+            "recall later on request. Always pass a subject. To correct "
+            "something already stored, use update_memory instead — never "
+            "store a second version."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "kind": {"type": "string", "enum": ["preference", "fact"]},
+                "kind": {"type": "string", "enum": ["preference", "house", "fact"]},
                 "text": {"type": "string", "description": "one self-contained sentence"},
+                "subject": _SUBJECT_PARAM,
+                "supersedes": {
+                    "type": "integer",
+                    "description": (
+                        "id this replaces, if it corrects an existing memory — "
+                        "the old one is retired in the same write"
+                    ),
+                },
             },
-            "required": ["kind", "text"],
+            "required": ["kind", "text", "subject"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "update_memory",
+        "description": (
+            "Correct a stored memory in ONE step ('actually make that 2700'): "
+            "writes the new wording and retires the old id together, so there "
+            "is never a moment with both versions or neither. Use this for "
+            "every change of mind about something already remembered."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "description": "the memory being corrected"},
+                "text": {"type": "string", "description": "the new wording, in full"},
+                "subject": _SUBJECT_PARAM,
+            },
+            "required": ["id", "text"],
         },
     },
     {
@@ -355,23 +412,34 @@ MEMORY_TOOLS: list[dict[str, Any]] = [
         "name": "list_memories",
         "description": (
             "List stored memories with ids. Optional kind filter: preference, "
-            "fact, lesson, observation, or episode (the conversation journal — "
-            "use for 'what did we talk about/figure out recently?')."
+            "house, fact, lesson, observation, or episode (the conversation "
+            "journal — use for 'what did we talk about/figure out recently?'). "
+            "Optional subject filter (lights, music, calendar…) — the way to "
+            "answer 'what do you remember about the lights?', since your "
+            "instructions carry only what is in play. Corrected memories are "
+            "not listed; only what stands now."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "kind": {
                     "type": "string",
-                    "enum": ["preference", "fact", "lesson", "observation", "episode"],
-                }
+                    "enum": [
+                        "preference", "house", "fact", "lesson", "observation", "episode",
+                    ],
+                },
+                "subject": {"type": "string", "description": "one scope, e.g. lights"},
             },
         },
     },
     {
         "type": "function",
         "name": "forget",
-        "description": "Delete one stored memory by id (see list_memories first).",
+        "description": (
+            "Delete one stored memory by id — only when the owner wants it "
+            "GONE ('forget that I ever said…'). A change of mind is "
+            "update_memory, not forget-then-remember."
+        ),
         "parameters": {
             "type": "object",
             "properties": {"id": {"type": "integer"}},
@@ -1416,6 +1484,9 @@ class RealtimeEngine:
         self._panel = panel  # the desktop Settings panel she opens by voice
         self.last_response_followup = False  # a tool ran: more audio is coming
         self._instructions_stale = False  # a preference changed mid-session
+        # The last few tools she actually used — what "in play" means when
+        # memory is retrieved by subject (memory.subjects_in_play).
+        self._tools_in_play: deque[str] = deque(maxlen=6)
         self._transcription_model: str | None = None  # what _configure settled on
         self._usage_log = usage_log
 
@@ -1448,6 +1519,15 @@ class RealtimeEngine:
             ]
         lights = await self._home.get_lights()
         players = await self._home.media_players()
+        # Which memories are worth carrying into this stretch: the subjects of
+        # the tools just used and the entities they touched. Everything else
+        # stays in the store, one list_memories away.
+        subjects = subjects_in_play(
+            tools=self._tools_in_play,
+            entities=[row["id"] for row in self._context.entities()]
+            if self._context is not None
+            else (),
+        )
         instructions = _INSTRUCTIONS.format(
             name=self._name,
             owner=self._owner,
@@ -1455,8 +1535,9 @@ class RealtimeEngine:
             devices=device_table(lights),
             media=media_table(players),
             preferences=(
-                self._memory.preferences_text() if self._memory else "(memory not enabled)"
+                self._memory.preferences_text(subjects) if self._memory else "(memory not enabled)"
             ),
+            house=self._memory.house_text(subjects) if self._memory else "(none)",
             lessons=self._memory.lessons_text() if self._memory else "(none)",
             observations=self._memory.observations_text() if self._memory else "(none)",
             other_repos=other_repos,
@@ -1664,6 +1745,7 @@ class RealtimeEngine:
             else:
                 result_text, is_error = await self._executor.execute(call_name, args)
             self._trace.tool(call_name, time.monotonic() - call_started)
+            self._tools_in_play.append(call_name)  # scopes the memory she gets
             tool_hook = getattr(self, "_ui_tool_hook", None)
             if tool_hook is not None:
                 tool_hook(call_name, result_text, is_error)
@@ -2347,17 +2429,46 @@ class RealtimeEngine:
             return "memory is not enabled", True
         try:
             if name == "remember":
-                item = self._memory.add(str(args.get("kind", "")), str(args.get("text", "")))
-                if item.kind == "preference":
+                supersedes = args.get("supersedes")
+                item = self._memory.add(
+                    str(args.get("kind", "")),
+                    str(args.get("text", "")),
+                    subject=str(args.get("subject", "") or ""),
+                    supersedes=int(supersedes) if supersedes not in (None, "") else None,
+                )
+                if item.kind in ("preference", "house"):
                     self._instructions_stale = True
+                if item.supersedes is not None:
+                    return f"stored (id {item.id}); id {item.supersedes} retired", False
                 return f"stored (id {item.id})", False
+            if name == "update_memory":
+                subject = args.get("subject")
+                item = self._memory.replace(
+                    int(args.get("id", -1)),
+                    str(args.get("text", "")),
+                    subject=None if subject in (None, "") else str(subject),
+                )
+                if item.kind in ("preference", "house"):
+                    self._instructions_stale = True
+                return (
+                    f"updated in one step: id {item.id} now stands, "
+                    f"id {item.supersedes} retired"
+                ), False
             if name == "list_memories":
-                items = self._memory.items(args.get("kind") or None)
+                items = self._memory.items(
+                    args.get("kind") or None, subject=str(args.get("subject", "") or "")
+                )
                 if not items:
                     return "nothing stored yet", False
                 return json.dumps(
                     [
-                        {"id": i.id, "kind": i.kind, "text": i.text, "since": i.created}
+                        {
+                            "id": i.id,
+                            "kind": i.kind,
+                            "subject": i.scope,
+                            "text": i.text,
+                            "since": i.created,
+                        }
                         for i in items
                     ]
                 ), False
