@@ -182,6 +182,13 @@ class Settings(BaseSettings):
     # desk microphone at speaking distance, near_field for a headset, "" off.
     realtime_noise_reduction: str = "far_field"
 
+    # Push to talk: hold this system-wide hotkey and speak; letting go ends
+    # the turn (turn detection is off while it is held, so a pause can never
+    # cut him off). Modifier-only by default — Ctrl+Alt on its own means
+    # nothing to the app he is typing in, and we never swallow the keys.
+    # "" (or "off") = wake word only.
+    ptt_hotkey: str = "ctrl+alt"
+
     # Milestone 6: Apple Calendar over iCloud CalDAV. The password MUST be an
     # app-specific one (appleid.apple.com); the Apple ID password is rejected.
     # Both empty = the calendar tools stay hidden from the assistant.

@@ -25,7 +25,7 @@ class SessionRow:
     id: int
     started: float
     ended: float | None = None
-    kind: str = "wake"  # wake | announce
+    kind: str = "wake"  # wake | ptt (the hotkey) | announce
     ended_by: str = ""
     first_user_line: str = ""
     summary: str = ""

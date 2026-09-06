@@ -284,6 +284,16 @@ speaking (no echo loop on open speakers); true talk-over needs headphones/AEC
 and is a later upgrade. Swap voices anytime via `REALTIME_VOICE` in `.env`
 (marin/cedar recommended). Costs land in `.usage.jsonl` like everything else.
 
+**Push to talk** (`PTT_HOTKEY`, default `ctrl+alt`) is the second way in:
+hold the hotkey anywhere on the desktop and speak. Your hold IS the turn —
+turn detection is switched off while the key is down, so a three-second pause
+mid-sentence can't cut you off, and letting go ends it immediately instead of
+waiting for her to decide you're finished. Press while she's talking to
+interrupt and start a new question. Modifier-only by default, so nothing is
+stolen from whatever app has focus; no admin rights, though a press inside an
+elevated window isn't seen. Each hold is one turn, and the session closes
+`REALTIME_COMMAND_CLOSE_S` after her reply unless you hold again.
+
 **Done when** you've had one genuine conversation that included a lighting
 command mid-chat, a wrap-up close, and a barge-in — and the voice quality
 makes you grin. Then judge: does the pipeline (M4b, ElevenLabs mouth) still

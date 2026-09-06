@@ -1,12 +1,12 @@
 """The app's idle loop, extracted so it can be tested without audio.
 
-While idle, the app watches every 80 ms mic frame for the wake word AND
-checks whether an announcement is due — the two things that can start a
-conversation. `wait_for_trigger` returns which one happened (or "restart"
-when something else — a phone approve — asked for one, or "reconfigure" when
-the microphone or speaker was changed and the idle mic must be reopened).
-`record_session` is the bookkeeping after a conversation: the session log,
-the journal, and reflection.
+While idle, the app watches every 80 ms mic frame for the wake word, reads
+the push-to-talk hotkey, and checks whether an announcement is due — the
+three things that can start a conversation. `wait_for_trigger` returns which
+one happened (or "restart" when something else — a phone approve — asked for
+one, or "reconfigure" when the microphone or speaker was changed and the idle
+mic must be reopened). `record_session` is the bookkeeping after a
+conversation: the session log, the journal, and reflection.
 """
 
 from __future__ import annotations
@@ -49,18 +49,19 @@ async def wait_for_trigger(
     convert: Callable[[bytes], bytes] | None = None,
     stall_s: float | None = None,
     on_score: Callable[[float, bool], None] | None = None,
+    ptt: Any = None,
 ) -> str:
-    """Block until the wake phrase is heard ("wake"), an announcement is
-    ready to be spoken ("announce"), a restart was requested ("restart"),
-    the audio devices changed ("reconfigure"), or no frame arrived for
-    `stall_s` seconds ("stalled" — an unplugged microphone gives no error,
-    only silence). `convert` turns a source frame into what the detector
-    expects (the session mic runs at 24 kHz, the wake model wants 16 kHz)
-    so one microphone serves idle and talk — and whatever he says right
-    after the wake phrase queues on that same stream and reaches the
-    session first. `on_score` sees every idle frame's wake score and
-    whether it fired — that is how the latency log times the wake and
-    keeps the near misses."""
+    """Block until the wake phrase is heard ("wake"), the push-to-talk hotkey
+    is held ("ptt"), an announcement is ready to be spoken ("announce"), a
+    restart was requested ("restart"), the audio devices changed
+    ("reconfigure"), or no frame arrived for `stall_s` seconds ("stalled" —
+    an unplugged microphone gives no error, only silence). `convert` turns a
+    source frame into what the detector expects (the session mic runs at
+    24 kHz, the wake model wants 16 kHz) so one microphone serves idle and
+    talk — and whatever he says right after the wake phrase queues on that
+    same stream and reaches the session first. `on_score` sees every idle
+    frame's wake score and whether it fired — that is how the latency log
+    times the wake and keeps the near misses."""
     while True:
         if stall_s is not None:
             try:
@@ -75,6 +76,8 @@ async def wait_for_trigger(
                 on_score(float(getattr(wake, "last_score", 0.0)), fired)
         if fired:
             return "wake"
+        if ptt is not None and ptt.held:
+            return "ptt"
         if announcer is not None and announcer.due():
             return "announce"
         if restart is not None and restart():

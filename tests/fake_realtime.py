@@ -6,7 +6,9 @@ answers the session handshake automatically and, for each `response.create`
 it receives, emits one audio delta and a `response.done` with no output —
 enough to exercise the engine's session lifecycle without a network. A
 scripted user turn is the real event order: speech_started, speech_stopped,
-then the finished transcription.
+then the finished transcription. `hold_response` leaves a reply open — she is
+still speaking — until the test calls `finish_response()`, which is how a
+barge-in gets something to cut into.
 
 Replay tests (tests/test_replay.py) want the timing to be theirs: set
 `auto_reply = False` and script every event by hand with `push`,
@@ -25,6 +27,10 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
+
+from assistant.engines.realtime_engine import FRAME_SAMPLES_24K, REALTIME_RATE
+
 
 class FakeConnection:
     def __init__(self) -> None:
@@ -37,6 +43,10 @@ class FakeConnection:
         # False: response.create is only recorded, never answered — the test
         # scripts every event itself, with its own delays between them.
         self.auto_reply = True
+        # When set, a reply starts but never finishes until the test calls
+        # finish_response() — the only way to hold the engine in "she is
+        # speaking" long enough to interrupt her on purpose.
+        self.hold_response = False
 
     async def send(self, event: dict[str, Any]) -> None:
         self.sent.append(event)
@@ -44,6 +54,8 @@ class FakeConnection:
             self._events.put_nowait(SimpleNamespace(type="session.updated"))
         elif event["type"] == "response.create" and self.auto_reply:
             self._reply("Heads up: the build finished.")
+            if self.hold_response:
+                return  # she is mid-sentence until the test says otherwise
             if self.say_after_response and not self._said:
                 self._said = True
                 self._events.put_nowait(SimpleNamespace(type="input_audio_buffer.speech_started"))
@@ -63,7 +75,8 @@ class FakeConnection:
         audio: bool = True,
     ) -> None:
         """One response: created, (audio, transcript,) done — with any
-        function calls listed on the done event, the way the server does it."""
+        function calls listed on the done event, the way the server does it.
+        Under `hold_response` the done event waits for `finish_response()`."""
         self._events.put_nowait(SimpleNamespace(type="response.created"))
         if audio:
             self._events.put_nowait(
@@ -77,6 +90,12 @@ class FakeConnection:
             self._events.put_nowait(
                 SimpleNamespace(type="response.output_audio_transcript.done", transcript=transcript)
             )
+        if self.hold_response:
+            return
+        self.finish_response(calls=calls)
+
+    def finish_response(self, *, calls: list[tuple[str, dict[str, Any]]] | None = None) -> None:
+        """End the reply the engine is waiting on (see `hold_response`)."""
         output = [
             SimpleNamespace(type="function_call", name=name, arguments=json.dumps(args), call_id=f"call_{i}")
             for i, (name, args) in enumerate(calls or [])
@@ -168,12 +187,39 @@ class FakeClient:
 class NeverMic:
     """A mic that never produces a frame (the announcement needs none)."""
 
+    drained = 0
+
     async def get_frame(self) -> bytes:
         await asyncio.sleep(3600)
         return b""
 
     def drain(self) -> None:
         pass
+
+
+class LoudMic:
+    """A 24 kHz mic that never stops talking — every frame is well clear of
+    the engine's silence floor, so a hold counts as speech."""
+
+    def __init__(self, amplitude: int = 8000, interval_s: float = 0.01) -> None:
+        t = np.arange(FRAME_SAMPLES_24K) / REALTIME_RATE
+        self._frame = (amplitude * np.sin(2 * np.pi * 440 * t)).astype(np.int16).tobytes()
+        self._interval = interval_s
+        self.drained = 0
+
+    async def get_frame(self) -> bytes:
+        await asyncio.sleep(self._interval)
+        return self._frame
+
+    def drain(self) -> None:
+        self.drained += 1
+
+
+class QuietRoomMic(LoudMic):
+    """The same mic in an empty room: frames arrive, none of them is speech."""
+
+    def __init__(self, interval_s: float = 0.01) -> None:
+        super().__init__(amplitude=0, interval_s=interval_s)
 
 
 class InstantSpeaker:
@@ -313,6 +359,7 @@ class DelayedSpeaker:
 class QuietUi:
     def __init__(self) -> None:
         self.notes: list[str] = []
+        self.interruptions = 0
 
     def note(self, message: str) -> None:
         self.notes.append(message)
@@ -322,6 +369,8 @@ class QuietUi:
     def user_partial(self, heard: str) -> None: ...
     def user_said(self, transcript: str) -> None: ...
     def assistant_said(self, transcript: str) -> None: ...
-    def interrupted(self) -> None: ...
+    def interrupted(self) -> None:
+        self.interruptions += 1
+
     def tool(self, name: str, result: str, is_error: bool) -> None: ...
     def error(self, message: str) -> None: ...
