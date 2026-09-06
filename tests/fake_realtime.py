@@ -241,8 +241,12 @@ class InstantSpeaker:
         self._played_ms = played_ms  # what played_ms() reports for any item
         self._drain_s = drain_s  # >0: pretend the audio takes this long to play out
 
+    tap = None  # the runner's session recording, when a test arms one
+
     def enqueue(self, pcm: bytes) -> None:
         self.chunks.append(pcm)
+        if self.tap is not None:
+            self.tap(pcm)
 
     def begin_item(self, item_id: str) -> None:
         if item_id and item_id != self.current_item:

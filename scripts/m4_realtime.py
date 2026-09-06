@@ -60,6 +60,7 @@ from assistant.panel import PanelOverrides, SettingsPanel
 from assistant.presence import Presence
 from assistant.push import PhoneActions, PhonePusher
 from assistant.receipts import ReceiptBook
+from assistant.recording import Recorder
 from assistant.routines import RoutineStore
 from assistant.scheduler import Scheduler
 from assistant.sessions import SessionLog
@@ -207,6 +208,7 @@ def build_engine(fake: bool):
     settings = load_settings()
     root = home_dir()  # .env, data/, logs/: the MAIN repo even when staged
     overrides = PanelOverrides(root / "data" / "panel.json")
+    recorder = Recorder(root / "data" / "recordings")  # opt-in session recordings, for debugging
     applied = overrides.apply(settings)  # voice / wake word chosen in the panel
     settings.require("openai_api_key")
     home = FakeHome() if fake else HomeAssistantClient(settings.ha_url, settings.ha_token)
@@ -360,6 +362,7 @@ def build_engine(fake: bool):
         log=lambda m: console.print(f"[dim]{m}[/dim]"),
         on_audio_change=apply_audio,
         on_refresh_devices=rescan_audio,
+        recorder=recorder,
     )
     engine = RealtimeEngine(
         api_key=settings.openai_api_key,
@@ -422,6 +425,7 @@ def build_engine(fake: bool):
     engine.fallbacks = fallbacks  # the runner's recovery path speaks too
     engine.acks = acks  # "Yes?" in her own voice, the instant the wake fires
     engine.panel = panel
+    engine.recorder = recorder  # "record this session": the tool opens one mid-conversation
     engine.latency = latency
     engine.overrides = overrides
     engine.audio_reconfigure = False  # set when the mic/speaker choice changes
@@ -659,6 +663,7 @@ async def one_cycle(
         audio = engine._audio = AudioIO(settings, rate=REALTIME_RATE, frame_samples=FRAME_SAMPLES_24K)
     latency = engine.latency  # the turn log; its stopwatch starts at the wake
     trace = None
+    wake_score = None
     quiet = False  # a periodic re-scan while on a fallback mic: repeat nothing unless it changed
     if getattr(engine, "audio_reconfigure", False) or not audio.is_open:
         engine.audio_reconfigure = False
@@ -682,6 +687,13 @@ async def one_cycle(
             status.configure(mic=audio.mic_in_use, speaker=audio.speaker_in_use)  # what she is really on
     mic, speaker = audio.mic, audio.speaker
     assert mic is not None and speaker is not None
+    recorder = getattr(engine, "recorder", None)
+    if recorder is not None:
+        # Always tapped, rarely writing: idle frames feed a three-second
+        # ring only while armed, and nothing at all reaches disk until a
+        # recording opens.
+        mic.tap = recorder.mic
+        speaker.tap = recorder.spoke
     # Something to say already? Skip the wait and speak. Otherwise IDLE:
     # wake-gate on the open mic (local, free, private) while watching the
     # announcement queue, the restart flag, the audio-change flag and stalls.
@@ -709,9 +721,10 @@ async def one_cycle(
             # The wake starts the stopwatch; the near misses (loud
             # enough to be someone trying, too quiet to fire) are
             # kept so the threshold can be argued from real audio.
-            nonlocal trace
+            nonlocal trace, wake_score
             if fired:
                 trace = latency.wake(score)
+                wake_score = score
             else:
                 latency.near_miss(score, settings.wake_threshold)
 
@@ -736,12 +749,26 @@ async def one_cycle(
     push = trigger == "ptt"
     if trace is None:
         trace = latency.wake(None)  # she opened this one: no wake word, no score
+    recording = ""
+    if recorder is not None:
+        # Armed from the panel or by voice: the timeline opens before the
+        # acknowledgment, with the three seconds of room before the wake.
+        recording = recorder.begin("announce" if announcing else "ptt" if push else "wake") or ""
+        if recording:
+            engine.tap = recorder.event
+            if trigger == "wake":
+                recorder.event(
+                    "wake", score=wake_score, threshold=settings.wake_threshold,
+                    effective=getattr(wake, "effective_threshold", None),
+                )
     if not announcing and cues is not None:
         # "Yes?" in her own voice (or the ding) through the stream already
         # open. Push to talk gets it the moment he presses, and the same
         # microphone keeps running, so the words he says while the socket is
         # still connecting are already queued for this session.
-        acknowledge(cues, getattr(engine, "acks", None), speaker, mic, trace)
+        spoken = acknowledge(cues, getattr(engine, "acks", None), speaker, mic, trace)
+        if recording:
+            recorder.event("acknowledged", seconds=round(spoken, 2))
     trace.stamp("mic_ready")  # both streams were open before the wake word
     session_wake.reset()
     if announcing:
@@ -768,6 +795,13 @@ async def one_cycle(
         await asyncio.wait_for(speaker.wait_idle(), timeout=3.0)
     if speaker.stalled:
         engine.audio_reconfigure = True  # the speaker stopped taking audio: reopen next cycle
+    if recorder is not None and recorder.active:
+        # (opened above, or mid-conversation by "record this session")
+        engine.tap = None
+        with contextlib.suppress(Exception):
+            summary = recorder.end(ended_by=stats.ended_by, transcript=stats.transcript, replied=stats.replied)
+            if summary:
+                say(status, f"recorded → data/recordings/{summary['name']} ({summary['duration_s']:.0f} s)", "dim")
     if trigger == "wake":
         # A wake nobody followed up counts against the detector; two in three
         # minutes (the vacuum cleaner) raise its bar for ten. A real one clears.

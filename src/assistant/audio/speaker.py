@@ -211,6 +211,8 @@ class Speaker:
                 self._stream.close()
             self._stream = None
 
+    tap: Callable[[bytes], None] | None = None  # a session recording: everything queued, as queued
+
     def enqueue(self, pcm: bytes) -> None:
         with self._lock:
             self._buffer.extend(pcm)
@@ -218,6 +220,9 @@ class Speaker:
             if self.current_item:
                 start, _end = self._items.get(self.current_item, (self._enqueued - len(pcm), 0))
                 self._items[self.current_item] = (start, self._enqueued)
+        if self.tap is not None:
+            with contextlib.suppress(Exception):
+                self.tap(pcm)
 
     def begin_item(self, item_id: str) -> None:
         """Audio for this assistant item starts here (idempotent for the same id)."""

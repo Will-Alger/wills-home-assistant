@@ -1425,6 +1425,23 @@ PANEL_TOOLS: list[dict[str, Any]] = [
         "description": "Re-scan the audio devices after something was just paired or plugged in.",
         "parameters": {"type": "object", "properties": {}},
     },
+    {
+        "type": "function",
+        "name": "start_recording",
+        "description": (
+            "Start recording sessions for debugging — 'record this session', "
+            "'start recording', 'record our conversations'. Both sides of the "
+            "audio and every turn-taking decision go to data/recordings, "
+            "browsable from the Settings panel. Stays on until stopped."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "stop_recording",
+        "description": "Stop recording sessions — 'stop recording'.",
+        "parameters": {"type": "object", "properties": {}},
+    },
 ]
 _PANEL_TOOL_NAMES = {tool["name"] for tool in PANEL_TOOLS}
 
@@ -1642,6 +1659,11 @@ class RealtimeEngine:
         self._latency = latency  # logs/turns.jsonl: how long each step took
         self._trace = TurnTrace()  # replaced per conversation; this one writes nothing
         self._panel = panel  # the desktop Settings panel she opens by voice
+        # A session recording (recording.py): the runner points `tap` at it
+        # while one is open, and every decision below lands on its timeline.
+        # None costs one attribute read per decision.
+        self.tap: Callable[..., None] | None = None
+        self.recorder: Any = None
         self.last_response_followup = False  # a tool ran: more audio is coming
         self._instructions_stale = False  # a preference changed mid-session
         # The last few tools she actually used — what "in play" means when
@@ -1931,6 +1953,7 @@ class RealtimeEngine:
             outcome = await self._run_tool(call_name, args)
             result_text, is_error = outcome.as_pair()
             self._trace.tool(call_name, time.monotonic() - call_started)
+            self._tap("tool", name=call_name, seconds=round(time.monotonic() - call_started, 3), ok=not is_error)
             self._tools_in_play.append(call_name)  # scopes the memory she gets
             tool_hook = getattr(self, "_ui_tool_hook", None)
             if tool_hook is not None:
@@ -2589,6 +2612,13 @@ class RealtimeEngine:
         self._pending_followups = []
         self._raised_followups = []
 
+    def _tap(self, kind: str, **fields: Any) -> None:
+        """One row on the session recording's timeline, when one is open."""
+        tap = self.tap
+        if tap is not None:
+            with contextlib.suppress(Exception):
+                tap(kind, **fields)
+
     def _execute_panel_tool(self, name: str, args: dict[str, Any] | None = None) -> tuple[str, bool]:
         args = args or {}
         if self._panel is None:
@@ -2598,6 +2628,17 @@ class RealtimeEngine:
                 return self._panel.open(), False
             if name == "close_settings_panel":
                 return self._panel.close(), False
+            if name == "start_recording":
+                text = self._panel.set_recording(True)
+                recorder = self.recorder
+                if recorder is not None and not recorder.active and recorder.begin("wake"):
+                    # from here, not from the next conversation: the mic and
+                    # speaker taps are already in place, the timeline starts now
+                    self.tap = recorder.event
+                    text += " — and this conversation is being recorded from here"
+                return text, False
+            if name == "stop_recording":
+                return self._panel.set_recording(False), False
             if name == "list_audio_devices":
                 return json.dumps(
                     {
@@ -2993,6 +3034,7 @@ class RealtimeEngine:
                 heard_ms = speaker.played_ms(item) if item and hasattr(speaker, "played_ms") else 0
                 speaker.clear()
                 self._trace.interrupted(time.monotonic() - heard_at)
+                self._tap("barge_in", how=how, heard_ms=heard_ms, item=item, cancelled=response_active)
                 if response_active:
                     await connection.send({"type": "response.cancel"})
                 if item and heard_ms > 0:
@@ -3050,6 +3092,10 @@ class RealtimeEngine:
                         return
                     possible_since = heard_at
                     speaker.pause()
+                    self._tap(
+                        "talk_over", what="hold", level=round(level), echo=round(levels.echo_level),
+                        threshold=round(levels.threshold()),
+                    )
                     if note_fn is not None:
                         note_fn(
                             f"possible interruption: mic {level:.0f} over echo "
@@ -3064,6 +3110,7 @@ class RealtimeEngine:
                     possible_since = None
                     await connection.send({"type": "input_audio_buffer.clear"})
                     speaker.resume()
+                    self._tap("talk_over", what="false alarm", level=round(level))
                     if note_fn is not None:
                         note_fn("false alarm — resuming")
 
@@ -3116,6 +3163,7 @@ class RealtimeEngine:
                         hot_after_commit = hot_after_commit + 1 if hot else 0
                         if hot_after_commit >= _STILL_TALKING_FRAMES:
                             fragment_cancelled = True
+                            self._tap("fragment_dropped", by="mic", level=round(level))
                             await connection.send({"type": "response.cancel"})
                             if self._cues is not None:
                                 self._cues.start(speaker, sound=False)  # still his turn: the window re-opens, silently
@@ -3134,7 +3182,11 @@ class RealtimeEngine:
                     if self._speech_gate and not ptt_active:
                         # The server hears speech or clean silence, never the
                         # room: a vacuum cleaner, the fridge, her own tail.
-                        if gate.update(level, heard_at, frame):
+                        was_open = gate.open
+                        passed = gate.update(level, heard_at, frame)
+                        if gate.open != was_open:
+                            self._tap("gate", open=gate.open, level=round(level), floor=round(gate.floor))
+                        if passed:
                             for held in gate.take_preroll():
                                 await send_audio(held)
                             await send_audio(frame)
@@ -3453,10 +3505,19 @@ class RealtimeEngine:
                         and not audio_in_response
                         and self._cues is not None
                     ):
+                        self._tap("turn_over_ding")
                         self._cues.turn_over(speaker)
+                    else:
+                        self._tap(
+                            "turn_over_ding_withheld",
+                            why="newer commit" if last_commit_at != commit_at
+                            else "fragment dropped" if fragment_cancelled
+                            else "she is answering",
+                        )
 
                 async def set_patience(patient: bool) -> None:
                     """Widen (or restore) how long the server waits for his turn to end."""
+                    self._tap("patience", patient=patient)
                     await connection.send(
                         {
                             "type": "session.update",
@@ -3477,6 +3538,7 @@ class RealtimeEngine:
                         if not audio_in_response:
                             levels.new_playback(time.monotonic())  # a reply starts: learn its echo
                             quiet_since = None  # she is heard: no working tick after this
+                            self._tap("audio_first", item=getattr(event, "item_id", "") or "")
                         speaking = True
                         audio_in_response = True
                         self._trace.audio_delta()
@@ -3485,6 +3547,7 @@ class RealtimeEngine:
                             begin(getattr(event, "item_id", "") or "")
                         speaker.enqueue(base64.b64decode(event.delta))
                     elif kind == "response.created":
+                        self._tap("response_created")
                         response_active = True
                         audio_in_response = False
                         fragment_cancelled = False
@@ -3501,6 +3564,7 @@ class RealtimeEngine:
                     elif kind.endswith("audio_transcript.done"):
                         said = getattr(event, "transcript", "")
                         stats.transcript.append(("alexa", said))
+                        self._tap("alexa_said", text=said)
                         ui.assistant_said(said)
                     elif kind == "conversation.item.input_audio_transcription.delta":
                         heard += getattr(event, "delta", "") or ""
@@ -3517,6 +3581,7 @@ class RealtimeEngine:
                             note_fn = getattr(ui, "note", None)
                             if note_fn is not None:
                                 note_fn("the transcriber echoed its vocabulary — that was noise, ignored")
+                            self._tap("vocabulary_echo", text=said, cancelled=response_active and not speaking)
                             if response_active and not speaking and not fragment_cancelled:
                                 fragment_cancelled = True
                                 await connection.send({"type": "response.cancel"})
@@ -3524,11 +3589,13 @@ class RealtimeEngine:
                         stats.transcript.append(("you", said))
                         stats.replied = True
                         user_turns += 1
+                        self._tap("you_said", text=said)
                         ui.user_said(said)
                         if is_thinking(said):
                             # patience: no clock closes the conversation for a
                             # while, and the server waits longer for his turn
                             thinking_until = time.monotonic() + _THINKING_S
+                            self._tap("thinking", text=said, seconds=_THINKING_S)
                             await set_patience(True)
                             note_fn = getattr(ui, "note", None)
                             if note_fn is not None:
@@ -3538,9 +3605,11 @@ class RealtimeEngine:
                             await set_patience(False)
                         if is_wrapup(said):
                             wrapup_heard = True  # the engine closes after her goodbye
+                            self._tap("wrapup", text=said)
                         if is_stop_command(said):
                             # Instant hard stop: no model round-trip, works even
                             # when background audio keeps the session alive.
+                            self._tap("stop_command", text=said)
                             speaker.clear()
                             if response_active:
                                 await connection.send({"type": "response.cancel"})
@@ -3550,6 +3619,7 @@ class RealtimeEngine:
                         if possible_since is not None and speaking:
                             # the server heard speech in the probe: a real
                             # interruption — stop her, his turn goes through
+                            self._tap("talk_over", what="confirmed", held_s=round(time.monotonic() - possible_since, 2))
                             await barge_in(time.monotonic(), "talk-over")
                         elif (
                             response_active
@@ -3563,6 +3633,7 @@ class RealtimeEngine:
                             # both pieces. (Had she started speaking, the
                             # talk-over path owns it.)
                             fragment_cancelled = True
+                            self._tap("fragment_dropped", by="server", since_commit_s=round(time.monotonic() - last_commit_at, 2))
                             await connection.send({"type": "response.cancel"})
                             if self._cues is not None:
                                 self._cues.start(speaker, sound=False)  # still his turn: the window re-opens, silently
@@ -3571,6 +3642,7 @@ class RealtimeEngine:
                                 note_fn("he kept talking — the reply to the fragment is dropped")
                         self._trace.speech_started()  # a new turn rolls the log row
                         speech_segments += 1
+                        self._tap("speech_started", segment=speech_segments, speaking=speaking)
                         if speech_segments > 1:
                             # they kept talking — it's a conversation now
                             command_pending = False
@@ -3589,8 +3661,10 @@ class RealtimeEngine:
                         # listening" ding here: a breath mid-sentence used to
                         # get one, and he thought she had quit on him.
                         self._trace.speech_stopped()
+                        self._tap("speech_stopped")
                     elif kind == "input_audio_buffer.committed":
                         last_commit_at = time.monotonic()
+                        self._tap("committed")
                         fragment_cancelled = False  # a new turn: the last fragment's fate is history
                         hot_after_commit = 0
                         # the listening flag drops now; the tone waits a beat, and
@@ -3599,6 +3673,7 @@ class RealtimeEngine:
                         if window_closed:
                             spawn(turn_over_ding(last_commit_at))  # only if nothing follows
                     elif kind == "response.done":
+                        self._tap("response_done", had_audio=audio_in_response)
                         response_active = False
                         # A tool may take a while (a search, a uv sync): the
                         # idle watchdog must not close the session under it, and
@@ -3608,6 +3683,7 @@ class RealtimeEngine:
                         spawn(after_response(event, user_turns, audio_in_response, speech_segments))
                     elif kind == "error":
                         message = str(getattr(event, "error", event))
+                        self._tap("error", message=message[:200])
                         if self._cues is not None and self._cues.listening:
                             # Only when he was mid-turn: a stale response.cancel
                             # after a barge-in is a protocol grumble, not a
@@ -3706,6 +3782,7 @@ class RealtimeEngine:
                     await asyncio.sleep(_NO_SPEECH_S)  # one more beat for a real transcript
                     if stats.replied or ended.is_set():
                         return
+                self._tap("nobody_spoke", segments=speech_segments, cancelled=response_active)
                 if response_active:
                     await connection.send({"type": "response.cancel"})
                 speaker.clear()
@@ -3720,6 +3797,7 @@ class RealtimeEngine:
                 await ended.wait()
                 if stats.ended_by == "unknown":
                     stats.ended_by = "end_conversation"
+                self._tap("session_over", by=stats.ended_by, replied=stats.replied, segments=speech_segments)
                 if stats.replied and opener_ids and self._announcer is not None:
                     # she opened with news and he answered: he heard it
                     self._announcer.mark_read(opener_ids)

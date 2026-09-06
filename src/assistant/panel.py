@@ -23,12 +23,14 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, ClassVar
 
 from assistant.config import wake_phrase
+from assistant.recording import SCRIPT, describe
 
 # The Realtime voices the API accepts (verified against the installed openai
 # SDK: RealtimeAudioConfigOutput), plus "sol" — Will's pick, still org-gated,
@@ -142,6 +144,9 @@ class SettingsPanel:
         on_audio_change: Callable[[str, str], None] | None = None,
         on_refresh_devices: Callable[[], None] | None = None,
         devices: Any | None = None,
+        recorder: Any | None = None,
+        player: Callable[[bytes, int], None] | None = None,
+        stopper: Callable[[], None] | None = None,
     ) -> None:
         self._status = status
         self._overrides = overrides
@@ -156,6 +161,10 @@ class SettingsPanel:
 
             devices = audio_devices
         self._devices = devices
+        self._recorder = recorder  # session recordings (recording.py), opt-in
+        self._player = player or _play_pcm
+        self._stopper = stopper or _stop_pcm
+        self._script_pos = 0  # the read-aloud test script: steps reached so far
         self._view: Any | None = None
 
     # ── opened and closed by voice ────────────────────────────────────────
@@ -228,6 +237,7 @@ class SettingsPanel:
         data["saved_wake_word"] = self._overrides.wake_model
         data["saved_microphone"] = self._overrides.microphone
         data["saved_speaker"] = self._overrides.speaker
+        data["recording"] = self.recording
         return data
 
     def meter(self) -> tuple[bool, float]:
@@ -342,6 +352,126 @@ class SettingsPanel:
         self.note("restart requested from the settings panel")
         self._restart()
         return "restarting — she's back in about fifteen seconds"
+
+    # ── session recordings ────────────────────────────────────────────────
+
+    @property
+    def recording(self) -> bool:
+        """Armed: every conversation from the next one is recorded."""
+        if self._recorder is None:
+            return False
+        try:
+            return bool(self._recorder.armed)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def set_recording(self, on: bool) -> str:
+        if self._recorder is None:
+            return "recording isn't wired up in this session"
+        self._recorder.arm(bool(on))
+        if on:
+            text = (
+                "recording sessions — both sides of the audio and every turn-taking "
+                "decision, in data/recordings, from the next conversation"
+            )
+        else:
+            text = "not recording sessions"
+            self._script_pos = 0
+        self.note(text)
+        return text
+
+    def recordings(self) -> list[dict[str, Any]]:
+        """Finished recordings, newest first — summary rows (see recording.py)."""
+        if self._recorder is None:
+            return []
+        try:
+            return list(self._recorder.list())
+        except Exception:  # noqa: BLE001 — a listing is never worth a crash
+            return []
+
+    def recording_note(self, name: str, text: str) -> str:
+        if self._recorder is None or not self._recorder.note(name, text):
+            return f"no recording called {name!r}"
+        return f"note saved on {name}"
+
+    def delete_recording(self, name: str) -> str:
+        if self._recorder is None or not self._recorder.delete(name):
+            return f"couldn't delete {name!r}"
+        self.note(f"deleted recording {name}")
+        return f"deleted {name}"
+
+    def open_recording(self, name: str) -> str:
+        folder = self._recorder.folder(name) if self._recorder is not None else None
+        if folder is None:
+            return f"no recording called {name!r}"
+        try:
+            os.startfile(str(folder))  # type: ignore[attr-defined]  # Explorer, on Windows
+        except (OSError, AttributeError) as err:
+            return f"couldn't open the folder: {err}"
+        return f"opened {folder}"
+
+    def play_recording(self, name: str, side: str = "mic") -> str:
+        """Play one side through the default output. She can hear it too:
+        her own name in the mic track will wake her unless he uses headphones."""
+        audio = self._recorder.audio(name, side) if self._recorder is not None else None
+        if audio is None:
+            return f"no {side} audio for {name!r}"
+        pcm, rate = audio
+        try:
+            self._player(pcm, rate)
+        except Exception as err:  # noqa: BLE001
+            return f"couldn't play it: {err}"
+        return f"playing the {side} side of {name} ({len(pcm) / (2 * rate):.0f} s) — headphones, or she hears it too"
+
+    def stop_playback(self) -> str:
+        with contextlib.suppress(Exception):
+            self._stopper()
+        return "stopped"
+
+    # ── the read-aloud test script ────────────────────────────────────────
+
+    def script(self) -> tuple[tuple[str, str], ...]:
+        return SCRIPT
+
+    def script_step(self) -> int:
+        """Steps reached so far (0 before the first click)."""
+        return self._script_pos
+
+    def next_step(self) -> tuple[int, str, str] | None:
+        """The owner reached the next step: stamp it into the recording
+        (arming the recorder if it was off) and return (n, say, expect);
+        None past the end."""
+        if self._script_pos >= len(SCRIPT):
+            return None
+        if self._recorder is not None and not self.recording:
+            self._recorder.arm(True)
+            self.note("recording sessions — the test script turned it on")
+        self._script_pos += 1
+        say, expect = SCRIPT[self._script_pos - 1]
+        if self._recorder is not None:
+            with contextlib.suppress(Exception):
+                self._recorder.step(self._script_pos, say)
+        self.note(f"test script, step {self._script_pos}: {say}")
+        return self._script_pos, say, expect
+
+    def restart_script(self) -> None:
+        self._script_pos = 0
+
+
+def _play_pcm(pcm: bytes, rate: int) -> None:
+    """The panel's play button: its own PortAudio stream, on the default
+    output, so it never touches the session's speaker."""
+    import numpy as np
+    import sounddevice as sd
+
+    sd.stop()
+    sd.play(np.frombuffer(pcm, dtype=np.int16), rate)
+
+
+def _stop_pcm() -> None:
+    import sounddevice as sd
+
+    sd.stop()
 
 
 # ── the Tk window ─────────────────────────────────────────────────────────
@@ -482,25 +612,215 @@ class _TkPanel:
         ttk.Button(buttons, text="Restart assistant", command=self._on_restart).pack(side="left")
         ttk.Button(buttons, text="Close", command=self._on_x).pack(side="left", padx=6)
 
+        # debugging her turn-taking: record sessions, browse them, read the script
+        debug = ttk.Frame(frame)
+        debug.grid(row=10, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        self._record = tk.BooleanVar(value=self._panel.recording)
+        ttk.Checkbutton(
+            debug, text="Record sessions", variable=self._record, command=self._on_record
+        ).pack(side="left")
+        ttk.Button(debug, text="Recordings…", command=self._open_recordings).pack(side="left", padx=6)
+        ttk.Button(debug, text="Test script…", command=self._open_script).pack(side="left")
+        self._rec_win: Any = None
+        self._script_win: Any = None
+
         self._message = ttk.Label(
             frame,
             text="Voice and wake word take effect on the next start; microphone and "
             "speaker on the next conversation. Just paired something? Refresh devices.",
             wraplength=520, justify="left",
         )
-        self._message.grid(row=10, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        self._message.grid(row=11, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
-        ttk.Label(frame, text="Live log").grid(row=11, column=0, sticky="w")
+        ttk.Label(frame, text="Live log").grid(row=12, column=0, sticky="w")
         self._feed = tk.Text(frame, height=14, width=64, wrap="none", state="disabled")
-        self._feed.grid(row=12, column=0, columnspan=3, sticky="nsew")
+        self._feed.grid(row=13, column=0, columnspan=3, sticky="nsew")
         scroll = ttk.Scrollbar(frame, orient="vertical", command=self._feed.yview)
-        scroll.grid(row=12, column=3, sticky="ns")
+        scroll.grid(row=13, column=3, sticky="ns")
         self._feed.configure(yscrollcommand=scroll.set)
-        frame.rowconfigure(12, weight=1)
+        frame.rowconfigure(13, weight=1)
         frame.columnconfigure(2, weight=1)
 
         self._refresh()
         self._tick_level()
+
+    # recordings (Tk thread)
+
+    def _on_record(self) -> None:
+        self._message.configure(text=self._panel.set_recording(bool(self._record.get())))
+
+    def _window_alive(self, win: Any) -> bool:
+        try:
+            return win is not None and bool(win.winfo_exists())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _open_recordings(self) -> None:
+        tk = self._tk
+        from tkinter import ttk
+
+        if self._window_alive(self._rec_win):
+            self._rec_win.lift()
+            self._reload_recordings()
+            return
+        win = tk.Toplevel(self._root)
+        win.title("Alexa — Recordings")
+        win.geometry("760x380")
+        self._rec_win = win
+        body = ttk.Frame(win, padding=10)
+        body.pack(fill="both", expand=True)
+        ttk.Label(
+            body,
+            text="Each recording: mic.wav (what she heard, from 3 s before the wake), "
+            "speaker.wav (what she played), events.jsonl (every decision, with the numbers) "
+            "and summary.json. Playback goes through the default speaker — she hears it too.",
+            wraplength=720, justify="left",
+        ).pack(anchor="w")
+        rows = ttk.Frame(body)
+        rows.pack(fill="both", expand=True, pady=6)
+        self._rec_list = tk.Listbox(rows, height=10, activestyle="dotbox")
+        self._rec_list.pack(side="left", fill="both", expand=True)
+        bar = ttk.Scrollbar(rows, orient="vertical", command=self._rec_list.yview)
+        bar.pack(side="right", fill="y")
+        self._rec_list.configure(yscrollcommand=bar.set)
+        buttons = ttk.Frame(body)
+        buttons.pack(anchor="w")
+        for label, fn in (
+            ("Open folder", lambda: self._rec_do(self._panel.open_recording)),
+            ("Play mic", lambda: self._rec_do(lambda n: self._panel.play_recording(n, "mic"))),
+            ("Play speaker", lambda: self._rec_do(lambda n: self._panel.play_recording(n, "speaker"))),
+            ("Stop", lambda: self._rec_say(self._panel.stop_playback())),
+            ("Note…", self._rec_note),
+            ("Delete", self._rec_delete),
+            ("Refresh", self._reload_recordings),
+        ):
+            ttk.Button(buttons, text=label, command=fn).pack(side="left", padx=(0, 6))
+        self._rec_message = ttk.Label(body, text="", wraplength=720, justify="left")
+        self._rec_message.pack(anchor="w", pady=(6, 0))
+        self._reload_recordings()
+
+    def _reload_recordings(self) -> None:
+        if not self._window_alive(self._rec_win):
+            return
+        self._rec_rows = self._panel.recordings()
+        self._rec_list.delete(0, "end")
+        for row in self._rec_rows:
+            self._rec_list.insert("end", describe(row))
+        if not self._rec_rows:
+            self._rec_list.insert("end", "(no recordings yet — tick Record sessions, then talk to her)")
+
+    def _rec_selected(self) -> str:
+        try:
+            index = self._rec_list.curselection()[0]
+            return str(self._rec_rows[index].get("name", ""))
+        except (IndexError, AttributeError):
+            return ""
+
+    def _rec_say(self, text: str) -> None:
+        with contextlib.suppress(Exception):
+            self._rec_message.configure(text=text)
+
+    def _rec_do(self, fn: Callable[[str], str]) -> None:
+        name = self._rec_selected()
+        self._rec_say(fn(name) if name else "pick a recording first")
+
+    def _rec_note(self) -> None:
+        from tkinter import simpledialog
+
+        name = self._rec_selected()
+        if not name:
+            self._rec_say("pick a recording first")
+            return
+        current = next((str(r.get("note", "")) for r in self._rec_rows if r.get("name") == name), "")
+        text = simpledialog.askstring(
+            "Note", "What happened? (e.g. 'cut me off after \"repaint the\"')",
+            parent=self._rec_win, initialvalue=current,
+        )
+        if text is None:
+            return
+        self._rec_say(self._panel.recording_note(name, text))
+        self._reload_recordings()
+
+    def _rec_delete(self) -> None:
+        from tkinter import messagebox
+
+        name = self._rec_selected()
+        if not name:
+            self._rec_say("pick a recording first")
+            return
+        if messagebox.askyesno("Delete", f"Delete recording {name}?", parent=self._rec_win):
+            self._rec_say(self._panel.delete_recording(name))
+            self._reload_recordings()
+
+    # the read-aloud test script (Tk thread)
+
+    def _open_script(self) -> None:
+        tk = self._tk
+        from tkinter import ttk
+
+        if self._window_alive(self._script_win):
+            self._script_win.lift()
+            return
+        win = tk.Toplevel(self._root)
+        win.title("Alexa — Test script")
+        win.geometry("640x340")
+        self._script_win = win
+        body = ttk.Frame(win, padding=10)
+        body.pack(fill="both", expand=True)
+        self._script_head = ttk.Label(body, text="", font=("TkDefaultFont", 11, "bold"))
+        self._script_head.pack(anchor="w")
+        ttk.Label(body, text="Say").pack(anchor="w", pady=(8, 0))
+        self._script_say = tk.Text(body, height=4, wrap="word", state="disabled")
+        self._script_say.pack(fill="x")
+        ttk.Label(body, text="What should happen").pack(anchor="w", pady=(8, 0))
+        self._script_expect = tk.Text(body, height=4, wrap="word", state="disabled")
+        self._script_expect.pack(fill="x")
+        buttons = ttk.Frame(body)
+        buttons.pack(anchor="w", pady=(10, 0))
+        ttk.Button(buttons, text="Next step", command=self._script_next).pack(side="left")
+        ttk.Button(buttons, text="Start over", command=self._script_restart).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Close", command=win.destroy).pack(side="left")
+        self._render_step()
+
+    def _script_set(self, widget: Any, text: str) -> None:
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("end", text)
+        widget.configure(state="disabled")
+
+    def _render_step(self, done: bool = False) -> None:
+        if not self._window_alive(self._script_win):
+            return
+        n = self._panel.script_step()
+        total = len(self._panel.script())
+        if done:
+            self._script_head.configure(text=f"Done — all {total} steps are stamped into the recording.")
+            self._script_set(self._script_say, "Untick Record sessions when you are finished, or leave it on.")
+            self._script_set(self._script_expect, "Open Recordings… to add a note about what went wrong, and play back the mic side.")
+            return
+        if n == 0:
+            self._script_head.configure(text=f"{total} steps. Click Next step as you reach each one.")
+            self._script_set(
+                self._script_say,
+                "Every click is stamped into the recording's timeline, so the events can be read "
+                "against the script. Recording turns itself on at the first click.",
+            )
+            self._script_set(self._script_expect, "Read the step, do it, watch what she does, click Next step.")
+            return
+        say, expect = self._panel.script()[n - 1]
+        self._script_head.configure(text=f"Step {n} of {total}")
+        self._script_set(self._script_say, say)
+        self._script_set(self._script_expect, expect)
+
+    def _script_next(self) -> None:
+        result = self._panel.next_step()
+        with contextlib.suppress(Exception):
+            self._record.set(self._panel.recording)
+        self._render_step(done=result is None)
+
+    def _script_restart(self) -> None:
+        self._panel.restart_script()
+        self._render_step()
 
     # callbacks (Tk thread)
 

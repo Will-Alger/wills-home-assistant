@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from collections.abc import Callable
 from typing import Self
 
 import sounddevice as sd
@@ -208,12 +209,17 @@ class Microphone:
         reach the session first. Only ever moves forward."""
         self._ignore_before = max(self._ignore_before, deadline)
 
+    tap: Callable[[bytes], None] | None = None  # a session recording: every frame delivered, raw
+
     async def get_frame(self) -> bytes:
         if self._stream is None:
             raise AudioSourceClosed
         while True:
             captured, frame = await self._queue.get()
             if captured >= self._ignore_before:
+                if self.tap is not None:
+                    with contextlib.suppress(Exception):
+                        self.tap(frame)
                 return frame
 
     def drain(self) -> None:
