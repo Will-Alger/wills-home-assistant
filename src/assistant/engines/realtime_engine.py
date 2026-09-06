@@ -141,6 +141,16 @@ scores, facts, "is the highway closed" — go to web_search: at most \
 named, no "okay, here's what I found". \
 If something is truly beyond your tools, say so honestly.
 
+Say what actually happened. A command tool tells you when only part of it \
+worked ("2 of 3 lights changed; the Bedroom Lamp did not respond") — pass \
+that on in your own words and say what you can do about it; never round it \
+up to "done". "Undo that", "no, put it back", "never mind" → undo_last: it \
+restores the lights you last changed, and when the last thing has no undo it \
+hands you the plain sentence saying so — read that out, don't apologise \
+around it. A change of mind is NOT an undo: "no, the bedroom", "keep the \
+brightness but make it blue" means ONE corrected set_lights aimed at the \
+entities in your working context below.
+
 Lights:
 {devices}
 
@@ -1069,7 +1079,7 @@ _TASK_TOOL_NAMES = {tool["name"] for tool in TASK_TOOLS}
 # these is a one-shot command — the engine closes it itself a few seconds
 # after the spoken confirmation, because the model cannot be trusted to.
 COMMAND_TOOLS = frozenset(
-    {"set_lights", "media_control", "play_music", "launch_app", "ha_call_service"}
+    {"set_lights", "media_control", "play_music", "launch_app", "ha_call_service", "undo_last"}
 )
 
 _RESTART_TOOL = {
@@ -1292,6 +1302,7 @@ class RealtimeEngine:
         cues: Any | None = None,
         panel: Any | None = None,
         latency: LatencyLog | None = None,
+        receipts: Any | None = None,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
         self._journal = journal  # what she did and saw, by day
@@ -1316,7 +1327,7 @@ class RealtimeEngine:
         # Proper names for the transcriber, warmed off the critical path.
         self.music_names = MusicNames(home)
         self._calendar = calendar
-        self._executor = ToolExecutor(home, calendar, web, routines)
+        self._executor = ToolExecutor(home, calendar, web, routines, receipts)
         self._scheduler = scheduler  # timers/alarms/scheduled actions
         self._routines = routines  # deterministic defaults on tool calls
         self._thinker = thinker  # slow reasoning; answers arrive as events
