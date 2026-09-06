@@ -76,6 +76,17 @@ def test_a_failure_never_looks_like_listening() -> None:
     assert any("would not open" in line for line in snapshot["log"])  # type: ignore[union-attr]
 
 
+def test_the_working_tick_says_working_without_claiming_to_listen() -> None:
+    """Under a slow tool the panel reads "working" — and the tick must not
+    leave anything believing a listening window is open."""
+    status = AssistantStatus()
+    cues, played = make_cues(status)
+    cues.working()
+    assert played == ["working"] and not cues.listening
+    snapshot = status.snapshot()
+    assert snapshot["state"] == "working" and snapshot["listening"] is False
+
+
 def test_session_end_chimes_once_and_reset_is_silent() -> None:
     cues, played = make_cues()
     cues.start()

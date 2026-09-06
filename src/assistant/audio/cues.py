@@ -3,6 +3,8 @@
 One ding when a listening window opens — the wake, and every follow-up turn
 in the same conversation — a smaller, falling one when it closes normally,
 and the low error tone when capture fails, times out, or the session errors.
+While she is off running a tool and the room would hear nothing at all, a
+soft low tick repeats (the engine decides when: realtime_engine.working_cue).
 A failure never plays the listening ding and clears the listening flag, so
 neither the tone nor the Settings panel can tell you she's listening when
 she isn't.
@@ -78,6 +80,13 @@ class VoiceCues:
         self._sound("listen_end", speaker)
         self._state("working")
         return True
+
+    def working(self, speaker: Any | None = None) -> None:
+        """She is away doing something and the room would otherwise be silent:
+        the soft tick, and the panel says "working". Never a listening window
+        — the flag is untouched, so a tick can't claim she is hearing you."""
+        self._sound("working", speaker)
+        self._state("working")
 
     def error(self, message: str = "", speaker: Any | None = None) -> None:
         """Capture failed, timed out, or the session errored."""
