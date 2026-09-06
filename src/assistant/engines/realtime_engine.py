@@ -2208,6 +2208,7 @@ class RealtimeEngine:
             user_turns = 0  # finished user transcripts so far (a tool learns what he said meanwhile)
             audio_in_response = False  # the current response produced speech
             farewell_pending = False  # end_conversation fired without a word: a goodbye was requested
+            deferred_close = False  # a close decided under a tool: it waits for the words
             session_started = time.monotonic()
 
             async def deliver(items: list[Any], *, opener: bool) -> None:
@@ -2383,6 +2384,7 @@ class RealtimeEngine:
                 listening: bool = True,
                 announced: list[int] | None = None,
                 opener: bool = False,
+                more_coming: bool = False,
             ) -> None:
                 nonlocal speaking
                 await speaker.wait_idle()
@@ -2402,9 +2404,11 @@ class RealtimeEngine:
                     elif not opener:
                         self._announcer.mark_read(announced)  # slipped into a live conversation: heard
                 self._trace.playback_done()
-                if (close_after or wrapup_heard) and not interrupted:
+                if (close_after or wrapup_heard) and not interrupted and not more_coming:
                     # (a barge-in during the audio keeps the session open: he
-                    # wanted to say something)
+                    # wanted to say something; and a tool whose answer is still
+                    # being generated has not spoken yet — closing on its
+                    # silent response would cut off the reply he is owed)
                     if wrapup_heard and not close_after:
                         stats.ended_by = "wrap-up"  # he said so; the model never called the tool
                     speaking = False
@@ -2439,7 +2443,7 @@ class RealtimeEngine:
                 what he says while a tool runs."""
                 nonlocal tool_busy, closing, last_activity, announcing, announcing_opener
                 nonlocal command_pending, quick_close_armed, quick_close_window, quick_close_reason
-                nonlocal farewell_pending
+                nonlocal farewell_pending, deferred_close
 
                 def late_note() -> str:
                     if user_turns <= turn_at_start:
@@ -2461,6 +2465,7 @@ class RealtimeEngine:
                     announcing = []
                     announcing_opener = False
                 ran = self.last_response_tools
+                more_coming = self.last_response_followup  # a tool's answer is on its way
                 if any(t in COMMAND_TOOLS for t in ran):
                     command_pending = True
                 elif not ran and segments_at_done <= 1:
@@ -2501,7 +2506,8 @@ class RealtimeEngine:
                     farewell_pending = False
                     closing = True
                     stats.ended_by = "end_conversation"
-                close_after = closing or wrapup_heard
+                close_after = closing or wrapup_heard or deferred_close
+                deferred_close = False
                 if wrapup_heard and not closing:
                     stats.ended_by = "wrap-up"
                 if announced_ids and announce and segments_at_done == 0 and not interrupted:
@@ -2516,12 +2522,18 @@ class RealtimeEngine:
                         # back to sleep as soon as the audio drains
                         stats.ended_by = "announcement delivered"
                         close_after = True
+                if close_after and more_coming:
+                    # The tool ran but she has not said a word yet: hold the
+                    # close for the answer she is about to give, and do not
+                    # lose the reason for it.
+                    deferred_close = True
                 spawn(
                     finish_playback(
                         close_after,
-                        listening=not self.last_response_followup,
+                        listening=not more_coming,
                         announced=announced_ids,
                         opener=opener_batch,
+                        more_coming=more_coming,
                     )
                 )
 
