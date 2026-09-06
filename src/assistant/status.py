@@ -30,6 +30,7 @@ class AssistantStatus:
         }
         self._state = "starting"
         self._listening = False
+        self._level = 0.0  # live mic level, 0..1, only while she is listening
         self._error = ""
         self._log: deque[tuple[float, str]] = deque(maxlen=keep_lines)
         self._started = time.time()
@@ -52,6 +53,15 @@ class AssistantStatus:
     def set_listening(self, on: bool) -> None:
         with self._lock:
             self._listening = bool(on)
+            if not self._listening:
+                self._level = 0.0  # the bar goes flat with the flag, not after it
+
+    def set_level(self, level: float) -> None:
+        """How loud the room is right now, 0 (flat) to 1 (full bar). Ignored
+        unless a listening window is open: a moving bar must never claim she
+        is hearing you when she isn't."""
+        with self._lock:
+            self._level = min(1.0, max(0.0, float(level))) if self._listening else 0.0
 
     def note(self, text: str) -> None:
         """One line for the live feed. Empty lines and repeats are dropped."""
@@ -67,6 +77,7 @@ class AssistantStatus:
         message = " ".join(str(message).split()) or "something went wrong"
         with self._lock:
             self._listening = False  # a failure must never look like listening
+            self._level = 0.0
             self._state = "error"
             self._error = message
         self.note(f"error: {message}")
@@ -77,6 +88,13 @@ class AssistantStatus:
     def listening(self) -> bool:
         with self._lock:
             return self._listening
+
+    @property
+    def level(self) -> float:
+        """The bar's height. Read many times a second by the panel, so it
+        stays a plain float behind the same lock — no snapshot needed."""
+        with self._lock:
+            return self._level
 
     def summary(self) -> str:
         with self._lock:
@@ -96,6 +114,7 @@ class AssistantStatus:
             fields["state"] = self._state
             fields["error"] = self._error
             fields["listening"] = self._listening
+            fields["level"] = self._level
         fields["summary"] = self.summary()
         fields["log"] = self.lines(log_lines)
         return fields

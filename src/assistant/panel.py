@@ -1,11 +1,11 @@
 """The Settings panel — a small desktop window she opens and closes by voice.
 
 It shows what the running session knows about itself (microphone, whether she
-is listening, voice, wake word, a status summary and a live log feed) and
-holds the two settings worth changing without a keyboard — her voice and her
-wake word — plus a restart button, because both only take effect on a fresh
-session. It is deliberately NOT a microphone switch: nothing in the panel
-turns listening on or off.
+is listening and how loud the room is while she does, voice, wake word, a
+status summary and a live log feed) and holds the two settings worth changing
+without a keyboard — her voice and her wake word — plus a restart button,
+because both only take effect on a fresh session. It is deliberately NOT a
+microphone switch: nothing in the panel turns listening on or off.
 
 The window is Tk (standard library, no new dependency) on its own thread, and
 every Tk call happens on that thread: the app posts intent through flags the
@@ -41,6 +41,10 @@ VOICES: tuple[str, ...] = (
 WAKE_MODELS: tuple[str, ...] = ("alexa", "hey_jarvis", "hey_mycroft", "hey_rhasspy")
 
 _REFRESH_S = 0.4
+_LEVEL_REFRESH_S = 0.1  # the level bar has its own tick: a meter, not a status line
+_METER_W, _METER_H = 120, 10  # pixels
+_METER_FILL = "#3f9a52"  # she is hearing you
+_METER_TROUGH = "#e9e9e9"
 
 
 class PanelUnavailable(RuntimeError):
@@ -224,6 +228,17 @@ class SettingsPanel:
         data["saved_speaker"] = self._overrides.speaker
         return data
 
+    def meter(self) -> tuple[bool, float]:
+        """(is she listening, how loud the room is — 0 flat to 1 full). The
+        two numbers the level bar redraws from, read many times a second and
+        so kept out of the full snapshot."""
+        if self._status is None:
+            return False, 0.0
+        try:
+            return bool(self._status.listening), float(self._status.level)
+        except Exception:  # noqa: BLE001 — a bar is never worth a crash
+            return False, 0.0
+
     def note(self, text: str) -> None:
         if self._status is not None:
             with contextlib.suppress(Exception):
@@ -395,8 +410,24 @@ class _TkPanel:
             )
         ):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=2)
-            value = ttk.Label(frame, text="…", wraplength=380, justify="left")
-            value.grid(row=row, column=1, columnspan=2, sticky="w", pady=2)
+            if key == "listening":
+                # the flag, and beside it the live level: the bar moves while
+                # she is hearing you and reads flat the moment she isn't
+                cell = ttk.Frame(frame)
+                cell.grid(row=row, column=1, columnspan=2, sticky="w", pady=2)
+                value = ttk.Label(cell, text="…")
+                value.pack(side="left")
+                self._meter = tk.Canvas(
+                    cell, width=_METER_W, height=_METER_H, bg=_METER_TROUGH,
+                    highlightthickness=1, highlightbackground="#b0b0b0",
+                )
+                self._meter.pack(side="left", padx=8)
+                self._meter_fill = self._meter.create_rectangle(
+                    0, 0, 0, _METER_H, fill=_METER_FILL, width=0
+                )
+            else:
+                value = ttk.Label(frame, text="…", wraplength=380, justify="left")
+                value.grid(row=row, column=1, columnspan=2, sticky="w", pady=2)
             self._values[key] = value
 
         snapshot = self._panel.snapshot()
@@ -466,6 +497,7 @@ class _TkPanel:
         frame.columnconfigure(2, weight=1)
 
         self._refresh()
+        self._tick_level()
 
     # callbacks (Tk thread)
 
@@ -492,6 +524,19 @@ class _TkPanel:
 
     def _on_x(self) -> None:
         self._closing.set()
+
+    def _tick_level(self) -> None:
+        """The bar's own tick, ten times a second — the frames arrive at
+        twelve and a half, and a meter that moved at the panel's 0.4 s pace
+        would not be a meter. Two numbers in, one rectangle out."""
+        if self._closing.is_set():
+            return  # _refresh owns the teardown
+        listening, level = self._panel.meter()
+        with contextlib.suppress(Exception):
+            self._meter.coords(
+                self._meter_fill, 0, 0, int(_METER_W * level) if listening else 0, _METER_H
+            )
+            self._root.after(int(_LEVEL_REFRESH_S * 1000), self._tick_level)
 
     def _refresh(self) -> None:
         if self._closing.is_set():
