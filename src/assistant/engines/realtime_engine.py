@@ -33,6 +33,7 @@ import numpy as np
 from openai import AsyncOpenAI
 from scipy.signal import resample_poly
 
+from assistant.brain.outcome import ToolOutcome, adapt
 from assistant.brain.tools import CALENDAR_TOOLS, TOOL_DEFINITIONS, ToolExecutor
 from assistant.calendar.base import CalendarApi, spoken_now
 from assistant.context import WorkingContext
@@ -143,6 +144,18 @@ scores, facts, "is the highway closed" — go to web_search: at most \
 "checking" before it, then the answer in a sentence or two with one source \
 named, no "okay, here's what I found". \
 If something is truly beyond your tools, say so honestly.
+
+Every tool answers in the same shape, and you act on its STATUS, never on \
+the wording. success: say the summary and move on. partial: some of it \
+worked and some did not — say which part failed, by name, and NEVER say \
+"done" or "all set". pending: it is underway, so say it's underway and carry \
+on; never claim it finished and never poll. unavailable: it could not be \
+done — say so plainly with the reason, no pretending and no blind retry. \
+needs_clarification: ask the question in the summary verbatim, then stop and \
+wait for the answer. The summary is the sentence to say (when it is data, \
+read the answer out of it); details are the facts behind it; follow_up is an \
+instruction for YOU and is never spoken; reversible says whether undo_last \
+could put it back.
 
 Say what actually happened. A command tool tells you when only part of it \
 worked ("2 of 3 lights changed; the Bedroom Lamp did not respond") — pass \
@@ -543,6 +556,26 @@ _SILENT_CALL = (
     " CALL THIS BEFORE SPEAKING: no 'let me check', no 'I'll pull that up' — "
     "the first thing said is the answer it returns."
 )
+
+_CLOSE_NOTE = (
+    "if this completes a one-shot request, confirm in a few words and call "
+    "end_conversation in this same response"
+)
+
+
+def _also(first: str, second: str) -> str:
+    """Two instructions for the model in one follow_up line."""
+    return f"{first.rstrip('. ')}. {second}" if first else second
+
+
+# Tools whose work carries on after the call returns: she says it is underway
+# and announces the result later — `pending`, never "done".
+_PENDING_TOOLS = frozenset(
+    {"think", "start_task", "revise_task", "answer_task", "approve_task", "switch_build"}
+)
+# How a tool refuses for want of the owner's explicit yes. The sentence is a
+# question to ask him, so the contract calls it needs_clarification.
+_NEEDS_A_YES = "not done: restate"
 
 # Read-only lookups are not journaled — the journal is what she DID, not
 # every glance she took.
@@ -1706,61 +1739,25 @@ class RealtimeEngine:
             except json.JSONDecodeError:
                 args = {}
             call_started = time.monotonic()
-            if call_name == "restart_self":
-                self.restart_requested = True
-                result_text, is_error = (
-                    (
-                        "restart armed — say a brief goodbye and end the conversation; "
-                        "you'll be back in about fifteen seconds"
-                    ),
-                    False,
-                )
-            elif call_name in _MEMORY_TOOL_NAMES:
-                result_text, is_error = self._execute_memory(call_name, args)
-            elif call_name in _TASK_TOOL_NAMES:
-                result_text, is_error = await self._execute_task_tool(call_name, args)
-            elif call_name in _SYSTEM_TOOL_NAMES:
-                result_text, is_error = self._execute_system_tool(call_name, args)
-            elif call_name == "confirm_action":
-                result_text, is_error = await self._execute_confirm_action(args)
-            elif call_name in _SCHEDULE_TOOL_NAMES:
-                result_text, is_error = self._execute_schedule_tool(call_name, args)
-            elif call_name in _FOLLOWUP_TOOL_NAMES:
-                result_text, is_error = self._execute_followup_tool(call_name, args)
-            elif call_name in _DELIVERY_TOOL_NAMES:
-                result_text, is_error = self._execute_delivery_tool(call_name, args)
-            elif call_name in _ROUTINE_TOOL_NAMES:
-                result_text, is_error = self._execute_routine_tool(call_name, args)
-            elif call_name in _WATCH_TOOL_NAMES:
-                result_text, is_error = self._execute_watch_tool(call_name, args)
-            elif call_name in _JOURNAL_TOOL_NAMES:
-                result_text, is_error = self._execute_journal_tool(call_name, args)
-            elif call_name in _PANEL_TOOL_NAMES:
-                result_text, is_error = self._execute_panel_tool(call_name, args)
-            elif call_name in _LATENCY_TOOL_NAMES:
-                result_text, is_error = self._execute_latency_tool(args)
-            elif call_name in _BRAIN_TOOL_NAMES:
-                self._live_transcript = stats.transcript
-                result_text, is_error = await self._execute_brain_tool(call_name, args)
-            else:
-                result_text, is_error = await self._executor.execute(call_name, args)
+            self._live_transcript = stats.transcript  # what think() reads the room from
+            outcome = await self._run_tool(call_name, args)
+            result_text, is_error = outcome.as_pair()
             self._trace.tool(call_name, time.monotonic() - call_started)
             self._tools_in_play.append(call_name)  # scopes the memory she gets
             tool_hook = getattr(self, "_ui_tool_hook", None)
             if tool_hook is not None:
                 tool_hook(call_name, result_text, is_error)
-            outcome = "ERROR: " if is_error else ""
-            stats.transcript.append((f"tool {call_name}", outcome + result_text[:200]))
+            flag = "ERROR: " if is_error else ""
+            stats.transcript.append((f"tool {call_name}", flag + result_text[:200]))
             if not is_error:
                 with contextlib.suppress(Exception):  # continuity never breaks a command
                     self._note_context(call_name, args, result_text)
-            payload: dict[str, Any] = {"error" if is_error else "result": result_text}
             applied = getattr(self._executor, "last_routines", [])
             if self._journal is not None and call_name not in _QUIET_TOOLS:
                 with contextlib.suppress(Exception):
                     self._journal.write(
                         "tool",
-                        f"{call_name}: {outcome}{result_text[:160]}",
+                        f"{call_name}: {flag}{result_text[:160]}",
                         source="voice",
                         data={
                             "args": args,
@@ -1769,16 +1766,15 @@ class RealtimeEngine:
                         },
                     )
             if applied and not is_error:
-                payload["routines_applied"] = applied
+                outcome.details["routines_applied"] = applied
             if call_name in COMMAND_TOOLS and not is_error:
                 # Decision-time nudge beats buried instructions: the engine's
                 # quick-close timer remains the backstop if this is ignored.
-                payload["note"] = (
-                    "if this completes a one-shot request, confirm in a few "
-                    "words and call end_conversation in this same response"
-                )
+                outcome.follow_up = _also(outcome.follow_up, _CLOSE_NOTE)
             elif call_name in _READ_TOOLS and not is_error:
-                payload["note"] = _READ_NOTE  # "Sure, today you have…", not "I have it now"
+                # "Sure, today you have…", not "I have it now"
+                outcome.follow_up = _also(outcome.follow_up, _READ_NOTE)
+            payload: dict[str, Any] = outcome.payload()
             since = late_note() if late_note is not None else ""
             if since:
                 payload["since"] = since  # he spoke while this ran: answer THAT
@@ -1810,6 +1806,58 @@ class RealtimeEngine:
         self.last_response_followup = bool(outputs) and not closing
         return closing
 
+    async def _run_tool(self, name: str, args: dict[str, Any]) -> ToolOutcome:
+        """One tool call, in the one shape every tool reports (brain/
+        outcome.py). The home tools already answer that way; the engine's own
+        still speak in (text, is_error) pairs and are ADAPTED here rather than
+        rewritten. The flag picks the status except where the engine knows
+        better: work that keeps running after the call is `pending`, and a
+        refusal for want of the owner's explicit yes is a question to ask
+        him, not a failure."""
+        if name == "restart_self":
+            self.restart_requested = True
+            return ToolOutcome(
+                "pending",
+                "restart armed — say a brief goodbye and end the conversation; "
+                "you'll be back in about fifteen seconds",
+            )
+        if name in _MEMORY_TOOL_NAMES:
+            pair = self._execute_memory(name, args)
+        elif name in _TASK_TOOL_NAMES:
+            pair = await self._execute_task_tool(name, args)
+        elif name in _SYSTEM_TOOL_NAMES:
+            pair = self._execute_system_tool(name, args)
+        elif name == "confirm_action":
+            pair = await self._execute_confirm_action(args)
+        elif name in _SCHEDULE_TOOL_NAMES:
+            pair = self._execute_schedule_tool(name, args)
+        elif name in _FOLLOWUP_TOOL_NAMES:
+            pair = self._execute_followup_tool(name, args)
+        elif name in _DELIVERY_TOOL_NAMES:
+            pair = self._execute_delivery_tool(name, args)
+        elif name in _ROUTINE_TOOL_NAMES:
+            pair = self._execute_routine_tool(name, args)
+        elif name in _WATCH_TOOL_NAMES:
+            pair = self._execute_watch_tool(name, args)
+        elif name in _JOURNAL_TOOL_NAMES:
+            pair = self._execute_journal_tool(name, args)
+        elif name in _PANEL_TOOL_NAMES:
+            pair = self._execute_panel_tool(name, args)
+        elif name in _LATENCY_TOOL_NAMES:
+            pair = self._execute_latency_tool(args)
+        elif name in _BRAIN_TOOL_NAMES:
+            pair = await self._execute_brain_tool(name, args)
+        else:
+            return await self._executor.run(name, args)
+        text, is_error = pair
+        status = ""
+        if is_error and text.startswith(_NEEDS_A_YES):
+            status = "needs_clarification"
+        elif not is_error and name in _PENDING_TOOLS:
+            # think answers on the spot when there is nobody to announce to.
+            status = "success" if name == "think" and self._announcer is None else "pending"
+        return adapt(text, is_error, status=status)
+
     def _note_context(self, name: str, args: dict[str, Any], result: str) -> None:
         """A tool succeeded: leave behind what "it", "that" or "a little
         dimmer" should bind to after this session closes (context.py). Only
@@ -1838,7 +1886,7 @@ class RealtimeEngine:
             if args.get("confirmed"):
                 return None
             return (
-                f"not done: restate the exact task to the owner and get an explicit "
+                f"{_NEEDS_A_YES} the exact task to the owner and get an explicit "
                 f"yes for {action}, then retry with confirmed=true"
             ), True
 

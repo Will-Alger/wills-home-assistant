@@ -111,13 +111,13 @@ async def test_read_tools_are_answered_in_one_breath(tmp_path) -> None:
 
     await engine._handle_response_done(connection, call("get_lights", {}), SessionStats())
     output = json.loads(next(e for e in connection.sent if e["type"] == "conversation.item.create")["item"]["output"])
-    assert "one breath" in output["note"] and "result" in output
+    assert "one breath" in output["follow_up"] and output["status"] == "success"
     connection.sent.clear()
     await engine._handle_response_done(
         connection, call("set_lights", {"changes": [{"target": "Hallway", "turn": "on"}]}), SessionStats()
     )
     output = json.loads(next(e for e in connection.sent if e["type"] == "conversation.item.create")["item"]["output"])
-    assert "end_conversation" in output["note"]
+    assert "end_conversation" in output["follow_up"]
     text = (await engine._session_config(None))["instructions"]
     assert "the function call comes FIRST" in text and "let me check your schedule" in text
     # the lookups themselves say so — the model weighs a tool's description above the prose
