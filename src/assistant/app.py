@@ -17,6 +17,8 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from assistant.context import pending_question, temporary_override
+
 
 class RescanClock:
     """While she is on a fallback microphone (the saved one unplugged, or the
@@ -88,12 +90,15 @@ async def record_session(
     row: Any,
     reflector: Any,
     timings: dict[str, Any] | None = None,
+    context: Any = None,
 ) -> Any | None:
     """Close the session's row, journal it, then let reflection add the
     one-line summary (its fallback is the first thing the owner said).
     Sequential on purpose: the row exists before the summary updates it.
     `timings` is the last turn's latency row, kept on the session so "how
-    fast were you?" never has to re-read the log."""
+    fast were you?" never has to re-read the log. `context` is the expiring
+    working context (context.py): the topic, an unanswered question and any
+    "just for tonight" rule outlive the close by half an hour."""
     first = next((text for role, text in stats.transcript if role == "you"), "")
     if sessions is not None and row is not None:
         with contextlib.suppress(Exception):
@@ -119,12 +124,35 @@ async def record_session(
                     "tools": list(stats.tool_calls)[:20],
                 },
             )
+    if context is not None:
+        with contextlib.suppress(Exception):
+            note_context(context, stats, first)
     if reflector is None:
         return None
-    return await reflect_session(reflector, sessions, row, stats)
+    return await reflect_session(reflector, sessions, row, stats, context)
 
 
-async def reflect_session(reflector: Any, sessions: Any, row: Any, stats: Any) -> Any | None:
+def note_context(context: Any, stats: Any, first: str) -> None:
+    """What this conversation leaves behind for the next one: the topic (the
+    first thing he said, until reflection replaces it with the summary), a
+    question of hers he never answered, and any "just for tonight" rule.
+    A session where she never spoke — an announcement nobody heard — leaves
+    an earlier pending question exactly where it was."""
+    context.note_topic(first)
+    if any(role == "alexa" for role, _ in stats.transcript):
+        asked = pending_question(stats.transcript)
+        if asked is None:
+            context.answered()
+        else:
+            context.ask(asked[0], asked[1])
+    for role, said in stats.transcript:
+        if role == "you" and (rule := temporary_override(said)):
+            context.note_override(rule)
+
+
+async def reflect_session(
+    reflector: Any, sessions: Any, row: Any, stats: Any, context: Any = None
+) -> Any | None:
     """Reflection is a Claude CLI call that takes seconds: the runner awaits
     it in the BACKGROUND, because while it ran in line the wake-word mic
     stayed closed and "hey alexa" right after a conversation went unheard."""
@@ -136,4 +164,7 @@ async def reflect_session(reflector: Any, sessions: Any, row: Any, stats: Any) -
     if summary and sessions is not None and row is not None:
         with contextlib.suppress(Exception):
             sessions.set_summary(row.id, summary)
+    if summary and context is not None:
+        with contextlib.suppress(Exception):
+            context.note_topic(summary)  # a better topic than his opening line
     return reflection

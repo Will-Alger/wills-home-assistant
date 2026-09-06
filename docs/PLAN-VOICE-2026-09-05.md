@@ -10,7 +10,7 @@
 | 3 receiver, playback, closing | done | `ad460cf` — supervised tasks, "since" note, delivered = played, farewell first |
 | 4 tentative interruption | done, tuning by ear | `762927d` — `REALTIME_TENTATIVE_INTERRUPT`, levels in the log |
 | 5 detection tuning | far_field live (`e50fa81`); `WAKE_THRESHOLD` 0.5→0.4 from two logged misses; task 14 vocabulary merged (`410f400`); task 10 awaits Will | |
-| 6 continuity | task 20 merged (`406a12b`: follow-ups retire on evidence, reads wait for playback); 21 working context building; 22 receipts and undo drafted | `raise_follow_up`, `tests/test_kept_promises.py` |
+| 6 continuity | task 20 merged (`406a12b`: follow-ups retire on evidence, reads wait for playback); 21 working context merged (`src/assistant/context.py`, `{context}` placeholder); 22 receipts and undo building | `raise_follow_up`, `tests/test_kept_promises.py`, `tests/test_context.py` |
 | 7 conversation quality | "let me think" patience state shipped (`c71f441`); 23 thinker jobs, 24 scoped memory, 25 tool contracts drafted | `is_thinking`, `_THINKING_S` |
 
 Board order from here, one build at a time: 20 → 21 → 22 → 23 → 24 → 25; task 16 (spoken reply rules) folds into 25's instructions pass; 11, 13, 15 when their phase data exists; 17, 18 deferred.
