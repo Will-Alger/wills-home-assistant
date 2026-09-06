@@ -446,6 +446,45 @@ _INJECT_QUIET_S = 2.0
 _INJECT_MIN_AGE_S = 3.0
 _WRAPUP_GRACE_S = 1.5  # after "that's all" with nothing playing: close, don't listen
 
+# Tentative talk-over on loudspeakers (docs/PLAN-VOICE-2026-09-05.md phase 4).
+_TENTATIVE_COOLDOWN_S = 0.8  # the first moments of a reply: learn her echo, never interrupt
+_ONSET_FRAMES = 3  # 80 ms frames above the threshold before playback is held (240 ms)
+_ECHO_FACTOR = 2.5  # the mic must rise this far above her own echo
+_QUIET_FACTOR = 4.0  # ...and above the room while nobody spoke
+_ABS_FLOOR = 400.0  # int16 RMS: below this nothing is speech at a desk mic
+_FALSE_ALARM_S = 1.5  # held this long with no server speech detection: resume
+
+
+def _rms(frame: bytes) -> float:
+    samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
+    return float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
+
+
+class _Levels:
+    """Mic level bookkeeping for tentative talk-over: the room while he can
+    talk freely, and her own echo during the first moments of each reply."""
+
+    def __init__(self) -> None:
+        self.quiet_level = 0.0
+        self.echo_level = 0.0
+        self._playback_started: float | None = None
+
+    def quiet(self, level: float) -> None:
+        self.quiet_level = level if not self.quiet_level else 0.95 * self.quiet_level + 0.05 * level
+
+    def new_playback(self, now: float) -> None:
+        self._playback_started = now
+        self.echo_level = 0.0
+
+    def calibrating(self, now: float) -> bool:
+        return self._playback_started is not None and now - self._playback_started < _TENTATIVE_COOLDOWN_S
+
+    def echo(self, level: float) -> None:
+        self.echo_level = max(self.echo_level, level)
+
+    def threshold(self) -> float:
+        return max(self.echo_level * _ECHO_FACTOR, self.quiet_level * _QUIET_FACTOR, _ABS_FLOOR)
+
 BRAIN_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -1191,6 +1230,7 @@ class RealtimeEngine:
         command_close_s: float = 8.0,
         info_close_s: float = 15.0,
         talk_over: bool = False,
+        tentative_interrupt: bool = False,
         eagerness: str = "high",
         extra_instructions: str = "",
         memory: MemoryStore | None = None,
@@ -1240,6 +1280,9 @@ class RealtimeEngine:
         self._info_close_s = info_close_s
         self.last_response_tools: list[str] = []  # set by _handle_response_done
         self._talk_over = talk_over  # headphones only: mic streams during playback
+        # Loudspeakers: while she talks, a sustained rise of the mic above her
+        # own echo pauses playback and probes the server for real speech.
+        self._tentative = tentative_interrupt
         self._eagerness = eagerness  # semantic VAD: how fast it decides you're done
         self._extra_instructions = extra_instructions
         self._memory = memory
@@ -2152,6 +2195,9 @@ class RealtimeEngine:
             opener_ids: list[int] = []  # everything spoken as an opener: read only if he replies
             interrupted = False  # wake-word barge-in cut THIS response (reset per response)
             wrapup_heard = False  # he said "that's all": close after her goodbye, tool or no tool
+            possible_since: float | None = None  # playback held for a possible talk-over since
+            levels = _Levels()  # the room's level, and her echo during each reply
+            onset: list[bytes] = []  # frames above the threshold, waiting to become an onset
             user_turns = 0  # finished user transcripts so far (a tool learns what he said meanwhile)
             audio_in_response = False  # the current response produced speech
             farewell_pending = False  # end_conversation fired without a word: a goodbye was requested
@@ -2220,52 +2266,110 @@ class RealtimeEngine:
                     return stats
                 await deliver(items, opener=True)
 
-            async def pump_mic() -> None:
-                nonlocal speaking, interrupted
+            async def send_audio(frame: bytes) -> None:
+                await connection.send(
+                    {
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(frame).decode("ascii"),
+                    }
+                )
+
+            async def barge_in(heard_at: float, how: str) -> None:
+                """He cut in — the wake phrase, or a confirmed talk-over: stop
+                her now, tell the server how much he heard, take his turn."""
+                nonlocal speaking, interrupted, possible_since
                 nonlocal quick_close_armed, quick_close_window, quick_close_reason
+                interrupted = True
+                possible_since = None
+                onset.clear()
+                item = getattr(speaker, "current_item", "")
+                heard_ms = speaker.played_ms(item) if item and hasattr(speaker, "played_ms") else 0
+                speaker.clear()
+                self._trace.interrupted(time.monotonic() - heard_at)
+                if response_active:
+                    await connection.send({"type": "response.cancel"})
+                if item and heard_ms > 0:
+                    # Over WebSocket the server has no idea how much he heard:
+                    # tell it, so the unheard tail (and its transcript) leaves
+                    # the model's memory.
+                    await connection.send(
+                        {
+                            "type": "conversation.item.truncate",
+                            "item_id": item,
+                            "content_index": 0,
+                            "audio_end_ms": heard_ms,
+                        }
+                    )
+                speaking = False
+                mic.drain()
+                ui.interrupted()
+                if how != "wake phrase":
+                    note_fn = getattr(ui, "note", None)
+                    if note_fn is not None:
+                        note_fn(f"interrupted by {how}")
+                if speech_segments == 0:
+                    # he cut into an announcement: give him the question
+                    # window to say something, then close — never hover for
+                    # the full idle timeout
+                    quick_close_armed = True
+                    quick_close_window = self._info_close_s
+                    quick_close_reason = "interrupted announcement"
+
+            async def consider(frame: bytes, heard_at: float) -> None:
+                """Tentative talk-over on loudspeakers. Her first moments of a
+                reply teach us her echo; a sustained rise above it HOLDS
+                playback (nothing is thrown away) and streams the mic to the
+                server. Its speech detection confirms — see the receiver —
+                or, within a bounded window, nothing does and she resumes
+                exactly where she paused, the probe audio cleared."""
+                nonlocal possible_since
+                level = _rms(frame)
+                note_fn = getattr(ui, "note", None)
+                if possible_since is None:
+                    if levels.calibrating(heard_at):
+                        levels.echo(level)
+                        onset.clear()
+                        return
+                    if level > levels.threshold():
+                        onset.append(frame)
+                    else:
+                        onset.clear()
+                    if len(onset) < _ONSET_FRAMES:
+                        return
+                    possible_since = heard_at
+                    speaker.pause()
+                    if note_fn is not None:
+                        note_fn(
+                            f"possible interruption: mic {level:.0f} over echo "
+                            f"{levels.echo_level:.0f} — holding"
+                        )
+                    for held in onset:
+                        await send_audio(held)
+                    onset.clear()
+                    return
+                await send_audio(frame)  # probing: the server's speech_started confirms
+                if heard_at - possible_since > _FALSE_ALARM_S:
+                    possible_since = None
+                    await connection.send({"type": "input_audio_buffer.clear"})
+                    speaker.resume()
+                    if note_fn is not None:
+                        note_fn("false alarm — resuming")
+
+            async def pump_mic() -> None:
                 while True:
                     frame = await mic.get_frame()
                     heard_at = time.monotonic()
                     if speaking and not self._talk_over:
                         # Half-duplex: don't feed our own voice back. But keep
-                        # watching for the wake phrase = instant barge-in.
+                        # watching for the wake phrase = instant barge-in, and
+                        # (on loudspeakers) for him simply talking over her.
                         if wake is not None and wake.detect(downsample_24k_to_16k(frame)):
-                            interrupted = True
-                            item = getattr(speaker, "current_item", "")
-                            heard_ms = speaker.played_ms(item) if item and hasattr(speaker, "played_ms") else 0
-                            speaker.clear()
-                            self._trace.interrupted(time.monotonic() - heard_at)
-                            if response_active:
-                                await connection.send({"type": "response.cancel"})
-                            if item and heard_ms > 0:
-                                # Over WebSocket the server has no idea how much
-                                # he heard: tell it, so the unheard tail (and its
-                                # transcript) leaves the model's memory.
-                                await connection.send(
-                                    {
-                                        "type": "conversation.item.truncate",
-                                        "item_id": item,
-                                        "content_index": 0,
-                                        "audio_end_ms": heard_ms,
-                                    }
-                                )
-                            speaking = False
-                            mic.drain()
-                            ui.interrupted()
-                            if speech_segments == 0:
-                                # he cut into an announcement: give him the
-                                # question window to say something, then close —
-                                # never hover for the full idle timeout
-                                quick_close_armed = True
-                                quick_close_window = self._info_close_s
-                                quick_close_reason = "interrupted announcement"
+                            await barge_in(heard_at, "wake phrase")
+                        elif self._tentative:
+                            await consider(frame, heard_at)
                         continue
-                    await connection.send(
-                        {
-                            "type": "input_audio_buffer.append",
-                            "audio": base64.b64encode(frame).decode("ascii"),
-                        }
-                    )
+                    levels.quiet(_rms(frame))  # the room, while he can talk freely
+                    await send_audio(frame)
 
             async def finish_playback(
                 close_after: bool,
@@ -2425,6 +2529,8 @@ class RealtimeEngine:
                     kind = event.type
                     last_activity = time.monotonic()
                     if kind.endswith("audio.delta") and "transcript" not in kind:
+                        if not audio_in_response:
+                            levels.new_playback(time.monotonic())  # a reply starts: learn its echo
                         speaking = True
                         audio_in_response = True
                         self._trace.audio_delta()
@@ -2464,6 +2570,10 @@ class RealtimeEngine:
                             stats.ended_by = "stop command"
                             ended.set()
                     elif kind == "input_audio_buffer.speech_started":
+                        if possible_since is not None and speaking:
+                            # the server heard speech in the probe: a real
+                            # interruption — stop her, his turn goes through
+                            await barge_in(time.monotonic(), "talk-over")
                         self._trace.speech_started()  # a new turn rolls the log row
                         speech_segments += 1
                         if speech_segments > 1:

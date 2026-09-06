@@ -299,6 +299,7 @@ def build_engine(fake: bool):
         command_close_s=settings.realtime_command_close_s,
         info_close_s=settings.realtime_info_close_s,
         talk_over=settings.realtime_talk_over,
+        tentative_interrupt=settings.realtime_tentative_interrupt,
         eagerness=settings.realtime_eagerness,
         extra_instructions=settings.assistant_extra_instructions,
         memory=memory,

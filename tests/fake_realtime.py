@@ -170,9 +170,33 @@ class InstantSpeaker:
     def clear(self) -> None:
         self.chunks.clear()
         self._drain_s = 0.0  # a barge-in: nothing left to play out
+        self.paused = False
+
+    paused = False
+    pauses = 0  # how often playback was held for a possible interruption
+    resumes = 0
+
+    def pause(self) -> None:
+        self.paused = True
+        self.pauses += 1
+
+    def resume(self) -> None:
+        self.paused = False
+        self.resumes += 1
 
     async def wait_idle(self, tail_s: float = 0.0) -> None:
-        await asyncio.sleep(self._drain_s)
+        # A paused speaker does not drain: only unpaused wall time counts.
+        # (Measured, not assumed: on Windows a short asyncio.sleep can return
+        # at once, so the loop must never count its own iterations.)
+        loop = asyncio.get_running_loop()
+        remaining = self._drain_s
+        last = loop.time()
+        while remaining > 0:
+            await asyncio.sleep(0.01)
+            now = loop.time()
+            if not self.paused:
+                remaining -= now - last
+            last = now
 
 
 class QuietUi:

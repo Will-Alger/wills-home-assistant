@@ -77,6 +77,7 @@ class Speaker:
         self.current_item = ""  # the assistant item whose audio is being enqueued
         self._last_callback = time.monotonic()
         self._marks: list[tuple[int, Callable[[], None]]] = []  # (byte position, callback)
+        self._paused = False
 
     @property
     def is_open(self) -> bool:
@@ -110,11 +111,29 @@ class Speaker:
             with contextlib.suppress(Exception):
                 fn()
 
+    def pause(self) -> None:
+        """Hold playback where it is (a possible interruption): the callback
+        plays silence, the audio waits, played_ms stops moving."""
+        with self._lock:
+            self._paused = True
+
+    def resume(self) -> None:
+        """A false alarm: carry on from the paused position."""
+        with self._lock:
+            self._paused = False
+
+    @property
+    def paused(self) -> bool:
+        with self._lock:
+            return self._paused
+
     def _consume(self, need: int) -> bytes:
         """The callback's read: the next `need` bytes, silence-padded."""
         self._last_callback = time.monotonic()
         due: list[Callable[[], None]] = []
         with self._lock:
+            if self._paused:
+                return b"\x00" * need
             chunk = bytes(self._buffer[:need])
             del self._buffer[: len(chunk)]
             self._consumed += len(chunk)
@@ -230,6 +249,7 @@ class Speaker:
             dropped = len(self._buffer)
             self._buffer.clear()
             self._enqueued -= dropped
+            self._paused = False
             self._marks = [(pos, fn) for pos, fn in self._marks if pos < self._enqueued]
             if self.current_item in self._items:
                 start, end = self._items[self.current_item]

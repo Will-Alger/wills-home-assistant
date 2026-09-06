@@ -172,6 +172,12 @@ class Settings(BaseSettings):
     # True talk-over (interrupt by just speaking). ONLY with headphones — on
     # open speakers the mic hears the assistant and it interrupts itself.
     realtime_talk_over: bool = False
+    # Loudspeaker talk-over, tentatively: while she speaks, a sustained rise of
+    # the mic above her own echo pauses playback and streams the mic to the
+    # server; its speech detection confirms (she stops, your turn) or, within
+    # 1.5 s, nothing does and she resumes where she paused. The wake phrase
+    # still interrupts instantly. Turn off if the room makes her stall.
+    realtime_tentative_interrupt: bool = True
 
     # Milestone 6: Apple Calendar over iCloud CalDAV. The password MUST be an
     # app-specific one (appleid.apple.com); the Apple ID password is rejected.
