@@ -626,6 +626,9 @@ _WRAPUP_GRACE_S = 1.5  # after "that's all" with nothing playing: close, don't l
 _WORKING_CUE_AFTER_S = 2.0
 _WORKING_CUE_EVERY_S = 6.0
 _THINKING_S = 30.0  # after "let me think": no clock closes the conversation, VAD waits longer
+# The server ended his turn and he spoke again within this long, before she
+# said anything: one sentence split at a pause, not two turns.
+_CONTINUATION_S = 1.2
 
 # Tentative talk-over on loudspeakers (docs/PLAN-VOICE-2026-09-05.md phase 4).
 _TENTATIVE_COOLDOWN_S = 0.8  # the first moments of a reply: learn her echo, never interrupt
@@ -2766,6 +2769,7 @@ class RealtimeEngine:
             interrupted = False  # wake-word barge-in cut THIS response (reset per response)
             wrapup_heard = False  # he said "that's all": close after her goodbye, tool or no tool
             thinking_until = 0.0  # "let me think": patient until this moment
+            last_commit_at = -1e9  # when the server last ended his turn (a fragment is one that ends early)
             possible_since: float | None = None  # playback held for a possible talk-over since
             levels = _Levels()  # the room's level, and her echo during each reply
             meter = LevelMeter()  # the same frames, smoothed, for the panel's bar
@@ -3280,7 +3284,7 @@ class RealtimeEngine:
                 nonlocal speech_segments, command_pending, quick_close_armed
                 nonlocal quick_close_window, quick_close_reason, announcing, announcing_opener
                 nonlocal tool_busy, interrupted, wrapup_heard, user_turns, audio_in_response
-                nonlocal thinking_until, quiet_since, working_ticks
+                nonlocal thinking_until, quiet_since, working_ticks, last_commit_at
                 heard = ""  # live accumulation of the user's words
 
                 async def set_eagerness(value: str) -> None:
@@ -3364,6 +3368,20 @@ class RealtimeEngine:
                             # the server heard speech in the probe: a real
                             # interruption — stop her, his turn goes through
                             await barge_in(time.monotonic(), "talk-over")
+                        elif (
+                            response_active
+                            and not speaking
+                            and time.monotonic() - last_commit_at < _CONTINUATION_S
+                        ):
+                            # The server ended his turn at a pause and he kept
+                            # going before she said a word: that was one sentence.
+                            # Drop the reply to the fragment; the next reply sees
+                            # both pieces. (Had she started speaking, the
+                            # talk-over path owns it.)
+                            await connection.send({"type": "response.cancel"})
+                            note_fn = getattr(ui, "note", None)
+                            if note_fn is not None:
+                                note_fn("he kept talking — the reply to the fragment is dropped")
                         self._trace.speech_started()  # a new turn rolls the log row
                         speech_segments += 1
                         if speech_segments > 1:
@@ -3379,9 +3397,15 @@ class RealtimeEngine:
                             ui.interrupted()
                         ui.user_speaking()
                     elif kind == "input_audio_buffer.speech_stopped":
+                        # The server noticed a pause. It has NOT decided the turn
+                        # is over — that is `committed` — so no "stopped
+                        # listening" ding here: a breath mid-sentence used to
+                        # get one, and he thought she had quit on him.
                         self._trace.speech_stopped()
+                    elif kind == "input_audio_buffer.committed":
+                        last_commit_at = time.monotonic()
                         if self._cues is not None:
-                            self._cues.end(speaker)
+                            self._cues.end(speaker)  # his turn really ended
                     elif kind == "response.done":
                         response_active = False
                         # A tool may take a while (a search, a uv sync): the

@@ -43,6 +43,10 @@ class FakeConnection:
         # False: response.create is only recorded, never answered — the test
         # scripts every event itself, with its own delays between them.
         self.auto_reply = True
+        # True: a response.cancel is answered with the cancelled response's
+        # done event, as the server does (off by default: older scripts count
+        # their done events by hand).
+        self.ack_cancel = False
         # When set, a reply starts but never finishes until the test calls
         # finish_response() — the only way to hold the engine in "she is
         # speaking" long enough to interrupt her on purpose.
@@ -52,6 +56,11 @@ class FakeConnection:
         self.sent.append(event)
         if event["type"] == "session.update":
             self._events.put_nowait(SimpleNamespace(type="session.updated"))
+        elif event["type"] == "response.cancel" and self.ack_cancel:
+            # the server answers a cancel with a done event for the cancelled response
+            self._events.put_nowait(
+                SimpleNamespace(type="response.done", response=SimpleNamespace(output=[], usage=None))
+            )
         elif event["type"] == "response.create" and self.auto_reply:
             self._reply("Heads up: the build finished.")
             if self.hold_response:
@@ -60,6 +69,7 @@ class FakeConnection:
                 self._said = True
                 self._events.put_nowait(SimpleNamespace(type="input_audio_buffer.speech_started"))
                 self._events.put_nowait(SimpleNamespace(type="input_audio_buffer.speech_stopped"))
+                self._events.put_nowait(SimpleNamespace(type="input_audio_buffer.committed"))
                 self._events.put_nowait(
                     SimpleNamespace(
                         type="conversation.item.input_audio_transcription.completed",
@@ -119,6 +129,7 @@ class FakeConnection:
         tool-only response with no speech."""
         self._events.put_nowait(SimpleNamespace(type="input_audio_buffer.speech_started"))
         self._events.put_nowait(SimpleNamespace(type="input_audio_buffer.speech_stopped"))
+        self._events.put_nowait(SimpleNamespace(type="input_audio_buffer.committed"))  # the turn ended
         self._events.put_nowait(
             SimpleNamespace(
                 type="conversation.item.input_audio_transcription.completed", transcript=text

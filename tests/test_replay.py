@@ -117,6 +117,7 @@ def owner_says(conn: FakeConnection, text: str) -> None:
     """The real event order for a finished user turn."""
     conn.push("input_audio_buffer.speech_started")
     conn.push("input_audio_buffer.speech_stopped")
+    conn.push("input_audio_buffer.committed")  # the server ended his turn (the ding plays here)
     conn.push("conversation.item.input_audio_transcription.completed", transcript=text)
 
 
@@ -218,6 +219,7 @@ async def test_a_wrapup_arriving_a_second_late_still_closes_without_a_listening_
         await asyncio.sleep(0.1)
         conn.push("input_audio_buffer.speech_started")
         conn.push("input_audio_buffer.speech_stopped")
+        conn.push("input_audio_buffer.committed")
         she_says(conn, "Anything else I can do?", ms=1600)
         await asyncio.sleep(1.0)  # a full second after response.done
         conn.push("conversation.item.input_audio_transcription.completed", transcript="that's all")
