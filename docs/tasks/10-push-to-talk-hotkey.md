@@ -19,3 +19,7 @@ A second way to talk to her beside the wake word: hold a keyboard shortcut and s
 
 ## Out of scope
 A phone button or a physical satellite button (later tasks). Changing the wake word path.
+
+## Revision 2 — 2026-09-06
+
+Main has moved a long way since you built this: one persistent microphone and speaker across idle and talk (src/assistant/audio/io.py, AudioIO), a supervised receiver where everything after response.done runs as a task, a tentative talk-over state machine in pump_mic, per-item playback accounting and conversation.item.truncate, a latency log (src/assistant/latency.py, TurnTrace), and the outcome contract (src/assistant/brain/outcome.py). Merge main into your branch (git merge main), resolve every conflict so BOTH behaviours survive — push-to-talk must open its session on the already-open AudioIO streams instead of opening its own, and its turn_detection null session must still get the noise_reduction and transcription prompt settings — then make ruff and the full test suite green. Do not change what push-to-talk does; only integrate it. Summarise exactly which conflicts you resolved and how.
