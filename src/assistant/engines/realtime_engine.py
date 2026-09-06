@@ -507,6 +507,7 @@ class _Levels:
     def __init__(self) -> None:
         self.quiet_level = 0.0
         self.echo_level = 0.0
+        self.noted = False
         self._playback_started: float | None = None
 
     def quiet(self, level: float) -> None:
@@ -515,6 +516,7 @@ class _Levels:
     def new_playback(self, now: float) -> None:
         self._playback_started = now
         self.echo_level = 0.0
+        self.noted = False  # the "armed" line is printed once per reply
 
     def calibrating(self, now: float) -> bool:
         return self._playback_started is not None and now - self._playback_started < _TENTATIVE_COOLDOWN_S
@@ -2506,6 +2508,14 @@ class RealtimeEngine:
                         levels.echo(level)
                         onset.clear()
                         return
+                    if not levels.noted:
+                        # once per reply: the numbers the thresholds are tuned from
+                        levels.noted = True
+                        if note_fn is not None:
+                            note_fn(
+                                f"talk-over armed: echo {levels.echo_level:.0f}, room "
+                                f"{levels.quiet_level:.0f}, threshold {levels.threshold():.0f}"
+                            )
                     if level > levels.threshold():
                         onset.append(frame)
                     else:
