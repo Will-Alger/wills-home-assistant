@@ -13,7 +13,7 @@
 | 6 continuity | task 20 merged (`406a12b`: follow-ups retire on evidence, reads wait for playback); 21 working context merged (`src/assistant/context.py`, `{context}` placeholder); 22 receipts and undo merged (`src/assistant/receipts.py`, `undo_last`, per-bulb outcomes) | `raise_follow_up`, `tests/test_kept_promises.py`, `tests/test_context.py`, `tests/test_receipts.py` |
 | 7 conversation quality | "let me think" patience state shipped (`c71f441`); 23 thinker jobs building; 24 scoped memory, 25 tool contracts drafted | `is_thinking`, `_THINKING_S` |
 
-Board order from here, one build at a time: 20 → 21 → 22 → 23 → 24 → 25; task 16 (spoken reply rules) folds into 25's instructions pass; 11, 13, 15 when their phase data exists; 17, 18 deferred.
+Board order from here, one build at a time (2026-09-06 morning): 23 (resumed after the usage cap) → 24 → 25 → **10 revised** ("main moved: persistent AudioIO, supervised receiver, tentative talk-over — merge main into the branch, resolve, tests green"; eleven files overlap, so its agent rebases rather than a blind hand merge) → 13 spoken fallbacks → 11 working cue → 15 level meter; task 16 folds into 25; 17, 18 deferred. Will's voice tests remain the acceptance gate for 10.
 
 2026-09-05, 12:46. Inputs reconciled: `wills-home-assistant-audit.md` (ChatGPT Astra, 11
 findings + a 7-step delivery order + an 18-item voice acceptance script),
