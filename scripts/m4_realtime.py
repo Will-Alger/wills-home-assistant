@@ -59,6 +59,7 @@ from assistant.scheduler import Scheduler
 from assistant.sessions import SessionLog
 from assistant.status import AssistantStatus
 from assistant.tasks import TaskBoard
+from assistant.thoughts import ThoughtBook
 from assistant.wake.detector import WakeDetector
 from assistant.web import WebSearch
 
@@ -239,6 +240,7 @@ def build_engine(fake: bool):
     watches = WatchStore(root / "data" / "watches.json")
     routines = RoutineStore(root / "data" / "routines.json")
     receipts = ReceiptBook(root / "data" / "receipts.json")
+    thoughts = ThoughtBook(root / "data" / "thoughts.json")
     scheduler = Scheduler(root / "data" / "schedule.json", announcer=announcer, journal=journal)
     followups = FollowUpStore(root / "data" / "followups.json", announcer=announcer, journal=journal)
     thinker = None
@@ -313,6 +315,7 @@ def build_engine(fake: bool):
         usage_log=root / ".usage.jsonl",
         announcer=announcer,
         thinker=thinker,
+        thoughts=thoughts,
         watches=watches,
         scheduler=scheduler,
         routines=routines,

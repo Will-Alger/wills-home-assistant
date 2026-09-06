@@ -39,6 +39,8 @@ from assistant.home.base import HomeApi, device_table, media_table
 from assistant.latency import LatencyLog, TurnTrace, latency_report, since_label
 from assistant.memory import MemoryStore
 from assistant.tasks import TaskBoard
+from assistant.thoughts import ThoughtBook
+from assistant.thoughts import announcement as thought_announcement
 from assistant.vocabulary import MusicNames, vocabulary
 
 _STOP_COMMAND = re.compile(
@@ -267,10 +269,18 @@ manage them. Normal watches wait out quiet hours; say urgent=true only when \
 
 Thinking: you have a slower, deeper mind. For questions that deserve real \
 thought — plans, comparisons, tradeoffs, "help me think through…", advice \
-you might get wrong off the cuff — call think with the full question, tell \
-{owner} you're thinking it over, and carry on; the answer arrives as an \
-EVENT within a minute or two and you say it in your own words. Never think \
-for home commands or simple facts (those are yours, instantly).
+you might get wrong off the cuff — call think with the full question and a \
+short topic, tell {owner} you're thinking it over, and carry on; the answer \
+arrives as an EVENT within a minute or two and you say it in your own \
+words. Never think for home commands or simple facts (those are yours, \
+instantly). If he changes the premise while one is running — "actually, \
+assume I wait a year" — do NOT wait for the old answer and do NOT tell him \
+to hold on: call think again straight away with the revised question and \
+the SAME topic. That supersedes the old job, whose answer is then never \
+spoken, and the new answer arrives asking you to open with a short bridge \
+naming what changed ("With the extra year in mind…") — say that bridge. \
+list_thoughts shows what is running, done, superseded or cancelled; \
+cancel_thought stops one he no longer wants.
 
 Announcements: a conversation may begin with an EVENT from your own system \
 (a build finished, a progress milestone, a rollback) rather than with the \
@@ -473,7 +483,7 @@ _QUIET_TOOLS = frozenset(
         "get_lights", "search_entities", "get_entity", "browse_music", "list_memories",
         "list_tasks", "task_detail", "search_tasks", "web_search", "list_notifications",
         "announcement_history", "journal_search", "recent_conversations", "read_roadmap",
-        "read_history", "project_status", "show_me", "think", "list_watches",
+        "read_history", "project_status", "show_me", "think", "list_watches", "list_thoughts",
         "list_schedule", "list_routines", "list_calendar_events", "latency_report",
     }
 )
@@ -534,15 +544,50 @@ BRAIN_TOOLS: list[dict[str, Any]] = [
             "reasoning (a slower frontier model with your memory, your task "
             "board and this conversation as context): plans, comparisons, "
             "tradeoffs, advice, anything you might get wrong off the cuff. "
-            "Returns at once — tell the owner you're thinking it over and "
-            "keep talking; the answer arrives on its own within a minute or "
-            "two as an EVENT you then say in your own words. Never for home "
-            "commands or simple facts."
+            "Returns at once with a thought id — tell the owner you're "
+            "thinking it over and keep talking; the answer arrives on its own "
+            "within a minute or two as an EVENT you then say in your own "
+            "words. If he changes the premise while it runs ('actually, "
+            "assume I wait a year'), call think AGAIN with the revised "
+            "question and the same topic: the old job is superseded and its "
+            "answer is never spoken. Never for home commands or simple facts."
         ),
         "parameters": {
             "type": "object",
-            "properties": {"question": {"type": "string", "description": "the question, in full"}},
+            "properties": {
+                "question": {"type": "string", "description": "the question, in full"},
+                "topic": {
+                    "type": "string",
+                    "description": (
+                        "one short line naming the subject ('buying a bike') — reuse "
+                        "the SAME topic when he revises the question"
+                    ),
+                },
+            },
             "required": ["question"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "list_thoughts",
+        "description": (
+            "The questions you have handed to your deeper reasoning: id, "
+            "topic, status (running, done, superseded, cancelled) and when "
+            "each was asked. Use it for 'are you still thinking about that?'"
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "cancel_thought",
+        "description": (
+            "Stop a running think: 'never mind', 'forget that question'. Its "
+            "answer is never spoken. Get the id from list_thoughts."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"id": {"type": "integer", "description": "the thought id"}},
+            "required": ["id"],
         },
     },
 ]
@@ -1290,6 +1335,7 @@ class RealtimeEngine:
         announcer: Any | None = None,
         web: Any | None = None,
         thinker: Any | None = None,
+        thoughts: Any | None = None,
         watches: Any | None = None,
         scheduler: Any | None = None,
         routines: Any | None = None,
@@ -1331,8 +1377,15 @@ class RealtimeEngine:
         self._scheduler = scheduler  # timers/alarms/scheduled actions
         self._routines = routines  # deterministic defaults on tool calls
         self._thinker = thinker  # slow reasoning; answers arrive as events
+        # Every think is a job with an id, a topic and a status. Without a
+        # path it is memory-only, so ids and supersession still work.
+        self._thoughts = thoughts if thoughts is not None else ThoughtBook()
         self._watches = watches  # WatchStore: standing rules on the house
         self._thinking: list[asyncio.Task] = []
+        # Which conversation is open right now (0 = none). A thought answer
+        # is urgent only while the conversation that asked it is still live.
+        self._conversations = 0
+        self._live_conversation = 0
         self._live_transcript: list[tuple[str, str]] = []
         self._owner = owner
         self._name = name
@@ -1684,8 +1737,11 @@ class RealtimeEngine:
             ctx.note_entities(getattr(self._executor, "last_entities", []))
             ctx.note_action(name, args, result)
         elif name == "think":
+            recent = self._thoughts.recent(1)
+            job = recent[0] if recent else None
             question = " ".join(str(args.get("question", "")).split())[:80]
-            ctx.note_job("think", f"thinking over '{question}'")
+            key = f"think:{job.id}" if job is not None else "think"
+            ctx.note_job(key, f"thinking over '{job.topic if job is not None else question}'")
         elif name in ("start_task", "revise_task"):
             ctx.note_job(f"task:{args.get('id') or 'latest'}", result)
 
@@ -1787,40 +1843,115 @@ class RealtimeEngine:
             board.restart_requested = False
             self.restart_requested = True
 
+    def _last_said(self) -> str:
+        """The owner's most recent words — where "actually, assume…" lives."""
+        for role, text in reversed(self._live_transcript):
+            if role == "you" and str(text).strip():
+                return str(text)
+        return ""
+
+    def _current_topic(self) -> str:
+        """What the room is on now, for the freshness check: the working
+        context's topic while it is still live, else his last sentence."""
+        if self._context is not None:
+            with contextlib.suppress(Exception):
+                topic = str(self._context.snapshot().get("topic") or "")
+                if topic:
+                    return topic
+        return self._last_said()
+
     async def _execute_brain_tool(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
+        book = self._thoughts
+        if name == "list_thoughts":
+            return book.describe(), False
+        if name == "cancel_thought":
+            thought = book.cancel(args.get("id"))
+            if thought is None:
+                return "no thought with that id is still running", True
+            for task in self._thinking:
+                if task.get_name() == f"think:{thought.id}" and not task.done():
+                    task.cancel()  # stop paying for reasoning nobody wants
+            if self._announcer is not None:
+                self._announcer.cancel(f"thought:{thought.id}")
+            if self._context is not None:
+                self._context.clear_job(f"think:{thought.id}")
+            return f"stopped thinking about '{thought.topic}'; that answer will not arrive", False
         if name != "think" or self._thinker is None:
             return "deeper reasoning is not available right now", True
         question = " ".join(str(args.get("question", "")).split())
         if not question:
             return "think needs the question in full", True
+        try:
+            thought, replaced = book.start(
+                question,
+                topic=str(args.get("topic", "") or ""),
+                conversation=self._live_conversation,
+                said=self._last_said(),
+            )
+        except ValueError as err:
+            return str(err), True
+        for old in replaced:
+            for task in self._thinking:
+                if task.get_name() == f"think:{old.id}" and not task.done():
+                    task.cancel()
+            if self._announcer is not None:
+                self._announcer.cancel(f"thought:{old.id}")
+            if self._context is not None:
+                self._context.clear_job(f"think:{old.id}")
+        superseded = (
+            f" (this supersedes thought {replaced[-1].id} on the same topic; its answer "
+            "will never be spoken)"
+            if replaced
+            else ""
+        )
         transcript = list(self._live_transcript)
         if self._announcer is None:
             try:
-                return await self._thinker.think(question, transcript), False
+                answer = await self._thinker.think(question, transcript)
             except Exception as err:  # noqa: BLE001 — surfaced to the model
+                book.fail(thought.id, str(err) or type(err).__name__)
                 return f"thinking failed: {str(err) or type(err).__name__}", True
+            book.finish(thought.id, answer)
+            return answer, False
 
         async def deliver_later() -> None:
             try:
                 answer = await self._thinker.think(question, transcript)
-                text = f"Your deeper reasoning on '{question[:80]}': {answer}"
             except Exception as err:  # noqa: BLE001 — the owner still gets told
-                text = (
-                    f"I couldn't finish thinking about '{question[:80]}': "
-                    f"{str(err) or type(err).__name__}"
-                )
+                settled = book.fail(thought.id, str(err) or type(err).__name__)
+            else:
+                settled = book.finish(thought.id, answer)
+            if settled is None:
+                return  # superseded or cancelled meanwhile: never spoken
+            speak, why = book.deliverable(settled, current_topic=self._current_topic())
+            if not speak:
+                if self._journal is not None:
+                    with contextlib.suppress(Exception):
+                        self._journal.write(
+                            "thought",
+                            f"dropped an answer about '{settled.topic}': {why}",
+                            source="brain",
+                            data={"id": settled.id, "question": settled.question, "answer": settled.answer},
+                        )
+                return
+            # Urgent only while the conversation that asked is still open;
+            # afterwards it waits its turn like any other announcement.
+            live = settled.conversation and self._live_conversation == settled.conversation
             self._announcer.enqueue(
-                text,
+                thought_announcement(settled, self._owner),
                 kind="thought",
-                ref=f"thought:{time.time_ns()}",
-                priority="urgent",  # the owner asked; never held for quiet hours
+                ref=f"thought:{settled.id}",
+                priority="urgent" if live else "normal",
                 expires_in_s=3 * 3600,
             )
 
         self._thinking = [t for t in self._thinking if not t.done()]
-        self._thinking.append(asyncio.create_task(deliver_later()))
+        self._thinking.append(
+            asyncio.create_task(deliver_later(), name=f"think:{thought.id}")
+        )
         return (
-            "thinking it over in the background — tell the owner so and keep the "
+            f"thought {thought.id} on '{thought.topic}' is running in the background"
+            f"{superseded} — tell the owner you're thinking it over and keep the "
             "conversation going; the answer will arrive as an EVENT"
         ), False
 
@@ -2319,6 +2450,8 @@ class RealtimeEngine:
         stats = SessionStats()
         self._trace = trace if trace is not None else TurnTrace()
         self._session_opened = time.time()  # older promises are hers to keep
+        self._conversations += 1
+        self._live_conversation = self._conversations  # a thought asked here may interrupt
         self._raised_followups = []
         self._deferred_reads = []
         speaking = False
@@ -2387,10 +2520,15 @@ class RealtimeEngine:
                 if kinds == {"thought"}:
                     if self._context is not None:
                         self._context.clear_job("think")  # it is no longer outstanding
+                        for item in items:
+                            ref = str(getattr(item, "ref", ""))
+                            if ref.startswith("thought:"):
+                                self._context.clear_job(f"think:{ref.split(':', 1)[1]}")
                     lead = (
                         f"Your deeper reasoning finished the question {self._owner} asked earlier — "
                         "give him the answer now, in your own words, as if you'd just "
-                        "worked it out: "
+                        "worked it out. If the event asks for an opening bridge, say "
+                        "that bridge first, in a few words: "
                     )
                 elif "presence" in kinds:
                     lead = (
@@ -2884,6 +3022,9 @@ class RealtimeEngine:
                     self._announcer.mark_read(opener_ids)
                 self._settle_followups(stats)
             finally:
+                # Nothing is open any more: a thought answered after this is
+                # an ordinary announcement, not an interruption.
+                self._live_conversation = 0
                 if self._cues is not None:
                     self._cues.reset()  # the runner's goodbye chime ends it
                 for task in [*tasks, *pending]:
