@@ -229,7 +229,8 @@ when due. follow_up is for things to bring up by TRIGGER: "when I get home \
 remind me to…" → arrival; "when I leave, remind me to lock up" → departure; \
 "next time we talk, ask me how the demo went" → next_conversation; "what are \
 you waiting on me for?" → waiting_on. Things you promised to bring up THIS \
-conversation — do it once, at a natural moment, then move on: {followups}. \
+conversation — do it once, at a natural moment, call raise_follow_up with \
+its id the moment you do, then move on: {followups}. \
 Routines: \
 when {owner} states a standing rule about HOW to do things ("after 5pm use \
 warm orange", "TV volume should default to 65%"), add_routine it — read it \
@@ -740,6 +741,15 @@ FOLLOWUP_TOOLS: list[dict[str, Any]] = [
             },
             "required": ["what", "when"],
         },
+    },
+    {
+        "type": "function",
+        "name": "raise_follow_up",
+        "description": (
+            "Call this the moment you bring one of the follow-ups listed in "
+            "your instructions up — only then does it count as kept."
+        ),
+        "parameters": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]},
     },
     {
         "type": "function",
@@ -1277,7 +1287,14 @@ class RealtimeEngine:
         self._presence = presence  # is the owner home? (a wake session is proof)
         self._followups = followups  # things she promised to bring up later
         self._delivery = delivery  # DeliverySettings: focus + per-kind preferences
-        self._raised_followups: list[int] = []  # conversation follow-ups shown this session
+        # Conversation follow-ups she carried into this session, and the ones
+        # she actually raised (raise_follow_up). A promise is kept only when
+        # it was spoken — see _settle_followups.
+        self._pending_followups: list[int] = []
+        self._raised_followups: list[int] = []
+        self._session_opened = 0.0  # wall clock of the conversation now running
+        # (state, ids) markings that wait for the audio carrying them to play
+        self._deferred_reads: list[tuple[str, list[int]]] = []
         self._model = model
         self._voice = voice  # may be swapped to FALLBACK_VOICE during _configure
         self.voice_note: str | None = None
@@ -1343,7 +1360,13 @@ class RealtimeEngine:
             else ""
         )
         if self._followups is not None:
-            self._raised_followups = [f.id for f in self._followups.for_conversation()]
+            # Only what she was already carrying: a promise made in THIS
+            # conversation is not kept by the sentence that made it. (This
+            # runs again mid-session whenever the instructions are refreshed.)
+            opened = self._session_opened or time.time()
+            self._pending_followups = [
+                f.id for f in self._followups.for_conversation() if f.created <= opened
+            ]
         lights = await self._home.get_lights()
         players = await self._home.media_players()
         instructions = _INSTRUCTIONS.format(
@@ -1835,6 +1858,18 @@ class RealtimeEngine:
                     context=str(args.get("context", "") or ""),
                 )
                 return f"follow-up {item.id} set: '{item.what}' {store.when_text(item)}", False
+            if name == "raise_follow_up":
+                item = store.get(int(args.get("id", 0)))
+                if item is None or not item.active:
+                    return "no open follow-up with that id", True
+                if item.trigger != "conversation":
+                    return (
+                        f"follow-up {item.id} comes up {store.when_text(item)}, "
+                        "not in conversation — leave it be"
+                    ), True
+                if item.id not in self._raised_followups:
+                    self._raised_followups.append(item.id)
+                return f"follow-up {item.id} counts as raised", False
             if name == "list_follow_ups":
                 rows = store.describe()
                 return (json.dumps(rows) if rows else "no open follow-ups"), False
@@ -1970,11 +2005,15 @@ class RealtimeEngine:
             except (TypeError, ValueError):
                 return "ids must be integers", True
             state = "unread" if str(args.get("state", "read")).lower() == "unread" else "read"
-            changed = ann.mark_read(ids) if state == "read" else ann.mark_unread(ids)
-            if not changed:
+            found = [a for a in (ann.get(i) for i in ids) if a is not None]
+            if state == "read":
+                changing = [a.id for a in found if a.read is None and not a.cancelled]
+            else:
+                changing = [a.id for a in found if a.read is not None]
+            if not changing:
                 return "no notifications matched those ids", True
-            self._instructions_stale = True
-            return f"{changed} marked {state}", False
+            self._defer_read(state, changing)
+            return f"{len(changing)} marked {state}", False
         # announcement_history is the pre-M11 name; it lives on as scope=all
         scope = "all" if name == "announcement_history" else str(args.get("scope", "") or "unread").lower()
         kind = str(args.get("kind", "") or "").strip()
@@ -1984,16 +2023,17 @@ class RealtimeEngine:
             if item is None:
                 return "I haven't announced anything yet", False
             row = ann.to_row(item)
-            if ann.mark_read([item.id]):
-                self._instructions_stale = True
+            if item.read is None and not item.cancelled:
+                self._defer_read("read", [item.id])
             return json.dumps([row]), False
         if scope == "unread":
             rows = ann.unread(kinds=kinds)
             if not rows:
                 return "nothing unread", False
             out = [ann.to_row(a) for a in rows[-20:]]  # as they were: he is hearing them now
-            ann.mark_read([a.id for a in rows])  # listing them = he has heard them
-            self._instructions_stale = True
+            # Listing them is not hearing them: this waits for the answer that
+            # carries them to finish playing (_apply_deferred_reads).
+            self._defer_read("read", [a.id for a in rows])
             return json.dumps(out), False
         if scope != "all":
             return "scope must be unread, all, or last", True
@@ -2005,6 +2045,39 @@ class RealtimeEngine:
         if not rows:
             return "I haven't announced anything in that window", False
         return json.dumps(rows), False
+
+    def _defer_read(self, state: str, ids: list[int]) -> None:
+        """Hold a read/unread marking until the words carrying it are heard.
+        A tool's result is not an answer — the answer is the audio that
+        follows it, and a barge-in over that means he never heard the list."""
+        if ids:
+            self._deferred_reads.append((state, list(ids)))
+
+    def _apply_deferred_reads(self, *, interrupted: bool = False) -> list[int]:
+        """The response carrying them finished playing. Cut off by a barge-in:
+        nothing is marked and the items stay where they were."""
+        held, self._deferred_reads = self._deferred_reads, []
+        if self._announcer is None or interrupted:
+            return []
+        applied: list[int] = []
+        for state, ids in held:
+            marker = self._announcer.mark_read if state == "read" else self._announcer.mark_unread
+            if marker(ids):
+                applied.extend(ids)
+                self._instructions_stale = True
+        return applied
+
+    def _settle_followups(self, stats: SessionStats) -> None:
+        """End of the conversation: retire only the promises she spoke."""
+        if self._followups is None or not self._pending_followups:
+            return
+        said = " ".join(text for who, text in stats.transcript if who == "alexa")
+        with contextlib.suppress(Exception):
+            self._followups.settle_conversation(
+                self._pending_followups, said, raised=self._raised_followups
+            )
+        self._pending_followups = []
+        self._raised_followups = []
 
     def _execute_panel_tool(self, name: str, args: dict[str, Any] | None = None) -> tuple[str, bool]:
         args = args or {}
@@ -2197,6 +2270,9 @@ class RealtimeEngine:
         the timings are kept in memory and written nowhere."""
         stats = SessionStats()
         self._trace = trace if trace is not None else TurnTrace()
+        self._session_opened = time.time()  # older promises are hers to keep
+        self._raised_followups = []
+        self._deferred_reads = []
         speaking = False
         response_active = False
         closing = False
@@ -2445,6 +2521,14 @@ class RealtimeEngine:
                             note_fn("announcement cut short — kept unread")
                     elif not opener:
                         self._announcer.mark_read(announced)  # slipped into a live conversation: heard
+                if self._deferred_reads and not more_coming:
+                    # She listed his notifications: they count as read only now,
+                    # and not at all if he cut the reading short.
+                    self._apply_deferred_reads(interrupted=interrupted)
+                    if interrupted:
+                        note_fn = getattr(ui, "note", None)
+                        if note_fn is not None:
+                            note_fn("notifications kept unread — she was cut off")
                 self._trace.playback_done()
                 if (close_after or wrapup_heard) and not interrupted and not more_coming:
                     # (a barge-in during the audio keeps the session open: he
@@ -2748,11 +2832,7 @@ class RealtimeEngine:
                 if stats.replied and opener_ids and self._announcer is not None:
                     # she opened with news and he answered: he heard it
                     self._announcer.mark_read(opener_ids)
-                if stats.replied and self._raised_followups and self._followups is not None:
-                    # a conversation happened: the follow-ups she was carrying are raised
-                    with contextlib.suppress(Exception):
-                        self._followups.mark_raised(self._raised_followups)
-                    self._raised_followups = []
+                self._settle_followups(stats)
             finally:
                 if self._cues is not None:
                     self._cues.reset()  # the runner's goodbye chime ends it
