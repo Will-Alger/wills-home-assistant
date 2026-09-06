@@ -7,6 +7,12 @@ it receives, emits one audio delta and a `response.done` with no output —
 enough to exercise the engine's session lifecycle without a network. A
 scripted user turn is the real event order: speech_started, speech_stopped,
 then the finished transcription.
+
+Replay tests (tests/test_replay.py) want the timing to be theirs: set
+`auto_reply = False` and script every event by hand with `push`,
+`push_audio` and `push_response_done`, spacing them with real sleeps.
+`InstantSpeaker` plays nothing at all; `DelayedSpeaker` plays in real time,
+so what was HEARD and what was generated can finally disagree.
 """
 
 from __future__ import annotations
@@ -14,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
@@ -27,12 +34,15 @@ class FakeConnection:
         # (a scripted user turn: speech_started + a finished transcription).
         self.say_after_response: str | None = None
         self._said = False
+        # False: response.create is only recorded, never answered — the test
+        # scripts every event itself, with its own delays between them.
+        self.auto_reply = True
 
     async def send(self, event: dict[str, Any]) -> None:
         self.sent.append(event)
         if event["type"] == "session.update":
             self._events.put_nowait(SimpleNamespace(type="session.updated"))
-        elif event["type"] == "response.create":
+        elif event["type"] == "response.create" and self.auto_reply:
             self._reply("Heads up: the build finished.")
             if self.say_after_response and not self._said:
                 self._said = True
@@ -106,6 +116,21 @@ class FakeConnection:
         put real delays between the steps of a turn and time them."""
         self._events.put_nowait(SimpleNamespace(type=event_type, **fields))
 
+    def push_audio(self, ms: int, *, item_id: str = "item_1") -> None:
+        """`ms` milliseconds of (silent) assistant audio in one delta — enough
+        of it that a real-time speaker takes real time to play it out."""
+        pcm = b"\x00\x00" * (24 * ms)  # 24 kHz mono int16: 24 samples a millisecond
+        self.push(
+            "response.output_audio.delta",
+            item_id=item_id,
+            delta=base64.b64encode(pcm).decode("ascii"),
+        )
+
+    def fail_now(self, error: BaseException | None = None) -> None:
+        """The socket dies right here — reaching the receiver even when it is
+        already parked in recv(), which is how a connection really drops."""
+        self._events.put_nowait(error or ConnectionError("socket closed"))
+
     def push_response_done(self, *calls: tuple[str, str, dict[str, Any]]) -> None:
         """A finished response, optionally with function calls to execute:
         each is (call_id, name, arguments)."""
@@ -121,7 +146,10 @@ class FakeConnection:
         self._recv_count += 1
         if self.fail_recv_after is not None and self._recv_count >= self.fail_recv_after:
             raise ConnectionError("socket closed")
-        return await self._events.get()
+        event = await self._events.get()
+        if isinstance(event, BaseException):
+            raise event
+        return event
 
     def kinds(self) -> list[str]:
         return [e["type"] for e in self.sent]
@@ -173,6 +201,89 @@ class InstantSpeaker:
 
     async def wait_idle(self, tail_s: float = 0.0) -> None:
         await asyncio.sleep(self._drain_s)
+
+
+BYTES_PER_SECOND = 48_000  # 24 kHz mono int16: one second of her voice
+
+
+class DelayedSpeaker:
+    """A speaker that plays in real time, so heard and generated can differ.
+
+    Audio drains at `BYTES_PER_SECOND` (`scale` times faster when a test
+    wants the same shape in less wall clock; the millisecond figures stay
+    true to the 24 kHz stream either way). The accounting mirrors
+    `assistant.audio.speaker.Speaker`: `begin_item` marks where an item's
+    audio starts, `played_ms` reports only what has actually drained, and
+    `clear()` — a barge-in — drops the unplayed tail and pulls the item's
+    recorded end back to what was heard.
+    """
+
+    def __init__(self, scale: float = 1.0) -> None:
+        self._rate = BYTES_PER_SECOND * scale  # bytes of playout per real second
+        self.chunks: list[bytes] = []
+        self.items: list[str] = []  # begin_item calls, in order
+        self.current_item = ""
+        self.clears = 0  # barge-ins
+        self._enqueued = 0
+        self._played = 0.0  # bytes actually drained (fractional: no rounding drift)
+        self._spans: dict[str, tuple[int, int]] = {}  # item id -> (start, end) bytes
+        self._at = time.monotonic()
+
+    def _drain(self) -> None:
+        """Catch the playhead up with the clock (the audio callback's job)."""
+        now = time.monotonic()
+        if self._played < self._enqueued:
+            self._played = min(float(self._enqueued), self._played + (now - self._at) * self._rate)
+        self._at = now
+
+    def enqueue(self, pcm: bytes) -> None:
+        self._drain()
+        self.chunks.append(pcm)
+        self._enqueued += len(pcm)
+        if self.current_item and pcm:
+            start, _end = self._spans.get(self.current_item, (self._enqueued - len(pcm), 0))
+            self._spans[self.current_item] = (start, self._enqueued)
+
+    def begin_item(self, item_id: str) -> None:
+        if not item_id or item_id == self.current_item:
+            return
+        self._drain()
+        self.current_item = item_id
+        self._spans.setdefault(item_id, (self._enqueued, self._enqueued))
+        self.items.append(item_id)
+
+    def played_ms(self, item_id: str = "") -> int:
+        """Milliseconds of this item the room has heard (0 if it is unknown)."""
+        self._drain()
+        span = self._spans.get(item_id or self.current_item)
+        if span is None:
+            return 0
+        start, end = span
+        heard = min(max(self._played - start, 0.0), float(end - start))
+        return int(heard * 1000 / BYTES_PER_SECOND)
+
+    @property
+    def pending_seconds(self) -> float:
+        """Wall-clock time left before the queue runs dry."""
+        self._drain()
+        return max(self._enqueued - self._played, 0.0) / self._rate
+
+    def clear(self) -> None:
+        self._drain()
+        self.clears += 1
+        self._enqueued = int(self._played)
+        span = self._spans.get(self.current_item)
+        if span is not None:
+            start, end = span
+            self._spans[self.current_item] = (start, max(start, min(end, self._enqueued)))
+
+    async def wait_idle(self, tail_s: float = 0.0) -> None:
+        while self.pending_seconds > 0:
+            # capped, so a barge-in's clear() is noticed at once and not one
+            # whole reply later
+            await asyncio.sleep(min(self.pending_seconds, 0.02))
+        if tail_s:
+            await asyncio.sleep(tail_s)
 
 
 class QuietUi:
