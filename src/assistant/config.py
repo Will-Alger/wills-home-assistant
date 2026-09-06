@@ -141,6 +141,9 @@ class Settings(BaseSettings):
     # trained model, e.g. models/hey_gary.onnx — see docs/custom-wake-word.md
     wake_model: str = "alexa"
     wake_threshold: float = 0.5  # raise if false wakes, lower if it misses you
+    # openWakeWord's bundled Silero VAD gate: a prediction only counts when the
+    # frame sounds like speech, so a vacuum cleaner cannot wake her. 0 = off.
+    wake_vad_threshold: float = 0.5
     audio_input_device: str = ""  # "" = default mic; index or name substring
     audio_output_device: str = ""  # "" = default speaker; index or name substring
     stt_provider: str = "deepgram"
@@ -168,7 +171,7 @@ class Settings(BaseSettings):
     realtime_info_close_s: float = 15.0
     # How fast semantic VAD decides you're done talking: low|medium|high|auto.
     # high = snappy replies; drop toward auto/low if it cuts off your pauses.
-    realtime_eagerness: str = "high"
+    realtime_eagerness: str = "auto"  # high cut sentences off; auto = medium
     # True talk-over (interrupt by just speaking). ONLY with headphones — on
     # open speakers the mic hears the assistant and it interrupts itself.
     realtime_talk_over: bool = False
@@ -183,11 +186,18 @@ class Settings(BaseSettings):
     # Off by default: it went live 2026-09-05 and the mid-sentence cut-offs
     # were logged after it — an unvalidated trial, not a default.
     realtime_noise_reduction: str = ""
-    # Who decides a turn has ended. server_vad: SILENCE only, for
-    # REALTIME_SILENCE_MS — nothing about the words. semantic_vad also guesses
-    # from the words (eagerness above), and that guess cut him off mid-sentence.
-    realtime_turn_detection: str = "server_vad"
-    realtime_silence_ms: int = 800
+    # Who decides a turn has ended. semantic_vad waits while a sentence sounds
+    # unfinished and (at auto/medium) does not chunk aggressively — the "high"
+    # setting was what cut him off mid-sentence. server_vad ends a turn on
+    # SILENCE only, after REALTIME_SILENCE_MS: predictable, but any pause to
+    # think ends the turn. Either way the engine's own guards drop a reply to a
+    # fragment he kept adding to.
+    realtime_turn_detection: str = "semantic_vad"
+    realtime_silence_ms: int = 1000
+    # Send the server speech or clean silence, never the room: a local gate on
+    # the microphone (with a short pre-roll) keeps a vacuum cleaner, the fridge
+    # and her own tail from ever becoming a "turn".
+    realtime_speech_gate: bool = True
 
     # What the wake word (and a push-to-talk press) is answered with, before
     # the session exists: "voice" plays one of the short clips rendered in her

@@ -404,7 +404,7 @@ def test_a_wake_word_from_the_panel_can_never_brick_the_boot(tmp_path: Path, mon
     import scripts.m4_realtime as runner
 
     class FakeDetector:
-        def __init__(self, model: str, threshold: float = 0.5) -> None:
+        def __init__(self, model: str, threshold: float = 0.5, **_kw) -> None:
             if model.endswith(".onnx"):
                 raise FileNotFoundError(f"Custom wake model not found: {model}")
             self.model = model

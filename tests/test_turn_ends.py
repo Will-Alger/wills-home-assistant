@@ -86,17 +86,15 @@ async def test_a_fragment_followed_by_the_rest_drops_the_reply_to_the_fragment()
     assert stats.ended_by != "unknown"
 
 
-async def test_turns_end_on_silence_by_default_and_let_me_think_widens_it() -> None:
-    engine, client, _cues, ui = make(idle_timeout_s=0.5)
+async def test_turns_end_semantically_at_auto_by_default_and_silence_mode_widens_for_let_me_think() -> None:
+    default, _client, _cues, _ui = make()
+    on = (await default._session_config(None))["audio"]["input"]["turn_detection"]
+    assert on == {"type": "semantic_vad", "eagerness": "auto"}  # waits while a sentence sounds unfinished
+    assert default._turn_detection(False) is None  # push to talk: the client commits
+    engine, client, _cues, ui = make(idle_timeout_s=0.5, turn_detection="server_vad", silence_ms=800)
     conn = client.connection
-    on = (await engine._session_config(None))["audio"]["input"]["turn_detection"]
-    assert on == {"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 800}
-    assert engine._turn_detection(False) is None  # push to talk: the client commits
-    semantic = RealtimeEngine(
-        api_key="k", model="m", voice="v", home=FakeHome(), owner="Will", turn_detection="semantic_vad", eagerness="high"
-    )
-    assert (await semantic._session_config(None))["audio"]["input"]["turn_detection"] == {
-        "type": "semantic_vad", "eagerness": "high"
+    assert (await engine._session_config(None))["audio"]["input"]["turn_detection"] == {
+        "type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 800
     }
 
     async def owner() -> None:

@@ -377,6 +377,7 @@ def build_engine(fake: bool):
         noise_reduction=settings.realtime_noise_reduction,
         turn_detection=settings.realtime_turn_detection,
         silence_ms=settings.realtime_silence_ms,
+        speech_gate=settings.realtime_speech_gate,
         eagerness=settings.realtime_eagerness,
         extra_instructions=settings.assistant_extra_instructions,
         memory=memory,
@@ -520,8 +521,16 @@ def load_wake_detectors(settings, overrides) -> tuple[WakeDetector, WakeDetector
 
     def build() -> tuple[WakeDetector, WakeDetector]:
         return (
-            WakeDetector(settings.wake_model, threshold=settings.wake_threshold),
-            WakeDetector(settings.wake_model, threshold=settings.wake_threshold),
+            WakeDetector(
+                settings.wake_model,
+                threshold=settings.wake_threshold,
+                vad_threshold=getattr(settings, "wake_vad_threshold", 0.0),
+            ),
+            WakeDetector(
+                settings.wake_model,
+                threshold=settings.wake_threshold,
+                vad_threshold=getattr(settings, "wake_vad_threshold", 0.0),
+            ),
         )
 
     try:
@@ -759,6 +768,18 @@ async def one_cycle(
         await asyncio.wait_for(speaker.wait_idle(), timeout=3.0)
     if speaker.stalled:
         engine.audio_reconfigure = True  # the speaker stopped taking audio: reopen next cycle
+    if trigger == "wake":
+        # A wake nobody followed up counts against the detector; two in three
+        # minutes (the vacuum cleaner) raise its bar for ten. A real one clears.
+        if stats.replied:
+            wake.backoff.real_wake()
+        elif stats.ended_by == "nobody spoke" and wake.backoff.false_wake():
+            say(
+                status,
+                f"two false wakes in three minutes — the wake word now needs "
+                f"{wake.effective_threshold:.2f} for the next {wake.backoff.seconds_left / 60:.0f} minutes",
+                "yellow",
+            )
     total_cost += stats.cost_usd
     if engine.voice_note:
         say(status, engine.voice_note, "yellow")
@@ -769,6 +790,7 @@ async def one_cycle(
         "idle timeout": "quiet too long — closed to stop the meter; say the wake word anytime",
         "end_conversation": "she wrapped up",
         "wrap-up": "you wrapped up — closed after her goodbye",
+        "nobody spoke": "false wake — closed quietly, nothing answered",
         "question answered": "question answered — closed after quiet",
         "announcement delivered": "announced, back to sleep",
         "nothing to announce": "announcement was already handled",

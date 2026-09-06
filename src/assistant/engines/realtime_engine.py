@@ -630,7 +630,18 @@ _THINKING_S = 30.0  # after "let me think": no clock closes the conversation, VA
 # said anything: one sentence split at a pause, not two turns.
 _CONTINUATION_S = 3.0  # bounded in practice by her first audio, which ends the window
 _STILL_TALKING_FRAMES = 2  # mic frames still hot right after a commit: he was cut off
-_ECHO_TAIL_S = 0.6  # after she stops, a Bluetooth speaker keeps sounding this long at the mic
+_ECHO_TAIL_S = 1.0  # after she stops, a Bluetooth speaker keeps sounding this long at the mic (logged: 1346 at 0.6 s)
+_NO_SPEECH_S = 6.0  # a wake with no real speech by then (12 s if something sounded like speech) dies quietly
+
+# The local speech gate: the server hears speech or clean silence, never the room.
+_GATE_OPEN_MIN = 600.0  # int16 RMS a frame must reach to open the gate…
+_GATE_OPEN_FACTOR = 3.0  # …and how far above the room floor
+_GATE_OPEN_FRAMES = 2  # hot frames in a row before it opens (the pre-roll carries them)
+_GATE_CLOSE_MIN = 400.0
+_GATE_CLOSE_FACTOR = 2.0
+_GATE_HANGOVER_S = 0.8  # quiet this long before it closes (the pauses inside a sentence)
+_GATE_PREROLL = 4  # frames kept while closed and sent when it opens (320 ms)
+_SILENCE_FRAME = b"\x00\x00" * FRAME_SAMPLES_24K
 _TURN_OVER_DING_S = 1.0  # the "turn over" ding plays only if nothing followed the commit by then
 _PATIENT_SILENCE_MS = 2500  # "let me think" on server_vad: silence that ends a turn
 
@@ -674,6 +685,59 @@ class _Levels:
 
     def threshold(self) -> float:
         return max(self.echo_level * _ECHO_FACTOR, self.quiet_level * _QUIET_FACTOR, _ABS_FLOOR)
+
+
+class _SpeechGate:
+    """Send the server speech or clean silence, never the room. A microphone
+    beside a speaker hears the vacuum cleaner, the fridge and the tail of her
+    own voice, and every one of those used to become a "turn". The gate
+    tracks the room floor while closed, opens on a couple of frames well
+    above it (sending the frames it kept as pre-roll, so no first syllable is
+    lost), and closes after `_GATE_HANGOVER_S` of quiet — the pauses inside
+    a sentence do not close it. While closed the server gets silence frames,
+    so its own turn detection still sees the end of a turn."""
+
+    def __init__(self) -> None:
+        self.floor = 300.0
+        self.open = False
+        self._hot = 0
+        self._quiet_since: float | None = None
+        self._preroll: deque[bytes] = deque(maxlen=_GATE_PREROLL)
+
+    def update(self, level: float, now: float, frame: bytes) -> bool:
+        """True when this frame should go to the server."""
+        # The floor follows quiet quickly, rises to steady noise (a vacuum
+        # cleaner) in seconds while closed, and only creeps while open so a
+        # long sentence cannot pull it up to speech level.
+        rate = 0.05 if level < self.floor else (0.001 if self.open else 0.01)
+        self.floor += (level - self.floor) * rate
+        if not self.open:
+            if level > max(self.floor * _GATE_OPEN_FACTOR, _GATE_OPEN_MIN):
+                self._hot += 1
+                if self._hot >= _GATE_OPEN_FRAMES:
+                    self.open = True
+                    self._quiet_since = None
+                    return True
+            else:
+                self._hot = 0
+            self._preroll.append(frame)
+            return False
+        if level < max(self.floor * _GATE_CLOSE_FACTOR, _GATE_CLOSE_MIN):
+            if self._quiet_since is None:
+                self._quiet_since = now
+            elif now - self._quiet_since > _GATE_HANGOVER_S:
+                self.open = False
+                self._hot = 0
+                self._preroll.clear()
+                return False
+        else:
+            self._quiet_since = None
+        return True
+
+    def take_preroll(self) -> list[bytes]:
+        frames = list(self._preroll)
+        self._preroll.clear()
+        return frames
 
 # Push to talk. A hold shorter than this, or one carrying nothing but room
 # tone, is a slip of the hand: throw the audio away rather than make her
@@ -1480,9 +1544,10 @@ class RealtimeEngine:
         talk_over: bool = False,
         tentative_interrupt: bool = False,
         noise_reduction: str = "",
-        turn_detection: str = "server_vad",
-        silence_ms: int = 800,
-        eagerness: str = "high",
+        turn_detection: str = "semantic_vad",
+        silence_ms: int = 1000,
+        speech_gate: bool = True,
+        eagerness: str = "auto",  # semantic_vad: auto (= medium) waits while a sentence sounds unfinished
         extra_instructions: str = "",
         memory: MemoryStore | None = None,
         task_board: TaskBoard | None = None,
@@ -1562,6 +1627,7 @@ class RealtimeEngine:
         self._eagerness = eagerness  # semantic VAD: how fast it decides you're done
         self._turn_mode = "semantic_vad" if turn_detection.strip().lower() == "semantic_vad" else "server_vad"
         self._silence_ms = int(silence_ms)  # server_vad: silence that ends a turn
+        self._speech_gate = speech_gate  # the server hears speech or clean silence, never the room
         self._extra_instructions = extra_instructions
         self._memory = memory
         self._board = task_board  # her own Jira: specs, builds, approvals
@@ -2812,6 +2878,7 @@ class RealtimeEngine:
             hot_after_commit = 0  # mic frames still hot right after a commit
             possible_since: float | None = None  # playback held for a possible talk-over since
             levels = _Levels()  # the room's level, and her echo during each reply
+            gate = _SpeechGate()  # speech or clean silence to the server, never the room
             meter = LevelMeter()  # the same frames, smoothed, for the panel's bar
             onset: list[tuple[bytes, bool]] = []  # the last few frames and whether each was hot
             user_turns = 0  # finished user transcripts so far (a tool learns what he said meanwhile)
@@ -3063,6 +3130,16 @@ class RealtimeEngine:
                         # Push to talk with nobody holding: the buffer must
                         # stay empty, or the next commit would carry every
                         # sound the room made since his last turn.
+                        continue
+                    if self._speech_gate and not ptt_active:
+                        # The server hears speech or clean silence, never the
+                        # room: a vacuum cleaner, the fridge, her own tail.
+                        if gate.update(level, heard_at, frame):
+                            for held in gate.take_preroll():
+                                await send_audio(held)
+                            await send_audio(frame)
+                        else:
+                            await send_audio(_SILENCE_FRAME)
                         continue
                     await send_audio(frame)
                     if ptt_active:
@@ -3616,6 +3693,27 @@ class RealtimeEngine:
             ]
             if ptt is not None:
                 tasks.append(asyncio.create_task(ptt_watch()))
+            async def false_wake_watch() -> None:
+                """A wake nobody followed up — the vacuum cleaner, a TV, a word
+                that sounded like her name — dies quietly: no reply to the
+                room, no listening window, no 45 s idle. Six seconds with no
+                speech at all; twelve if something sounded like speech but no
+                real transcript came of it."""
+                await asyncio.sleep(_NO_SPEECH_S)
+                if stats.replied or ended.is_set():
+                    return
+                if speech_segments > 0:
+                    await asyncio.sleep(_NO_SPEECH_S)  # one more beat for a real transcript
+                    if stats.replied or ended.is_set():
+                        return
+                if response_active:
+                    await connection.send({"type": "response.cancel"})
+                speaker.clear()
+                stats.ended_by = "nobody spoke"
+                ended.set()
+
+            if not announce and not ptt_session:
+                spawn(false_wake_watch())
             for task in tasks:
                 task.add_done_callback(supervise)
             try:

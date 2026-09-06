@@ -29,7 +29,7 @@ from tests.fake_realtime import FakeClient, InstantSpeaker, LoudMic, QuietRoomMi
 
 VK_CONTROL, VK_MENU, VK_SHIFT = 0x11, 0x12, 0x10  # winuser.h
 
-_SEMANTIC_VAD = {"type": "semantic_vad", "eagerness": "high"}
+_SEMANTIC_VAD = {"type": "semantic_vad", "eagerness": "auto"}  # the engine's default patience
 _LONG_ENOUGH = mod._PTT_MIN_HOLD_S + 0.06  # a hold that counts, with margin
 
 
