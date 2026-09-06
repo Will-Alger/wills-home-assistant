@@ -6,8 +6,9 @@ Here a `DelayedSpeaker` drains at 24 kHz and the script pushes each event at
 a moment of its choosing: a transcript that lands a second late, a tool that
 takes most of a second while he corrects himself over it, a socket that dies
 mid-sentence, an announcement cut in half by the wake word, a wrap-up spoken
-under a running tool, a barge-in during the goodbye, and the end tool firing
-without a word to close on.
+under a running tool, a barge-in during the goodbye, the end tool firing
+without a word to close on, and a nine-second web search whose silence the
+working tick fills at two seconds and again at eight.
 
 Each scenario asserts how the session ended, what went to the server, and —
 where it matters — what the announcer believes he has actually heard.
@@ -20,12 +21,14 @@ import contextlib
 import json
 import time
 from pathlib import Path
+from typing import Any
 
 from assistant.announce import Announcer
 from assistant.audio.cues import VoiceCues
 from assistant.engines.realtime_engine import RealtimeEngine
 from assistant.home.base import LightCommand
 from assistant.home.fake import FakeHome
+from assistant.status import AssistantStatus
 from tests.fake_realtime import DelayedSpeaker, FakeClient, FakeConnection, QuietUi
 
 # ── the room ───────────────────────────────────────────────────────────────
@@ -92,8 +95,11 @@ class ReplayUi(QuietUi):
         self.errors.append(message)
 
 
-def make_engine(*, home: FakeHome | None = None, **kw) -> tuple[RealtimeEngine, FakeConnection, VoiceCues]:
-    cues = VoiceCues(play=lambda kind: None, render=lambda kind, rate: b"")  # silent earcons
+def make_engine(
+    *, home: FakeHome | None = None, cues: VoiceCues | None = None, **kw
+) -> tuple[RealtimeEngine, FakeConnection, VoiceCues]:
+    if cues is None:
+        cues = VoiceCues(play=lambda kind: None, render=lambda kind, rate: b"")  # silent earcons
     engine = RealtimeEngine(
         api_key="test-key", model="m", voice="v", home=home or FakeHome(), owner="Will",
         name="Alexa", wake_phrase="alexa", cues=cues, **kw,
@@ -433,3 +439,114 @@ async def test_the_end_tool_without_audio_asks_for_a_goodbye_and_closes_after_it
     assert "wake" not in cues.played and ui.listening_windows == 0
     assert not sent(conn, "conversation.item.truncate")
     assert stats.tool_calls == ["media_control", "end_conversation"]
+
+
+# ── 8. the working cue: a tool that takes its time in silence ──────────────
+
+
+class SlowSearch:
+    """A web search as slow as the real thing — the silent gap the working
+    cue exists for."""
+
+    def __init__(self, delay_s: float) -> None:
+        self.delay_s = delay_s
+        self.queries: list[str] = []
+
+    async def search(self, query: str) -> str:
+        self.queries.append(query)
+        await asyncio.sleep(self.delay_s)
+        return "The Celtics beat the Knicks 112-104 tonight."
+
+
+class TimedCues(VoiceCues):
+    """Silent earcons that remember WHEN each one went out."""
+
+    def __init__(self, status: AssistantStatus | None = None) -> None:
+        super().__init__(status=status, play=lambda kind: None, render=lambda kind, rate: b"")
+        self.at: list[tuple[str, float]] = []
+
+    def _sound(self, kind: str, speaker: Any | None = None, on_audible: Any | None = None) -> None:
+        self.at.append((kind, time.monotonic()))
+        super()._sound(kind, speaker, on_audible)
+
+    def ticks_since(self, mark: float) -> list[float]:
+        """Seconds from `mark` to each working tick."""
+        return [at - mark for kind, at in self.at if kind == "working"]
+
+
+async def test_a_slow_tool_ticks_at_two_seconds_and_again_six_seconds_later() -> None:
+    """A web search takes the room from her last word to her next one in
+    silence. One soft tick two seconds in, another six after that, and not
+    one more once she is actually speaking."""
+    status = AssistantStatus()
+    cues = TimedCues(status)
+    web = SlowSearch(delay_s=9.0)
+    engine, conn, _cues = make_engine(cues=cues, web=web, idle_timeout_s=20.0, info_close_s=0.3)
+    marks: dict[str, float] = {}
+    panel_state: list[str] = []  # what the panel said mid-wait
+
+    async def script(speaker, ui) -> None:
+        await asyncio.sleep(0.1)
+        owner_says(conn, "search the web for tonight's Celtics score")
+        marks["asked"] = time.monotonic()
+        she_says(conn, calls=(("call_0", "web_search", {"query": "Celtics score tonight"}),))
+        await asyncio.sleep(3.0)  # mid-wait: what the Settings panel says
+        marks["panel"] = time.monotonic()
+        panel_state.append(str(status.snapshot()["state"]))
+        await asyncio.sleep(6.7)  # the search has returned; here is the answer
+        marks["audio"] = time.monotonic()
+        she_says(conn, "The Celtics won, 112 to 104.", ms=400, item_id="item_2")
+
+    stats, _took, speaker, _ui = await replay(engine, script, timeout=25.0)
+
+    ticks = cues.ticks_since(marks["asked"])
+    assert len(ticks) == 2, ticks  # ...and none in the six seconds after the audio
+    assert 2.0 <= ticks[0] < 2.8, ticks  # the first, two seconds into the silence
+    assert 8.0 <= ticks[1] < 8.9, ticks  # the second, six seconds after that
+    assert 5.9 < ticks[1] - ticks[0] < 6.3, ticks
+    assert ticks[1] < marks["audio"] - marks["asked"]  # both before she said a word
+    assert panel_state == ["working"]
+    assert web.queries == ["Celtics score tonight"] and stats.tool_calls == ["web_search"]
+    assert speaker.played_ms("item_2") == 400  # the answer she waited for, heard in full
+    assert cues.played == ["working", "working", "wake"]  # then the listening ding
+
+
+async def test_a_tool_that_returns_at_once_never_ticks() -> None:
+    """"Lights off" is done in a moment: the room hears the answer, not a
+    cue for a wait that never happened."""
+    cues = TimedCues()
+    engine, conn, _cues = make_engine(cues=cues, idle_timeout_s=6.0, command_close_s=0.3)
+
+    async def script(speaker, ui) -> None:
+        await asyncio.sleep(0.1)
+        owner_says(conn, "lights off")
+        she_says(conn, calls=(("call_0", "set_lights",
+                               {"changes": [{"target": "hallway", "turn": "off"}]}),))
+        await asyncio.sleep(0.4)
+        she_says(conn, "Off.", ms=300, item_id="item_2")
+
+    stats, took, _speaker, _ui = await replay(engine, script)
+
+    assert stats.tool_calls == ["set_lights"] and took < 2.5
+    assert "working" not in cues.played
+
+
+async def test_a_word_before_the_tool_call_silences_the_tick() -> None:
+    """She said "Sure." and only then went looking. The room has heard her
+    voice, so the wait it is now in gets no tick — the rule is about the
+    silence, not about the clock."""
+    cues = TimedCues()
+    web = SlowSearch(delay_s=3.0)
+    engine, conn, _cues = make_engine(cues=cues, web=web, idle_timeout_s=20.0, info_close_s=0.3)
+
+    async def script(speaker, ui) -> None:
+        await asyncio.sleep(0.1)
+        owner_says(conn, "look up tonight's Celtics score")
+        she_says(conn, "Sure.", ms=200, calls=(("call_0", "web_search", {"query": "celtics"}),))
+        await asyncio.sleep(3.4)
+        she_says(conn, "They won by eight.", ms=300, item_id="item_2")
+
+    stats, took, _speaker, _ui = await replay(engine, script, timeout=15.0)
+
+    assert stats.tool_calls == ["web_search"] and took > 3.0  # the search really ran
+    assert "working" not in cues.played

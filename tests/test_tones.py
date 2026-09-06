@@ -8,7 +8,7 @@ from assistant.audio.tones import _SOUNDS
 
 
 def test_all_earcons_are_well_formed() -> None:
-    for kind in ("wake", "close", "error"):
+    for kind in ("wake", "close", "error", "working"):
         sound = _SOUNDS[kind]
         assert sound.dtype == np.float32
         assert len(sound) > 2000  # audible, not a click
@@ -35,3 +35,17 @@ def test_wake_rises_and_close_falls() -> None:
     assert dominant_hz(wake[:1500]) < dominant_hz(wake[-6000:-4500])
     close = _SOUNDS["close"]
     assert dominant_hz(close[:1500]) > dominant_hz(close[-7000:-5500])
+
+
+def test_the_working_tick_is_lower_and_quieter_than_the_wake_ding() -> None:
+    """It says "still here" under a running tool — it must never be mistaken
+    for the ding that says "your turn"."""
+    working, wake = _SOUNDS["working"], _SOUNDS["wake"]
+    assert np.max(np.abs(working)) < 0.5 * np.max(np.abs(wake))  # clearly softer
+    assert len(working) < len(wake)  # and shorter: a tick, not a chime
+
+    def dominant_hz(chunk: np.ndarray) -> float:
+        spectrum = np.abs(np.fft.rfft(chunk * np.hanning(len(chunk))))
+        return float(np.fft.rfftfreq(len(chunk), 1 / 22_050)[int(np.argmax(spectrum))])
+
+    assert dominant_hz(working) < dominant_hz(wake[:1500])  # and lower

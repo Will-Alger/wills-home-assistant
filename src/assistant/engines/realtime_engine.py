@@ -596,6 +596,11 @@ _QUIET_TOOLS = frozenset(
 _INJECT_QUIET_S = 2.0
 _INJECT_MIN_AGE_S = 3.0
 _WRAPUP_GRACE_S = 1.5  # after "that's all" with nothing playing: close, don't listen
+# The working cue: a response has started, a tool is running, and the room has
+# heard nothing yet. The first soft tick lands after this long, then one every
+# _WORKING_CUE_EVERY_S while the wait goes on. Module-level so tests can move them.
+_WORKING_CUE_AFTER_S = 2.0
+_WORKING_CUE_EVERY_S = 6.0
 _THINKING_S = 30.0  # after "let me think": no clock closes the conversation, VAD waits longer
 
 # Tentative talk-over on loudspeakers (docs/PLAN-VOICE-2026-09-05.md phase 4).
@@ -2689,6 +2694,11 @@ class RealtimeEngine:
             onset: list[bytes] = []  # frames above the threshold, waiting to become an onset
             user_turns = 0  # finished user transcripts so far (a tool learns what he said meanwhile)
             audio_in_response = False  # the current response produced speech
+            # The silent stretch: when a response started with nothing heard
+            # yet (None = the room has her voice, or nothing is pending), and
+            # how many working ticks have gone out inside it.
+            quiet_since: float | None = None
+            working_ticks = 0
             farewell_pending = False  # end_conversation fired without a word: a goodbye was requested
             deferred_close = False  # a close decided under a tool: it waits for the words
             session_started = time.monotonic()
@@ -2774,10 +2784,11 @@ class RealtimeEngine:
             async def barge_in(heard_at: float, how: str) -> None:
                 """He cut in — the wake phrase, or a confirmed talk-over: stop
                 her now, tell the server how much he heard, take his turn."""
-                nonlocal speaking, interrupted, possible_since
+                nonlocal speaking, interrupted, possible_since, quiet_since
                 nonlocal quick_close_armed, quick_close_window, quick_close_reason
                 interrupted = True
                 possible_since = None
+                quiet_since = None  # he is talking: nothing he cut into is still awaited
                 onset.clear()
                 item = getattr(speaker, "current_item", "")
                 heard_ms = speaker.played_ms(item) if item and hasattr(speaker, "played_ms") else 0
@@ -3047,7 +3058,7 @@ class RealtimeEngine:
                 nonlocal speech_segments, command_pending, quick_close_armed
                 nonlocal quick_close_window, quick_close_reason, announcing, announcing_opener
                 nonlocal tool_busy, interrupted, wrapup_heard, user_turns, audio_in_response
-                nonlocal thinking_until
+                nonlocal thinking_until, quiet_since, working_ticks
                 heard = ""  # live accumulation of the user's words
 
                 async def set_eagerness(value: str) -> None:
@@ -3070,6 +3081,7 @@ class RealtimeEngine:
                     if kind.endswith("audio.delta") and "transcript" not in kind:
                         if not audio_in_response:
                             levels.new_playback(time.monotonic())  # a reply starts: learn its echo
+                            quiet_since = None  # she is heard: no working tick after this
                         speaking = True
                         audio_in_response = True
                         self._trace.audio_delta()
@@ -3080,6 +3092,12 @@ class RealtimeEngine:
                     elif kind == "response.created":
                         response_active = True
                         audio_in_response = False
+                        if quiet_since is None:
+                            # The wait starts here and is NOT restarted by the
+                            # response a tool's result asks for: the ticks keep
+                            # their cadence from the moment the room went quiet.
+                            quiet_since = time.monotonic()
+                            working_ticks = 0
                         # a barge-in belongs to the response it cut; a stale flag
                         # used to veto every later goodbye ("closing out" … ding)
                         interrupted = False
@@ -3159,6 +3177,30 @@ class RealtimeEngine:
                             self._cues.error(message, speaker)
                         ui.error(message)
 
+            async def working_cue() -> None:
+                """Never a silent room while she is off doing something.
+
+                A response has started, a tool is running, and nothing has
+                come out of the speaker: a soft tick two seconds in, then one
+                every six while the wait lasts. A tool that returns at once
+                never reaches the first tick; the first audio delta ends the
+                stretch, so nothing ever ticks over her own voice.
+
+                Half-duplex is lifted under a tool (he can say "never mind"),
+                so the mic hears this one — hence a tick that is short, quiet
+                and a plain low tone rather than anything speech-shaped."""
+                nonlocal working_ticks
+                while True:
+                    await asyncio.sleep(0.05)
+                    if self._cues is None or quiet_since is None or not tool_busy:
+                        continue
+                    if speaking or getattr(speaker, "pending_seconds", 0.0) > 0:
+                        continue  # the room is hearing something already
+                    due = quiet_since + _WORKING_CUE_AFTER_S + working_ticks * _WORKING_CUE_EVERY_S
+                    if time.monotonic() >= due:
+                        working_ticks += 1
+                        self._cues.working(speaker)
+
             async def idle_watchdog() -> None:
                 while True:
                     await asyncio.sleep(0.5)
@@ -3201,6 +3243,7 @@ class RealtimeEngine:
                 asyncio.create_task(pump_mic()),
                 asyncio.create_task(receive()),
                 asyncio.create_task(idle_watchdog()),
+                asyncio.create_task(working_cue()),
             ]
             for task in tasks:
                 task.add_done_callback(supervise)

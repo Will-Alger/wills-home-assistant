@@ -65,6 +65,12 @@ _RECIPES: dict[str, dict] = {
     },
     # rising major triad, distinct from the wake fourth: she has news
     "announce": {"notes": [523.3, 659.3, 784.0], "amp": 0.28},
+    # she is off doing something: one soft low tick, well under the wake
+    # ding in both pitch and level — it says "still here", never "your turn"
+    "working": {
+        "notes": [392.0], "ms_each": 170, "stagger_ms": 0,
+        "amp": 0.13, "decay": 14.0,
+    },
 }
 
 
@@ -78,7 +84,8 @@ def pcm(kind: str, rate: int) -> bytes:
 
 # wake: rising fourth, bright — I'm listening. listen_end: a short step down,
 # your turn is over. close: falling, softer, longer ring — going back to
-# sleep. error: low, brief, minor-ish.
+# sleep. error: low, brief, minor-ish. working: a quiet low tick, repeated
+# while a tool runs so the room is never silent under her.
 _SOUNDS = {kind: _chime(**recipe) for kind, recipe in _RECIPES.items()}
 
 _OUTPUT: int | None = None  # the chosen speaker's index; None = the default
