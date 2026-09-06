@@ -629,8 +629,13 @@ _THINKING_S = 30.0  # after "let me think": no clock closes the conversation, VA
 
 # Tentative talk-over on loudspeakers (docs/PLAN-VOICE-2026-09-05.md phase 4).
 _TENTATIVE_COOLDOWN_S = 0.8  # the first moments of a reply: learn her echo, never interrupt
-_ONSET_FRAMES = 3  # 80 ms frames above the threshold before playback is held (240 ms)
-_ECHO_FACTOR = 2.5  # the mic must rise this far above her own echo
+_ONSET_FRAMES = 3  # hot 80 ms frames, out of the last _ONSET_WINDOW, before playback is held
+_ONSET_WINDOW = 4  # syllables dip: three of four, not three in a row
+# Measured 2026-09-06 on the Echo Dot: her echo reached the Snowball at 2228
+# with the room at 402, so 2.5x put the bar at 5569 — above a voice at the
+# desk on top of that echo (roughly 3500–4500). 1.6x lands at about 3600; a
+# false alarm costs only a brief hold, a bar too high costs the feature.
+_ECHO_FACTOR = 1.6  # the mic must rise this far above her own echo
 _QUIET_FACTOR = 4.0  # ...and above the room while nobody spoke
 _ABS_FLOOR = 400.0  # int16 RMS: below this nothing is speech at a desk mic
 _FALSE_ALARM_S = 1.5  # held this long with no server speech detection: resume
@@ -2764,7 +2769,7 @@ class RealtimeEngine:
             possible_since: float | None = None  # playback held for a possible talk-over since
             levels = _Levels()  # the room's level, and her echo during each reply
             meter = LevelMeter()  # the same frames, smoothed, for the panel's bar
-            onset: list[bytes] = []  # frames above the threshold, waiting to become an onset
+            onset: list[tuple[bytes, bool]] = []  # the last few frames and whether each was hot
             user_turns = 0  # finished user transcripts so far (a tool learns what he said meanwhile)
             audio_in_response = False  # the current response produced speech
             # The silent stretch: when a response started with nothing heard
@@ -2928,11 +2933,9 @@ class RealtimeEngine:
                                 f"talk-over armed: echo {levels.echo_level:.0f}, room "
                                 f"{levels.quiet_level:.0f}, threshold {levels.threshold():.0f}"
                             )
-                    if level > levels.threshold():
-                        onset.append(frame)
-                    else:
-                        onset.clear()
-                    if len(onset) < _ONSET_FRAMES:
+                    onset.append((frame, level > levels.threshold()))
+                    del onset[:-_ONSET_WINDOW]
+                    if sum(1 for _, hot in onset if hot) < _ONSET_FRAMES:
                         return
                     possible_since = heard_at
                     speaker.pause()
@@ -2941,7 +2944,7 @@ class RealtimeEngine:
                             f"possible interruption: mic {level:.0f} over echo "
                             f"{levels.echo_level:.0f} — holding"
                         )
-                    for held in onset:
+                    for held, _ in onset:
                         await send_audio(held)
                     onset.clear()
                     return
