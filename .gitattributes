@@ -1,0 +1,3 @@
+# The pre-rendered voice lines are audio, never text: no line-ending
+# translation on any checkout (assets/voice, see audio/fallbacks.py).
+*.wav binary

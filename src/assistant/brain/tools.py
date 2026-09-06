@@ -13,6 +13,8 @@ import json
 from datetime import datetime, timedelta
 from typing import Any
 
+import httpx
+
 from assistant.brain.outcome import NeedsClarification, ToolOutcome, ok, unavailable
 from assistant.calendar.base import (
     CalendarApi,
@@ -604,7 +606,14 @@ class ToolExecutor:
         except Exception as err:  # noqa: BLE001 — any tool failure must become an
             # outcome the model can react to, never a crashed loop
             # (str(err) can be empty — httpx timeouts — so include the type)
-            return unavailable(f"Tool failed: {str(err) or type(err).__name__}")
+            detail = f"Tool failed: {str(err) or type(err).__name__}"
+            if isinstance(err, httpx.TransportError):
+                # Nothing reached Home Assistant at all — a hub that is off,
+                # unplugged or not answering, not one command it refused. The
+                # engine says that out loud in her own recorded voice rather
+                # than leaving dead air while the model reads "Tool failed".
+                return unavailable(detail, details={"home_unreachable": True})
+            return unavailable(detail)
 
     async def _set_lights(self, tool_input: dict[str, Any]) -> ToolOutcome:
         lights = await self._home.get_lights()

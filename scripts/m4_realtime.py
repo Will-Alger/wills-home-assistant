@@ -27,6 +27,7 @@ from assistant.announce import Announcer
 from assistant.app import RescanClock, record_session, reflect_session, wait_for_trigger
 from assistant.audio import devices, tones
 from assistant.audio.cues import VoiceCues
+from assistant.audio.fallbacks import SpokenFallbacks
 from assistant.audio.io import AudioIO
 from assistant.audio.mic import describe_device
 from assistant.brain.thinker import Thinker
@@ -66,6 +67,24 @@ from assistant.web import WebSearch
 console = Console()
 RESCAN_S = 30.0  # on a fallback microphone: how often the idle loop looks for the real one again
 MIC_STALL_S = 5.0  # idle with no mic frame for this long: the device is gone, reopen
+
+
+def recover(err: BaseException, failures: int, cues, fallbacks, speaker) -> float:
+    """One cycle died: what she does about it, and how long she then waits.
+
+    On the FIRST failure of a streak the error tone plays where it always
+    has, and then ONE pre-rendered line says what broke — "I can't reach my
+    voice service right now" when nothing could be reached (the wake word
+    with the network out), "Something failed. Check the log." otherwise. A
+    streak repeats neither: it backs off instead of spinning, because a
+    microphone that will not open would beep five times a second. Returns
+    the seconds to wait before trying again (5 s doubling to 60 s)."""
+    if failures == 1:
+        if cues is not None:
+            cues.error(f"{err}")  # never a listening ding on a failure
+        if fallbacks is not None:
+            fallbacks.after_failure(err, speaker)
+    return min(5.0 * 2 ** (failures - 1), 60.0)
 
 
 def say(status, text: str, style: str = "") -> None:
@@ -265,6 +284,9 @@ def build_engine(fake: bool):
     for change in applied:
         status.note(f"settings panel: {change}")
     cues = VoiceCues(rate=REALTIME_RATE, status=status)
+    # One player for the runner and the engine, so a collapse both of them
+    # see is spoken once (audio/fallbacks.py).
+    fallbacks = SpokenFallbacks()
 
     def request_restart() -> None:
         # the runner exits after this cycle; the watchdog brings her back
@@ -334,6 +356,7 @@ def build_engine(fake: bool):
         cues=cues,
         panel=panel,
         latency=latency,
+        fallbacks=fallbacks,
     )
     scheduler._executor = engine._executor  # scheduled actions run through her tools
     scheduler.briefing = compose_briefing(calendar, board, scheduler, announcer, settings.owner_name)
@@ -345,6 +368,7 @@ def build_engine(fake: bool):
     engine.home = home
     engine.status = status  # what the settings panel shows
     engine.cues = cues
+    engine.fallbacks = fallbacks  # the runner's recovery path speaks too
     engine.panel = panel
     engine.latency = latency
     engine.overrides = overrides
@@ -474,6 +498,9 @@ async def voice(fake: bool) -> int:
     staged = os.environ.get("ALEXA_STAGED_TASK", "").strip()
     if staged:
         say(status, f"◈ running the STAGED build of task {staged}", "magenta")
+    spoken = getattr(engine, "fallbacks", None)
+    if spoken is not None and (gap := spoken.note()):
+        say(status, gap, "yellow")  # she would have nothing to say when a service dies
     presence = getattr(engine, "presence", None)
     if presence is not None:
         with contextlib.suppress(Exception):  # HA down at boot: keep what we knew
@@ -516,13 +543,15 @@ async def voice(fake: bool) -> int:
             except (KeyboardInterrupt, asyncio.CancelledError):
                 raise
             except Exception as err:  # noqa: BLE001 — the app must never die on its own
-                # Back off instead of spinning: a mic that won't open would
-                # otherwise retry (and beep) five times a second. One error
-                # tone per streak, then 5 s → 60 s between attempts.
+                # One error tone and one spoken line per streak, then a
+                # growing wait instead of a spin (see recover()).
                 failures += 1
-                if failures == 1 and cues is not None:
-                    cues.error(f"{err}")  # never a listening ding on a failure
-                delay = min(5.0 * 2 ** (failures - 1), 60.0)
+                open_audio = engine.__dict__.get("_audio")
+                delay = recover(
+                    err, failures, cues,
+                    getattr(engine, "fallbacks", None),
+                    getattr(open_audio, "speaker", None),
+                )
                 say(status, f"recovered from: {err!r} — retrying in {delay:.0f}s", "red")
                 await asyncio.sleep(delay)
                 continue
