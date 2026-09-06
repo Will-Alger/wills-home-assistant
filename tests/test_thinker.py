@@ -54,6 +54,7 @@ async def test_think_tool_returns_at_once_and_the_answer_arrives_as_an_event(tmp
         api_key="k", model="m", voice="v", home=FakeHome(), owner="Will",
         announcer=announcer, thinker=Thinker(llm, owner="Will"),
     )
+    engine._live_conversation = 1  # he is still in the room: his answer may interrupt
     engine._live_transcript = [("you", "which thermostat should I buy?")]
     text, is_error = await engine._execute_brain_tool("think", {"question": "which thermostat should I buy"})
     assert not is_error and "thinking" in text.lower()

@@ -142,6 +142,7 @@ class Settings(BaseSettings):
     wake_model: str = "alexa"
     wake_threshold: float = 0.5  # raise if false wakes, lower if it misses you
     audio_input_device: str = ""  # "" = default mic; index or name substring
+    audio_output_device: str = ""  # "" = default speaker; index or name substring
     stt_provider: str = "deepgram"
     deepgram_api_key: str = ""
     # 0 = provider default. Raise toward ~0.85 if it ends your turn at
@@ -171,6 +172,15 @@ class Settings(BaseSettings):
     # True talk-over (interrupt by just speaking). ONLY with headphones — on
     # open speakers the mic hears the assistant and it interrupts itself.
     realtime_talk_over: bool = False
+    # Loudspeaker talk-over, tentatively: while she speaks, a sustained rise of
+    # the mic above her own echo pauses playback and streams the mic to the
+    # server; its speech detection confirms (she stops, your turn) or, within
+    # 1.5 s, nothing does and she resumes where she paused. The wake phrase
+    # still interrupts instantly. Turn off if the room makes her stall.
+    realtime_tentative_interrupt: bool = True
+    # Server-side noise reduction before VAD and the model: far_field for a
+    # desk microphone at speaking distance, near_field for a headset, "" off.
+    realtime_noise_reduction: str = "far_field"
 
     # Push to talk: hold this system-wide hotkey and speak; letting go ends
     # the turn (turn detection is off while it is held, so a pause can never

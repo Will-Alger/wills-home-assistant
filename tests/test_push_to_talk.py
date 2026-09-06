@@ -338,3 +338,50 @@ def test_between_holds_she_is_neither_listening_nor_working() -> None:
     assert not cues.listening and not status.listening
     assert status.snapshot()["state"] == "idle"
     assert cues.played == ["wake"]  # going quiet is silent: a tone would be a lie
+
+
+# ── the merge with main: a hotkey turn keeps everything else she gained ────
+
+
+async def test_a_hotkey_session_still_gets_noise_reduction_and_the_vocabulary() -> None:
+    """turn_detection null is the ONLY thing push to talk changes about the
+    audio input: the desk mic's noise reduction and the transcriber's list of
+    house names ride along, or a held turn would be transcribed worse than a
+    spoken one."""
+    engine = RealtimeEngine(
+        api_key="k", model="m", voice="v", home=FakeHome(), owner="Will",
+        name="Alexa", noise_reduction="far_field",
+    )
+    audio_in = (await engine._session_config("whisper-1", turn_detection=False))["audio"]["input"]
+    assert audio_in["turn_detection"] is None
+    assert audio_in["noise_reduction"] == {"type": "far_field"}
+    assert "Alexa" in audio_in["transcription"]["prompt"]
+    assert audio_in["format"] == {"type": "audio/pcm", "rate": 24_000}
+
+    # ...and the mid-session toggle resends that block, only flipped.
+    back_on = engine.audio_input_update(turn_detection=True)
+    assert back_on["turn_detection"] == _SEMANTIC_VAD
+    assert back_on["noise_reduction"] == audio_in["noise_reduction"]
+    assert back_on["transcription"] == audio_in["transcription"]
+    assert "voice" not in back_on  # the API refuses it once she has spoken
+    off_again = engine.audio_input_update(turn_detection=False)
+    assert off_again["turn_detection"] is None
+    assert off_again["transcription"] == audio_in["transcription"]
+
+
+async def test_the_hotkey_session_uses_the_streams_it_was_given() -> None:
+    """One microphone and one speaker stay open across idle and talk (AudioIO):
+    a hold opens its session on those, never on streams of its own."""
+    engine, client = make_engine()
+    mic, speaker = LoudMic(), InstantSpeaker()
+    ptt = PushToTalk()
+    ptt.press()
+    session = asyncio.create_task(
+        engine.run_conversation(mic, speaker, None, QuietUi(), ptt=ptt, ptt_session=True)
+    )
+    await until(lambda: "input_audio_buffer.append" in client.connection.kinds())
+    await asyncio.sleep(_LONG_ENOUGH)
+    ptt.release()
+    await asyncio.wait_for(session, timeout=5)
+    assert speaker.chunks  # her reply went to the runner's speaker
+    assert mic.drained  # and the same microphone was handed back drained

@@ -94,6 +94,29 @@ async def test_scheduled_action_runs_a_home_tool_and_reports(tmp_path: Path) -> 
         sched.schedule(kind="action", label="x", at="10:00")
 
 
+async def test_a_scheduled_action_that_half_worked_is_never_announced_as_done(tmp_path: Path) -> None:
+    """She speaks this one on her own, so it obeys the same contract: a
+    partial outcome names the bulb that stayed dark instead of saying Done."""
+    clock = Clock(wed(17, 55))
+    home = FakeHome()
+    home.unresponsive = {"light.living_room_lamp"}
+    sched = Scheduler(
+        tmp_path / "schedule.json", executor=ToolExecutor(home), now=clock
+    )
+    sched.schedule(
+        kind="action",
+        label="evening lights",
+        at="18:00",
+        action={"tool": "set_lights", "input": {"changes": [{"target": "Living Room", "turn": "on"}]}},
+    )
+    clock.at = wed(18, 0) + 1
+
+    (said,) = await sched.tick()
+
+    assert "Done" not in said
+    assert "Living Room Lamp did not respond" in said
+
+
 def test_routines_apply_defaults_and_overrides_deterministically(tmp_path: Path) -> None:
     evening = Clock(wed(18))
     store = RoutineStore(tmp_path / "routines.json", now=evening)

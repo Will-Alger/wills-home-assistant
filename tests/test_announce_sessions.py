@@ -151,7 +151,7 @@ async def test_a_slow_tool_call_does_not_get_idled_out(tmp_path: Path, monkeypat
     engine, _client = make_engine(announcer, idle_timeout_s=0.3)
     finished: list[float] = []
 
-    async def slow_tool(connection, event, stats):
+    async def slow_tool(connection, event, stats, **_kw):
         await asyncio.sleep(0.9)  # three idle timeouts long
         finished.append(asyncio.get_running_loop().time())
         return False

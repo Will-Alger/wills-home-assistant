@@ -24,7 +24,7 @@ from typing import Any
 
 KINDS = (
     "tool", "action", "watch", "schedule", "notification", "session", "presence",
-    "task", "push", "followup", "focus", "system",
+    "task", "push", "followup", "focus", "system", "thought",
 )
 _MAX_DAYS_PER_QUERY = 14
 

@@ -22,6 +22,8 @@ import contextlib
 import json
 import re
 import time
+from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -31,11 +33,17 @@ import numpy as np
 from openai import AsyncOpenAI
 from scipy.signal import resample_poly
 
+from assistant.brain.outcome import ToolOutcome, adapt
 from assistant.brain.tools import CALENDAR_TOOLS, TOOL_DEFINITIONS, ToolExecutor
 from assistant.calendar.base import CalendarApi, spoken_now
+from assistant.context import WorkingContext
 from assistant.home.base import HomeApi, device_table, media_table
-from assistant.memory import MemoryStore
+from assistant.latency import LatencyLog, TurnTrace, latency_report, since_label
+from assistant.memory import MemoryStore, subjects_in_play
 from assistant.tasks import TaskBoard
+from assistant.thoughts import ThoughtBook
+from assistant.thoughts import announcement as thought_announcement
+from assistant.vocabulary import MusicNames, vocabulary
 
 _STOP_COMMAND = re.compile(
     r"^(alexa[,!. ]*)?(stop( listening| it)?|be quiet|shut up|enough)[,!. ]*$"
@@ -45,6 +53,45 @@ _STOP_COMMAND = re.compile(
 def is_stop_command(transcript: str) -> bool:
     """Hard-stop phrases get an instant client-side session kill — no model."""
     return bool(_STOP_COMMAND.match(transcript.strip().lower()))
+
+
+# "That's all" means the conversation is over, whatever the model does next:
+# the ENGINE closes after her goodbye plays. The whole utterance must be a
+# wrap-up — "that's all for the lights, now play music" is not one.
+_WRAPUP_FILLER = re.compile(
+    r"^(?:(?:ok(?:ay)?|alright|all right|no|nope|yeah|yes|yep|cool|great|perfect|"
+    r"thanks|thank you|thanks a lot|alexa)\b[,!. ]*)+"
+)
+_WRAPUP_TAIL = re.compile(r"(?:[,!. ]*\b(?:alexa|thanks|thank you|for now|for today|for tonight))+[,!. ]*$")
+_WRAPUP = re.compile(
+    r"^(?:that'?s (?:all|it)|that'?ll (?:be all|do)|that is (?:all|it)|that will (?:be all|do)|"
+    r"nothing else|no thanks|no thank you|i'?m (?:good|done|all set)|we'?re done|all set|all good|"
+    r"never ?mind|(?:bye|goodbye|bye bye)|good ?night|(?:talk|see you|catch you) later|later)$"
+)
+
+
+# "Let me think" is a request for patience, not a turn: for a while the
+# engine stops every clock that could close the conversation and asks the
+# server to wait longer before deciding he is done speaking.
+_THINKING = re.compile(
+    r"^(?:(?:ok(?:ay)?|hmm+|um+|uh+|alexa)[,!. ]*)*"
+    r"(?:let me think(?: about (?:it|that))?|(?:hold|hang) on(?: a (?:sec(?:ond)?|moment|minute))?|"
+    r"(?:give me|just) a (?:sec(?:ond)?|moment|minute)|one (?:sec(?:ond)?|moment|minute)|"
+    r"wait a (?:sec(?:ond)?|moment|minute)|i'?m thinking|thinking)[,!. ]*$"
+)
+
+
+def is_thinking(transcript: str) -> bool:
+    """He asked for a moment ("let me think", "hang on")."""
+    return bool(_THINKING.match(transcript.strip().lower().replace("’", "'")))
+
+
+def is_wrapup(transcript: str) -> bool:
+    """The speaker said the conversation is over ("that's all", "thanks, bye")."""
+    text = transcript.strip().lower().replace("’", "'")
+    text = _WRAPUP_TAIL.sub("", text)
+    text = _WRAPUP_FILLER.sub("", text)
+    return bool(text) and bool(_WRAPUP.match(text.strip("!,. ")))
 
 
 REALTIME_RATE = 24_000
@@ -66,6 +113,16 @@ class, not just commands. Default to BRIEF: commands get a few words ("Done." \
 follow-up suggestions. In conversation, match the speaker's energy but stay \
 compact: a sentence or two unless asked to go deeper.
 
+Tools and speech: when a request needs a tool, the function call comes FIRST \
+— before any words. Speaking before the call is a mistake: not "let me check \
+your schedule", not "let me pull that up", not "I'll take a look". If you \
+must open your mouth first, the whole of it is "Sure." Then answer ONCE, in \
+one breath, with the substance: "Sure. Today you have the dentist at three \
+and run club at six thirty." Never narrate the mechanics — no "okay I have \
+it now", no "I'm going to read it" — the speaker hears the answer, never the \
+steps. A tool that takes seconds (web_search, think, a merge) may get \
+"checking" before it, then straight into the answer when it returns.
+
 You control the home through tools. No canned routines: interpret intent and \
 decide. Prefer area targets, and batch every lighting change into ONE \
 set_lights call. Music: browse_music finds music — scope 'library' for the \
@@ -83,9 +140,32 @@ MORE than the lights and media listed below — thermostats, switches, scenes, \
 sensors, weather: discover with search_entities, read with get_entity, act \
 via ha_call_service (the escape hatch — prefer the dedicated tools whenever \
 one fits). Questions about the world outside the home — store hours, news, \
-scores, facts, "is the highway closed" — go to web_search: say you're \
-checking, then give the answer in a sentence or two with one source named. \
+scores, facts, "is the highway closed" — go to web_search: at most \
+"checking" before it, then the answer in a sentence or two with one source \
+named, no "okay, here's what I found". \
 If something is truly beyond your tools, say so honestly.
+
+Every tool answers in the same shape, and you act on its STATUS, never on \
+the wording. success: say the summary and move on. partial: some of it \
+worked and some did not — say which part failed, by name, and NEVER say \
+"done" or "all set". pending: it is underway, so say it's underway and carry \
+on; never claim it finished and never poll. unavailable: it could not be \
+done — say so plainly with the reason, no pretending and no blind retry. \
+needs_clarification: ask the question in the summary verbatim, then stop and \
+wait for the answer. The summary is the sentence to say (when it is data, \
+read the answer out of it); details are the facts behind it; follow_up is an \
+instruction for YOU and is never spoken; reversible says whether undo_last \
+could put it back.
+
+Say what actually happened. A command tool tells you when only part of it \
+worked ("2 of 3 lights changed; the Bedroom Lamp did not respond") — pass \
+that on in your own words and say what you can do about it; never round it \
+up to "done". "Undo that", "no, put it back", "never mind" → undo_last: it \
+restores the lights you last changed, and when the last thing has no undo it \
+hands you the plain sentence saying so — read that out, don't apologise \
+around it. A change of mind is NOT an undo: "no, the bedroom", "keep the \
+brightness but make it blue" means ONE corrected set_lights aimed at the \
+entities in your working context below.
 
 Lights:
 {devices}
@@ -93,8 +173,15 @@ Lights:
 Media players:
 {media}
 
-Standing preferences ({owner}'s, apply them automatically, no announcement):
+Standing preferences — {owner}'s own, apply them automatically, no \
+announcement. These are the ones that fit what you are doing right now plus \
+the newest few, NOT everything you know: before telling him you remember \
+nothing about something, call list_memories with that subject:
 {preferences}
+
+House defaults — how this home runs for anyone in it, {owner} or a guest; \
+apply them the same way, and a personal preference above wins over one here:
+{house}
 
 Standing routines (applied to your tool calls automatically by the engine — \
 you don't have to remember them, but honor them when you explain choices):
@@ -111,14 +198,34 @@ to make one a standing preference (if yes: remember it as a preference, then \
 forget the observation's id; if no: just forget it):
 {observations}
 
-Memory: when the speaker states a durable preference ("from now on…", \
-"I always want…", "call me…"), store it with remember(kind="preference"). \
-If a new preference updates or contradicts a stored one, forget the old id \
-first and store the new — never keep both versions. \
+Memory: when the speaker states a durable preference of his own ("remember I \
+like…", "from now on…", "I always want…", "call me…"), store it with \
+remember(kind="preference"). When he sets it for the home rather than for \
+himself ("make that the house default", "that's how the house should be", \
+"for anyone here"), remember(kind="house") — same effect, shared with \
+guests. Every memory takes a subject (lights, music, climate, tv, calendar, \
+house, will): it is how it comes back to you in a later conversation about \
+that thing. \
+A change of mind about something already stored ("actually make that 2700") \
+is ONE call — update_memory with the old id and the new wording. It writes \
+the new version and retires the old together; never forget-then-remember, \
+and never leave two versions of the same thing standing. forget is only for \
+something he wants gone entirely. \
 Things they ask you to keep for later go in remember(kind="fact"); answer \
-"what do you remember?" via list_memories, and delete with forget after \
-checking ids. Store only what the speaker deliberately tells you — never \
+"what do you remember about the lights?" via list_memories with that subject \
+— your instructions carry only what is in play, so check before saying you \
+have nothing. Store only what the speaker deliberately tells you — never \
 ambient chatter.
+
+Working context — the last few minutes, carried across the close so "it", \
+"that", "them", "the same ones", "a little dimmer" or "the second option" \
+still land. It expires on its own (half an hour; an unanswered question, \
+ten minutes), so what is not written here is genuinely gone: {context} \
+Resolving a reference: with ONE fresh candidate, just act on it — never ask \
+which. With TWO plausible candidates, ask ONE specific question naming both \
+("the living room lamps, or the kitchen?") and nothing else. With none, ask \
+what they mean. This is not memory: never offer it as something you \
+remember about {owner}, and never let it override what he just said.
 {calendar}
 Recent conversations — so you can pick up where you left off; refer to them \
 naturally ("about that thermostat thing from earlier"), never read them out \
@@ -128,7 +235,9 @@ actions, watches that fired, scheduled things, your notifications, comings \
 and goings. "Did the porch light come on last night?", "what did you do \
 while I was gone?", "when did I leave today?" → journal_search. It knows only \
 what you did or watched — not every device change in the house; say so when \
-it comes up empty.
+it comes up empty. How QUICK you have been — "how fast were you today?", \
+"how long do you take to answer?", "were you quicker yesterday?" — is \
+latency_report, never the journal and never a guess.
 
 Your own development — the build loop, all by voice. You are an evolving open \
 project: project_status shows your recent code changes, read_roadmap your \
@@ -174,7 +283,8 @@ when due. follow_up is for things to bring up by TRIGGER: "when I get home \
 remind me to…" → arrival; "when I leave, remind me to lock up" → departure; \
 "next time we talk, ask me how the demo went" → next_conversation; "what are \
 you waiting on me for?" → waiting_on. Things you promised to bring up THIS \
-conversation — do it once, at a natural moment, then move on: {followups}. \
+conversation — do it once, at a natural moment, call raise_follow_up with \
+its id the moment you do, then move on: {followups}. \
 Routines: \
 when {owner} states a standing rule about HOW to do things ("after 5pm use \
 warm orange", "TV volume should default to 65%"), add_routine it — read it \
@@ -190,10 +300,18 @@ manage them. Normal watches wait out quiet hours; say urgent=true only when \
 
 Thinking: you have a slower, deeper mind. For questions that deserve real \
 thought — plans, comparisons, tradeoffs, "help me think through…", advice \
-you might get wrong off the cuff — call think with the full question, tell \
-{owner} you're thinking it over, and carry on; the answer arrives as an \
-EVENT within a minute or two and you say it in your own words. Never think \
-for home commands or simple facts (those are yours, instantly).
+you might get wrong off the cuff — call think with the full question and a \
+short topic, tell {owner} you're thinking it over, and carry on; the answer \
+arrives as an EVENT within a minute or two and you say it in your own \
+words. Never think for home commands or simple facts (those are yours, \
+instantly). If he changes the premise while one is running — "actually, \
+assume I wait a year" — do NOT wait for the old answer and do NOT tell him \
+to hold on: call think again straight away with the revised question and \
+the SAME topic. That supersedes the old job, whose answer is then never \
+spoken, and the new answer arrives asking you to open with a short bridge \
+naming what changed ("With the extra year in mind…") — say that bridge. \
+list_thoughts shows what is running, done, superseded or cancelled; \
+cancel_thought stops one he no longer wants.
 
 Announcements: a conversation may begin with an EVENT from your own system \
 (a build finished, a progress milestone, a rollback) rather than with the \
@@ -236,30 +354,70 @@ annoying. Never say the phrase "{wake_phrase}".
 
 _CALENDAR_INSTRUCTIONS = """
 Calendar: {owner}'s Apple calendar is connected, and right now it is {now}. \
-Read it with list_calendar_events before answering anything about the \
-schedule — never guess or recall. To add something, resolve the date and \
+Any question about the schedule: call list_calendar_events before saying a \
+word (never "let me check your schedule"), then answer with the events — \
+never guess or recall. To add something, resolve the date and \
 time yourself from the time above, say back the title, day and time, and \
 call create_calendar_event only once {owner} agrees; never invent a detail \
 you weren't given. Speak times naturally ("Thursday at three"), never as \
 timestamps, and read back the events that matter, not every field.
 """
 
+_SUBJECT_PARAM = {
+    "type": "string",
+    "description": (
+        "the short scope this belongs to — lights, music, climate, tv, "
+        "calendar, house, will; it is how the memory is found again later"
+    ),
+}
+
 MEMORY_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "name": "remember",
         "description": (
-            "Store a lasting memory. kind='preference' for standing "
-            "instructions applied automatically in every future conversation; "
-            "kind='fact' for things to recall later on request."
+            "Store a lasting memory. kind='preference' for the OWNER's own "
+            "standing instructions ('remember I like…', 'from now on…'); "
+            "kind='house' for a shared default for everyone in the home "
+            "('make that the house default'); kind='fact' for things to "
+            "recall later on request. Always pass a subject. To correct "
+            "something already stored, use update_memory instead — never "
+            "store a second version."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "kind": {"type": "string", "enum": ["preference", "fact"]},
+                "kind": {"type": "string", "enum": ["preference", "house", "fact"]},
                 "text": {"type": "string", "description": "one self-contained sentence"},
+                "subject": _SUBJECT_PARAM,
+                "supersedes": {
+                    "type": "integer",
+                    "description": (
+                        "id this replaces, if it corrects an existing memory — "
+                        "the old one is retired in the same write"
+                    ),
+                },
             },
-            "required": ["kind", "text"],
+            "required": ["kind", "text", "subject"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "update_memory",
+        "description": (
+            "Correct a stored memory in ONE step ('actually make that 2700'): "
+            "writes the new wording and retires the old id together, so there "
+            "is never a moment with both versions or neither. Use this for "
+            "every change of mind about something already remembered."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "description": "the memory being corrected"},
+                "text": {"type": "string", "description": "the new wording, in full"},
+                "subject": _SUBJECT_PARAM,
+            },
+            "required": ["id", "text"],
         },
     },
     {
@@ -267,23 +425,34 @@ MEMORY_TOOLS: list[dict[str, Any]] = [
         "name": "list_memories",
         "description": (
             "List stored memories with ids. Optional kind filter: preference, "
-            "fact, lesson, observation, or episode (the conversation journal — "
-            "use for 'what did we talk about/figure out recently?')."
+            "house, fact, lesson, observation, or episode (the conversation "
+            "journal — use for 'what did we talk about/figure out recently?'). "
+            "Optional subject filter (lights, music, calendar…) — the way to "
+            "answer 'what do you remember about the lights?', since your "
+            "instructions carry only what is in play. Corrected memories are "
+            "not listed; only what stands now."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "kind": {
                     "type": "string",
-                    "enum": ["preference", "fact", "lesson", "observation", "episode"],
-                }
+                    "enum": [
+                        "preference", "house", "fact", "lesson", "observation", "episode",
+                    ],
+                },
+                "subject": {"type": "string", "description": "one scope, e.g. lights"},
             },
         },
     },
     {
         "type": "function",
         "name": "forget",
-        "description": "Delete one stored memory by id (see list_memories first).",
+        "description": (
+            "Delete one stored memory by id — only when the owner wants it "
+            "GONE ('forget that I ever said…'). A change of mind is "
+            "update_memory, not forget-then-remember."
+        ),
         "parameters": {
             "type": "object",
             "properties": {"id": {"type": "integer"}},
@@ -368,6 +537,46 @@ JOURNAL_TOOLS: list[dict[str, Any]] = [
 ]
 _JOURNAL_TOOL_NAMES = {tool["name"] for tool in JOURNAL_TOOLS}
 
+# Tools whose result IS the answer: the reply must carry the substance in
+# one breath, never "I have it now, let me read it".
+_READ_TOOLS = frozenset(
+    {
+        "list_calendar_events", "journal_search", "recent_conversations", "list_notifications",
+        "announcement_history", "list_tasks", "task_detail", "search_tasks", "list_schedule",
+        "list_watches", "list_routines", "list_memories", "get_entity", "search_entities",
+        "browse_music", "web_search", "list_follow_ups", "waiting_on", "list_audio_devices",
+        "get_lights", "project_status", "read_roadmap", "read_history", "latency_report",
+    }
+)
+_READ_NOTE = (
+    "answer with the substance now, in one breath — no preamble about having "
+    "pulled it up, no 'I'll read it to you'"
+)
+_SILENT_CALL = (
+    " CALL THIS BEFORE SPEAKING: no 'let me check', no 'I'll pull that up' — "
+    "the first thing said is the answer it returns."
+)
+
+_CLOSE_NOTE = (
+    "if this completes a one-shot request, confirm in a few words and call "
+    "end_conversation in this same response"
+)
+
+
+def _also(first: str, second: str) -> str:
+    """Two instructions for the model in one follow_up line."""
+    return f"{first.rstrip('. ')}. {second}" if first else second
+
+
+# Tools whose work carries on after the call returns: she says it is underway
+# and announces the result later — `pending`, never "done".
+_PENDING_TOOLS = frozenset(
+    {"think", "start_task", "revise_task", "answer_task", "approve_task", "switch_build"}
+)
+# How a tool refuses for want of the owner's explicit yes. The sentence is a
+# question to ask him, so the contract calls it needs_clarification.
+_NEEDS_A_YES = "not done: restate"
+
 # Read-only lookups are not journaled — the journal is what she DID, not
 # every glance she took.
 _QUIET_TOOLS = frozenset(
@@ -375,8 +584,8 @@ _QUIET_TOOLS = frozenset(
         "get_lights", "search_entities", "get_entity", "browse_music", "list_memories",
         "list_tasks", "task_detail", "search_tasks", "web_search", "list_notifications",
         "announcement_history", "journal_search", "recent_conversations", "read_roadmap",
-        "read_history", "project_status", "show_me", "think", "list_watches",
-        "list_schedule", "list_routines", "list_calendar_events",
+        "read_history", "project_status", "show_me", "think", "list_watches", "list_thoughts",
+        "list_schedule", "list_routines", "list_calendar_events", "latency_report",
     }
 )
 
@@ -385,6 +594,49 @@ _QUIET_TOOLS = frozenset(
 # shrink them.
 _INJECT_QUIET_S = 2.0
 _INJECT_MIN_AGE_S = 3.0
+_WRAPUP_GRACE_S = 1.5  # after "that's all" with nothing playing: close, don't listen
+_THINKING_S = 30.0  # after "let me think": no clock closes the conversation, VAD waits longer
+
+# Tentative talk-over on loudspeakers (docs/PLAN-VOICE-2026-09-05.md phase 4).
+_TENTATIVE_COOLDOWN_S = 0.8  # the first moments of a reply: learn her echo, never interrupt
+_ONSET_FRAMES = 3  # 80 ms frames above the threshold before playback is held (240 ms)
+_ECHO_FACTOR = 2.5  # the mic must rise this far above her own echo
+_QUIET_FACTOR = 4.0  # ...and above the room while nobody spoke
+_ABS_FLOOR = 400.0  # int16 RMS: below this nothing is speech at a desk mic
+_FALSE_ALARM_S = 1.5  # held this long with no server speech detection: resume
+
+
+def _rms(frame: bytes) -> float:
+    samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
+    return float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
+
+
+class _Levels:
+    """Mic level bookkeeping for tentative talk-over: the room while he can
+    talk freely, and her own echo during the first moments of each reply."""
+
+    def __init__(self) -> None:
+        self.quiet_level = 0.0
+        self.echo_level = 0.0
+        self.noted = False
+        self._playback_started: float | None = None
+
+    def quiet(self, level: float) -> None:
+        self.quiet_level = level if not self.quiet_level else 0.95 * self.quiet_level + 0.05 * level
+
+    def new_playback(self, now: float) -> None:
+        self._playback_started = now
+        self.echo_level = 0.0
+        self.noted = False  # the "armed" line is printed once per reply
+
+    def calibrating(self, now: float) -> bool:
+        return self._playback_started is not None and now - self._playback_started < _TENTATIVE_COOLDOWN_S
+
+    def echo(self, level: float) -> None:
+        self.echo_level = max(self.echo_level, level)
+
+    def threshold(self) -> float:
+        return max(self.echo_level * _ECHO_FACTOR, self.quiet_level * _QUIET_FACTOR, _ABS_FLOOR)
 
 # Push to talk. A hold shorter than this, or one carrying nothing but room
 # tone, is a slip of the hand: throw the audio away rather than make her
@@ -409,15 +661,50 @@ BRAIN_TOOLS: list[dict[str, Any]] = [
             "reasoning (a slower frontier model with your memory, your task "
             "board and this conversation as context): plans, comparisons, "
             "tradeoffs, advice, anything you might get wrong off the cuff. "
-            "Returns at once — tell the owner you're thinking it over and "
-            "keep talking; the answer arrives on its own within a minute or "
-            "two as an EVENT you then say in your own words. Never for home "
-            "commands or simple facts."
+            "Returns at once with a thought id — tell the owner you're "
+            "thinking it over and keep talking; the answer arrives on its own "
+            "within a minute or two as an EVENT you then say in your own "
+            "words. If he changes the premise while it runs ('actually, "
+            "assume I wait a year'), call think AGAIN with the revised "
+            "question and the same topic: the old job is superseded and its "
+            "answer is never spoken. Never for home commands or simple facts."
         ),
         "parameters": {
             "type": "object",
-            "properties": {"question": {"type": "string", "description": "the question, in full"}},
+            "properties": {
+                "question": {"type": "string", "description": "the question, in full"},
+                "topic": {
+                    "type": "string",
+                    "description": (
+                        "one short line naming the subject ('buying a bike') — reuse "
+                        "the SAME topic when he revises the question"
+                    ),
+                },
+            },
             "required": ["question"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "list_thoughts",
+        "description": (
+            "The questions you have handed to your deeper reasoning: id, "
+            "topic, status (running, done, superseded, cancelled) and when "
+            "each was asked. Use it for 'are you still thinking about that?'"
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "cancel_thought",
+        "description": (
+            "Stop a running think: 'never mind', 'forget that question'. Its "
+            "answer is never spoken. Get the id from list_thoughts."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"id": {"type": "integer", "description": "the thought id"}},
+            "required": ["id"],
         },
     },
 ]
@@ -637,6 +924,15 @@ FOLLOWUP_TOOLS: list[dict[str, Any]] = [
             },
             "required": ["what", "when"],
         },
+    },
+    {
+        "type": "function",
+        "name": "raise_follow_up",
+        "description": (
+            "Call this the moment you bring one of the follow-ups listed in "
+            "your instructions up — only then does it count as kept."
+        ),
+        "parameters": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]},
     },
     {
         "type": "function",
@@ -945,7 +1241,7 @@ _TASK_TOOL_NAMES = {tool["name"] for tool in TASK_TOOLS}
 # these is a one-shot command — the engine closes it itself a few seconds
 # after the spoken confirmation, because the model cannot be trusted to.
 COMMAND_TOOLS = frozenset(
-    {"set_lights", "media_control", "play_music", "launch_app", "ha_call_service"}
+    {"set_lights", "media_control", "play_music", "launch_app", "ha_call_service", "undo_last"}
 )
 
 _RESTART_TOOL = {
@@ -979,10 +1275,12 @@ PANEL_TOOLS: list[dict[str, Any]] = [
         "description": (
             "Put your Settings panel on the desktop screen — 'open the "
             "settings panel', 'show me your settings'. It shows which "
-            "microphone you are on, whether you are listening right now, "
-            "your voice, your wake word, a status line and a live log, and "
-            "it has controls to change your voice or wake word and to "
-            "restart you. It never turns listening on or off."
+            "microphone and speaker you are on, whether you are listening "
+            "right now, your voice, your wake word, a status line and a live "
+            "log, and it has controls to change your voice or wake word, to "
+            "pick the microphone and speaker (saved, applied at the next "
+            "conversation), to re-scan devices, and to restart you. It never "
+            "turns listening on or off."
         ),
         "parameters": {"type": "object", "properties": {}},
     },
@@ -992,8 +1290,63 @@ PANEL_TOOLS: list[dict[str, Any]] = [
         "description": "Take the Settings panel off the screen — 'close the settings panel'.",
         "parameters": {"type": "object", "properties": {}},
     },
+    {
+        "type": "function",
+        "name": "list_audio_devices",
+        "description": (
+            "The microphones and speakers plugged in right now, and which are "
+            "saved — 'what audio devices do you see?', or before switching."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "use_audio_device",
+        "description": (
+            "Switch and SAVE the microphone and/or speaker she uses — 'use my "
+            "AirPods', 'switch the mic to the Snowball', 'back to the default "
+            "speaker'. A name fragment is enough (\"airpods\"); 'System default' "
+            "means whatever Windows prefers. Takes effect from the next "
+            "conversation, no restart. If nothing matches, the reply lists what "
+            "is plugged in — read that back."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "microphone": {"type": "string"},
+                "speaker": {"type": "string"},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "name": "refresh_audio_devices",
+        "description": "Re-scan the audio devices after something was just paired or plugged in.",
+        "parameters": {"type": "object", "properties": {}},
+    },
 ]
 _PANEL_TOOL_NAMES = {tool["name"] for tool in PANEL_TOOLS}
+
+LATENCY_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "latency_report",
+        "description": (
+            "How fast you have actually been, from the turn log: the median "
+            "wake-to-chime, the median gap between the speaker finishing and "
+            "your first word, and your slowest tool. For 'how fast were you "
+            "today?', 'how long do you take to answer?', 'were you quicker "
+            "yesterday?'. since: today (default) | yesterday | week | a number "
+            "of hours | an ISO date. It returns the sentence to say — call it "
+            "before you speak and read the numbers out, never guess them."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"since": {"type": "string"}},
+        },
+    },
+]
+_LATENCY_TOOL_NAMES = {tool["name"] for tool in LATENCY_TOOLS}
 
 
 def realtime_tools(*, calendar: bool = False) -> list[dict[str, Any]]:
@@ -1003,7 +1356,9 @@ def realtime_tools(*, calendar: bool = False) -> list[dict[str, Any]]:
         {
             "type": "function",
             "name": tool["name"],
-            "description": tool["description"],
+            # the model weighs a tool's description above the instructions:
+            # a lookup is called before a word is spoken, or she narrates
+            "description": tool["description"] + (_SILENT_CALL if tool["name"] in _READ_TOOLS else ""),
             "parameters": tool["input_schema"],
         }
         for tool in definitions
@@ -1086,6 +1441,8 @@ class RealtimeEngine:
         command_close_s: float = 8.0,
         info_close_s: float = 15.0,
         talk_over: bool = False,
+        tentative_interrupt: bool = False,
+        noise_reduction: str = "",
         eagerness: str = "high",
         extra_instructions: str = "",
         memory: MemoryStore | None = None,
@@ -1095,36 +1452,57 @@ class RealtimeEngine:
         announcer: Any | None = None,
         web: Any | None = None,
         thinker: Any | None = None,
+        thoughts: Any | None = None,
         watches: Any | None = None,
         scheduler: Any | None = None,
         routines: Any | None = None,
         journal: Any | None = None,
         sessions: Any | None = None,
+        context: WorkingContext | None = None,
         presence: Any | None = None,
         followups: Any | None = None,
         delivery: Any | None = None,
         cues: Any | None = None,
         panel: Any | None = None,
+        latency: LatencyLog | None = None,
+        receipts: Any | None = None,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
         self._journal = journal  # what she did and saw, by day
         self._sessions = sessions  # recent conversations, for continuity
+        self._context = context  # the expiring last-few-minutes record ("it", "that")
         self._presence = presence  # is the owner home? (a wake session is proof)
         self._followups = followups  # things she promised to bring up later
         self._delivery = delivery  # DeliverySettings: focus + per-kind preferences
-        self._raised_followups: list[int] = []  # conversation follow-ups shown this session
+        # Conversation follow-ups she carried into this session, and the ones
+        # she actually raised (raise_follow_up). A promise is kept only when
+        # it was spoken — see _settle_followups.
+        self._pending_followups: list[int] = []
+        self._raised_followups: list[int] = []
+        self._session_opened = 0.0  # wall clock of the conversation now running
+        # (state, ids) markings that wait for the audio carrying them to play
+        self._deferred_reads: list[tuple[str, list[int]]] = []
         self._model = model
         self._voice = voice  # may be swapped to FALLBACK_VOICE during _configure
         self.voice_note: str | None = None
         self.restart_requested = False  # set by restart_self; the runner acts on it
         self._home = home
+        # Proper names for the transcriber, warmed off the critical path.
+        self.music_names = MusicNames(home)
         self._calendar = calendar
-        self._executor = ToolExecutor(home, calendar, web, routines)
+        self._executor = ToolExecutor(home, calendar, web, routines, receipts)
         self._scheduler = scheduler  # timers/alarms/scheduled actions
         self._routines = routines  # deterministic defaults on tool calls
         self._thinker = thinker  # slow reasoning; answers arrive as events
+        # Every think is a job with an id, a topic and a status. Without a
+        # path it is memory-only, so ids and supersession still work.
+        self._thoughts = thoughts if thoughts is not None else ThoughtBook()
         self._watches = watches  # WatchStore: standing rules on the house
         self._thinking: list[asyncio.Task] = []
+        # Which conversation is open right now (0 = none). A thought answer
+        # is urgent only while the conversation that asked it is still live.
+        self._conversations = 0
+        self._live_conversation = 0
         self._live_transcript: list[tuple[str, str]] = []
         self._owner = owner
         self._name = name
@@ -1134,6 +1512,13 @@ class RealtimeEngine:
         self._info_close_s = info_close_s
         self.last_response_tools: list[str] = []  # set by _handle_response_done
         self._talk_over = talk_over  # headphones only: mic streams during playback
+        # Loudspeakers: while she talks, a sustained rise of the mic above her
+        # own echo pauses playback and probes the server for real speech.
+        self._tentative = tentative_interrupt
+        # Server-side noise reduction, applied before VAD and the model:
+        # "far_field" for a desk mic at speaking distance, "near_field" for
+        # a headset, "" for none. (SDK-verified: NoiseReductionType.)
+        self._noise_reduction = noise_reduction.strip().lower()
         self._eagerness = eagerness  # semantic VAD: how fast it decides you're done
         self._extra_instructions = extra_instructions
         self._memory = memory
@@ -1141,10 +1526,18 @@ class RealtimeEngine:
         self._announcer = announcer  # queued things she says on her own
         self.announcer = announcer  # the runner's idle loop polls it too
         self._cues = cues  # listening earcons: start / end / error
+        self._latency = latency  # logs/turns.jsonl: how long each step took
+        self._trace = TurnTrace()  # replaced per conversation; this one writes nothing
         self._panel = panel  # the desktop Settings panel she opens by voice
         self.last_response_followup = False  # a tool ran: more audio is coming
         self._instructions_stale = False  # a preference changed mid-session
+        # The last few tools she actually used — what "in play" means when
+        # memory is retrieved by subject (memory.subjects_in_play).
+        self._tools_in_play: deque[str] = deque(maxlen=6)
         self._transcription_model: str | None = None  # what _configure settled on
+        # The audio.input block of the last session.update, so a mid-session
+        # turn-detection toggle resends it unchanged (audio_input_update).
+        self._audio_input_sent: dict[str, Any] = {}
         self._usage_log = usage_log
 
     @property
@@ -1152,19 +1545,20 @@ class RealtimeEngine:
         """The voice actually in use — a gated one falls back on connect."""
         return self._voice
 
-    def _audio_input(
-        self, transcription_model: str | None, *, turn_detection: bool = True
-    ) -> dict[str, Any]:
-        """The `audio.input` block. turn_detection=False sends null, which the
-        API reads as "the client decides when a turn ends" — push to talk."""
-        audio_in: dict[str, Any] = {
-            "format": {"type": "audio/pcm", "rate": REALTIME_RATE},
-            "turn_detection": (
-                {"type": "semantic_vad", "eagerness": self._eagerness} if turn_detection else None
-            ),
-        }
-        if transcription_model:
-            audio_in["transcription"] = {"model": transcription_model}
+    def _turn_detection(self, on: bool) -> dict[str, Any] | None:
+        """Who decides a turn has ended. None is push to talk: the API reads
+        it as "the client will commit and ask for the response itself"
+        (SDK-verified: RealtimeAudioConfigInput.turn_detection is Optional)."""
+        return {"type": "semantic_vad", "eagerness": self._eagerness} if on else None
+
+    def audio_input_update(self, *, turn_detection: bool) -> dict[str, Any]:
+        """The `audio.input` block of the last session.update with turn
+        detection flipped — for handing turn-taking to the server mid-session,
+        or taking it back. The noise reduction and the transcriber's
+        vocabulary come along exactly as they were sent, and `voice` is not in
+        here at all: the API refuses it once she has spoken."""
+        audio_in = dict(self._audio_input_sent)
+        audio_in["turn_detection"] = self._turn_detection(turn_detection)
         return audio_in
 
     async def _session_config(
@@ -1184,16 +1578,34 @@ class RealtimeEngine:
             else ""
         )
         if self._followups is not None:
-            self._raised_followups = [f.id for f in self._followups.for_conversation()]
+            # Only what she was already carrying: a promise made in THIS
+            # conversation is not kept by the sentence that made it. (This
+            # runs again mid-session whenever the instructions are refreshed.)
+            opened = self._session_opened or time.time()
+            self._pending_followups = [
+                f.id for f in self._followups.for_conversation() if f.created <= opened
+            ]
+        lights = await self._home.get_lights()
+        players = await self._home.media_players()
+        # Which memories are worth carrying into this stretch: the subjects of
+        # the tools just used and the entities they touched. Everything else
+        # stays in the store, one list_memories away.
+        subjects = subjects_in_play(
+            tools=self._tools_in_play,
+            entities=[row["id"] for row in self._context.entities()]
+            if self._context is not None
+            else (),
+        )
         instructions = _INSTRUCTIONS.format(
             name=self._name,
             owner=self._owner,
             wake_phrase=self._wake_phrase,
-            devices=device_table(await self._home.get_lights()),
-            media=media_table(await self._home.media_players()),
+            devices=device_table(lights),
+            media=media_table(players),
             preferences=(
-                self._memory.preferences_text() if self._memory else "(memory not enabled)"
+                self._memory.preferences_text(subjects) if self._memory else "(memory not enabled)"
             ),
+            house=self._memory.house_text(subjects) if self._memory else "(none)",
             lessons=self._memory.lessons_text() if self._memory else "(none)",
             observations=self._memory.observations_text() if self._memory else "(none)",
             other_repos=other_repos,
@@ -1207,11 +1619,46 @@ class RealtimeEngine:
             staged=self._board.staged_paragraph() if self._board else "",
             unread=self._announcer.unread_summary() if self._announcer is not None else "none",
             recent=self._sessions.recent_text() if self._sessions is not None else "none",
+            context=(
+                self._context.text()
+                if self._context is not None
+                else "(not kept between sessions)"
+            ),
             presence=self._presence.describe() if self._presence is not None else "(not tracked)",
             followups=self._followups.text() if self._followups is not None else "none",
             delivery=self._delivery.text() if self._delivery is not None else "defaults",
             extra=extra,
         )
+        audio_in: dict[str, Any] = {
+            "format": {"type": "audio/pcm", "rate": REALTIME_RATE},
+            "turn_detection": self._turn_detection(turn_detection),
+        }
+        if transcription_model:
+            transcription: dict[str, Any] = {"model": transcription_model}
+            # The transcriber is a second model that never hears the audio the
+            # way she does; these are the names it would otherwise invent
+            # spellings for. Kick off the next library refresh while we're here
+            # — it lands in the background, in time for the session after this.
+            self.music_names.refresh_soon()
+            names = vocabulary(
+                name=self._name,
+                owner=self._owner,
+                lights=lights,
+                players=players,
+                playlists=self.music_names.playlists,
+                artists=self.music_names.artists,
+                tasks=[t.title for t in self._board.tasks() if not t.closed]
+                if self._board is not None
+                else (),
+            )
+            if names:
+                transcription["prompt"] = names
+            audio_in["transcription"] = transcription
+        if self._noise_reduction in ("near_field", "far_field"):
+            audio_in["noise_reduction"] = {"type": self._noise_reduction}
+        # Kept so a mid-session toggle can resend this block with only the
+        # turn detection changed (audio_input_update).
+        self._audio_input_sent = dict(audio_in)
         tools = realtime_tools(calendar=self._calendar is not None) + (
             MEMORY_TOOLS if self._memory else []
         )
@@ -1235,6 +1682,8 @@ class RealtimeEngine:
             tools += DELIVERY_TOOLS
         if self._panel is not None:
             tools += PANEL_TOOLS
+        if self._latency is not None:
+            tools += LATENCY_TOOLS
         return {
             "type": "realtime",
             "instructions": instructions,
@@ -1242,7 +1691,7 @@ class RealtimeEngine:
             "tool_choice": "auto",
             "output_modalities": ["audio"],
             "audio": {
-                "input": self._audio_input(transcription_model, turn_detection=turn_detection),
+                "input": audio_in,
                 "output": {
                     "format": {"type": "audio/pcm", "rate": REALTIME_RATE},
                     "voice": self._voice,
@@ -1278,6 +1727,7 @@ class RealtimeEngine:
                 kind = event.type
                 if kind == "session.updated":
                     self._transcription_model = transcribers[0]
+                    self._trace.connected()  # the session is live and configured
                     return
                 if kind == "error":
                     message = str(getattr(event, "error", event)).lower()
@@ -1295,10 +1745,20 @@ class RealtimeEngine:
                 # anything else (session.created, ...) is ignored during setup
         raise RuntimeError("Realtime session config could not be applied")
 
-    async def _handle_response_done(self, connection: Any, event: Any, stats: SessionStats) -> bool:
+    async def _handle_response_done(
+        self,
+        connection: Any,
+        event: Any,
+        stats: SessionStats,
+        *,
+        late_note: Callable[[], str] | None = None,
+    ) -> bool:
         """Execute any function calls; returns True when end_conversation fired.
         Side effect: self.last_response_tools lists what this response called —
-        the quick-close logic in run_conversation reads it."""
+        the quick-close logic in run_conversation reads it. `late_note` is
+        asked, once the tool has run, whether the owner said something in the
+        meantime; its sentence rides on the tool output so the model answers
+        the correction, not the request it superseded."""
         self.last_response_tools = []
         response = getattr(event, "response", None)
         usage = getattr(response, "usage", None)
@@ -1323,54 +1783,26 @@ class RealtimeEngine:
                 args = json.loads(item.arguments or "{}")
             except json.JSONDecodeError:
                 args = {}
-            if call_name == "restart_self":
-                self.restart_requested = True
-                result_text, is_error = (
-                    (
-                        "restart armed — say a brief goodbye and end the conversation; "
-                        "you'll be back in about fifteen seconds"
-                    ),
-                    False,
-                )
-            elif call_name in _MEMORY_TOOL_NAMES:
-                result_text, is_error = self._execute_memory(call_name, args)
-            elif call_name in _TASK_TOOL_NAMES:
-                result_text, is_error = await self._execute_task_tool(call_name, args)
-            elif call_name in _SYSTEM_TOOL_NAMES:
-                result_text, is_error = self._execute_system_tool(call_name, args)
-            elif call_name == "confirm_action":
-                result_text, is_error = await self._execute_confirm_action(args)
-            elif call_name in _SCHEDULE_TOOL_NAMES:
-                result_text, is_error = self._execute_schedule_tool(call_name, args)
-            elif call_name in _FOLLOWUP_TOOL_NAMES:
-                result_text, is_error = self._execute_followup_tool(call_name, args)
-            elif call_name in _DELIVERY_TOOL_NAMES:
-                result_text, is_error = self._execute_delivery_tool(call_name, args)
-            elif call_name in _ROUTINE_TOOL_NAMES:
-                result_text, is_error = self._execute_routine_tool(call_name, args)
-            elif call_name in _WATCH_TOOL_NAMES:
-                result_text, is_error = self._execute_watch_tool(call_name, args)
-            elif call_name in _JOURNAL_TOOL_NAMES:
-                result_text, is_error = self._execute_journal_tool(call_name, args)
-            elif call_name in _PANEL_TOOL_NAMES:
-                result_text, is_error = self._execute_panel_tool(call_name)
-            elif call_name in _BRAIN_TOOL_NAMES:
-                self._live_transcript = stats.transcript
-                result_text, is_error = await self._execute_brain_tool(call_name, args)
-            else:
-                result_text, is_error = await self._executor.execute(call_name, args)
+            call_started = time.monotonic()
+            self._live_transcript = stats.transcript  # what think() reads the room from
+            outcome = await self._run_tool(call_name, args)
+            result_text, is_error = outcome.as_pair()
+            self._trace.tool(call_name, time.monotonic() - call_started)
+            self._tools_in_play.append(call_name)  # scopes the memory she gets
             tool_hook = getattr(self, "_ui_tool_hook", None)
             if tool_hook is not None:
                 tool_hook(call_name, result_text, is_error)
-            outcome = "ERROR: " if is_error else ""
-            stats.transcript.append((f"tool {call_name}", outcome + result_text[:200]))
-            payload: dict[str, Any] = {"error" if is_error else "result": result_text}
+            flag = "ERROR: " if is_error else ""
+            stats.transcript.append((f"tool {call_name}", flag + result_text[:200]))
+            if not is_error:
+                with contextlib.suppress(Exception):  # continuity never breaks a command
+                    self._note_context(call_name, args, result_text)
             applied = getattr(self._executor, "last_routines", [])
             if self._journal is not None and call_name not in _QUIET_TOOLS:
                 with contextlib.suppress(Exception):
                     self._journal.write(
                         "tool",
-                        f"{call_name}: {outcome}{result_text[:160]}",
+                        f"{call_name}: {flag}{result_text[:160]}",
                         source="voice",
                         data={
                             "args": args,
@@ -1379,14 +1811,18 @@ class RealtimeEngine:
                         },
                     )
             if applied and not is_error:
-                payload["routines_applied"] = applied
+                outcome.details["routines_applied"] = applied
             if call_name in COMMAND_TOOLS and not is_error:
                 # Decision-time nudge beats buried instructions: the engine's
                 # quick-close timer remains the backstop if this is ignored.
-                payload["note"] = (
-                    "if this completes a one-shot request, confirm in a few "
-                    "words and call end_conversation in this same response"
-                )
+                outcome.follow_up = _also(outcome.follow_up, _CLOSE_NOTE)
+            elif call_name in _READ_TOOLS and not is_error:
+                # "Sure, today you have…", not "I have it now"
+                outcome.follow_up = _also(outcome.follow_up, _READ_NOTE)
+            payload: dict[str, Any] = outcome.payload()
+            since = late_note() if late_note is not None else ""
+            if since:
+                payload["since"] = since  # he spoke while this ran: answer THAT
             outputs.append(
                 {
                     "type": "conversation.item.create",
@@ -1415,6 +1851,77 @@ class RealtimeEngine:
         self.last_response_followup = bool(outputs) and not closing
         return closing
 
+    async def _run_tool(self, name: str, args: dict[str, Any]) -> ToolOutcome:
+        """One tool call, in the one shape every tool reports (brain/
+        outcome.py). The home tools already answer that way; the engine's own
+        still speak in (text, is_error) pairs and are ADAPTED here rather than
+        rewritten. The flag picks the status except where the engine knows
+        better: work that keeps running after the call is `pending`, and a
+        refusal for want of the owner's explicit yes is a question to ask
+        him, not a failure."""
+        if name == "restart_self":
+            self.restart_requested = True
+            return ToolOutcome(
+                "pending",
+                "restart armed — say a brief goodbye and end the conversation; "
+                "you'll be back in about fifteen seconds",
+            )
+        if name in _MEMORY_TOOL_NAMES:
+            pair = self._execute_memory(name, args)
+        elif name in _TASK_TOOL_NAMES:
+            pair = await self._execute_task_tool(name, args)
+        elif name in _SYSTEM_TOOL_NAMES:
+            pair = self._execute_system_tool(name, args)
+        elif name == "confirm_action":
+            pair = await self._execute_confirm_action(args)
+        elif name in _SCHEDULE_TOOL_NAMES:
+            pair = self._execute_schedule_tool(name, args)
+        elif name in _FOLLOWUP_TOOL_NAMES:
+            pair = self._execute_followup_tool(name, args)
+        elif name in _DELIVERY_TOOL_NAMES:
+            pair = self._execute_delivery_tool(name, args)
+        elif name in _ROUTINE_TOOL_NAMES:
+            pair = self._execute_routine_tool(name, args)
+        elif name in _WATCH_TOOL_NAMES:
+            pair = self._execute_watch_tool(name, args)
+        elif name in _JOURNAL_TOOL_NAMES:
+            pair = self._execute_journal_tool(name, args)
+        elif name in _PANEL_TOOL_NAMES:
+            pair = self._execute_panel_tool(name, args)
+        elif name in _LATENCY_TOOL_NAMES:
+            pair = self._execute_latency_tool(args)
+        elif name in _BRAIN_TOOL_NAMES:
+            pair = await self._execute_brain_tool(name, args)
+        else:
+            return await self._executor.run(name, args)
+        text, is_error = pair
+        status = ""
+        if is_error and text.startswith(_NEEDS_A_YES):
+            status = "needs_clarification"
+        elif not is_error and name in _PENDING_TOOLS:
+            # think answers on the spot when there is nobody to announce to.
+            status = "success" if name == "think" and self._announcer is None else "pending"
+        return adapt(text, is_error, status=status)
+
+    def _note_context(self, name: str, args: dict[str, Any], result: str) -> None:
+        """A tool succeeded: leave behind what "it", "that" or "a little
+        dimmer" should bind to after this session closes (context.py). Only
+        things worth referring to — a lookup is not an action."""
+        ctx = self._context
+        if ctx is None:
+            return
+        if name in COMMAND_TOOLS:
+            ctx.note_entities(getattr(self._executor, "last_entities", []))
+            ctx.note_action(name, args, result)
+        elif name == "think":
+            recent = self._thoughts.recent(1)
+            job = recent[0] if recent else None
+            question = " ".join(str(args.get("question", "")).split())[:80]
+            key = f"think:{job.id}" if job is not None else "think"
+            ctx.note_job(key, f"thinking over '{job.topic if job is not None else question}'")
+        elif name in ("start_task", "revise_task"):
+            ctx.note_job(f"task:{args.get('id') or 'latest'}", result)
+
     async def _execute_task_tool(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
         board = self._board
         if board is None:
@@ -1424,7 +1931,7 @@ class RealtimeEngine:
             if args.get("confirmed"):
                 return None
             return (
-                f"not done: restate the exact task to the owner and get an explicit "
+                f"{_NEEDS_A_YES} the exact task to the owner and get an explicit "
                 f"yes for {action}, then retry with confirmed=true"
             ), True
 
@@ -1513,40 +2020,115 @@ class RealtimeEngine:
             board.restart_requested = False
             self.restart_requested = True
 
+    def _last_said(self) -> str:
+        """The owner's most recent words — where "actually, assume…" lives."""
+        for role, text in reversed(self._live_transcript):
+            if role == "you" and str(text).strip():
+                return str(text)
+        return ""
+
+    def _current_topic(self) -> str:
+        """What the room is on now, for the freshness check: the working
+        context's topic while it is still live, else his last sentence."""
+        if self._context is not None:
+            with contextlib.suppress(Exception):
+                topic = str(self._context.snapshot().get("topic") or "")
+                if topic:
+                    return topic
+        return self._last_said()
+
     async def _execute_brain_tool(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
+        book = self._thoughts
+        if name == "list_thoughts":
+            return book.describe(), False
+        if name == "cancel_thought":
+            thought = book.cancel(args.get("id"))
+            if thought is None:
+                return "no thought with that id is still running", True
+            for task in self._thinking:
+                if task.get_name() == f"think:{thought.id}" and not task.done():
+                    task.cancel()  # stop paying for reasoning nobody wants
+            if self._announcer is not None:
+                self._announcer.cancel(f"thought:{thought.id}")
+            if self._context is not None:
+                self._context.clear_job(f"think:{thought.id}")
+            return f"stopped thinking about '{thought.topic}'; that answer will not arrive", False
         if name != "think" or self._thinker is None:
             return "deeper reasoning is not available right now", True
         question = " ".join(str(args.get("question", "")).split())
         if not question:
             return "think needs the question in full", True
+        try:
+            thought, replaced = book.start(
+                question,
+                topic=str(args.get("topic", "") or ""),
+                conversation=self._live_conversation,
+                said=self._last_said(),
+            )
+        except ValueError as err:
+            return str(err), True
+        for old in replaced:
+            for task in self._thinking:
+                if task.get_name() == f"think:{old.id}" and not task.done():
+                    task.cancel()
+            if self._announcer is not None:
+                self._announcer.cancel(f"thought:{old.id}")
+            if self._context is not None:
+                self._context.clear_job(f"think:{old.id}")
+        superseded = (
+            f" (this supersedes thought {replaced[-1].id} on the same topic; its answer "
+            "will never be spoken)"
+            if replaced
+            else ""
+        )
         transcript = list(self._live_transcript)
         if self._announcer is None:
             try:
-                return await self._thinker.think(question, transcript), False
+                answer = await self._thinker.think(question, transcript)
             except Exception as err:  # noqa: BLE001 — surfaced to the model
+                book.fail(thought.id, str(err) or type(err).__name__)
                 return f"thinking failed: {str(err) or type(err).__name__}", True
+            book.finish(thought.id, answer)
+            return answer, False
 
         async def deliver_later() -> None:
             try:
                 answer = await self._thinker.think(question, transcript)
-                text = f"Your deeper reasoning on '{question[:80]}': {answer}"
             except Exception as err:  # noqa: BLE001 — the owner still gets told
-                text = (
-                    f"I couldn't finish thinking about '{question[:80]}': "
-                    f"{str(err) or type(err).__name__}"
-                )
+                settled = book.fail(thought.id, str(err) or type(err).__name__)
+            else:
+                settled = book.finish(thought.id, answer)
+            if settled is None:
+                return  # superseded or cancelled meanwhile: never spoken
+            speak, why = book.deliverable(settled, current_topic=self._current_topic())
+            if not speak:
+                if self._journal is not None:
+                    with contextlib.suppress(Exception):
+                        self._journal.write(
+                            "thought",
+                            f"dropped an answer about '{settled.topic}': {why}",
+                            source="brain",
+                            data={"id": settled.id, "question": settled.question, "answer": settled.answer},
+                        )
+                return
+            # Urgent only while the conversation that asked is still open;
+            # afterwards it waits its turn like any other announcement.
+            live = settled.conversation and self._live_conversation == settled.conversation
             self._announcer.enqueue(
-                text,
+                thought_announcement(settled, self._owner),
                 kind="thought",
-                ref=f"thought:{time.time_ns()}",
-                priority="urgent",  # the owner asked; never held for quiet hours
+                ref=f"thought:{settled.id}",
+                priority="urgent" if live else "normal",
                 expires_in_s=3 * 3600,
             )
 
         self._thinking = [t for t in self._thinking if not t.done()]
-        self._thinking.append(asyncio.create_task(deliver_later()))
+        self._thinking.append(
+            asyncio.create_task(deliver_later(), name=f"think:{thought.id}")
+        )
         return (
-            "thinking it over in the background — tell the owner so and keep the "
+            f"thought {thought.id} on '{thought.topic}' is running in the background"
+            f"{superseded} — tell the owner you're thinking it over and keep the "
             "conversation going; the answer will arrive as an EVENT"
         ), False
 
@@ -1632,6 +2214,18 @@ class RealtimeEngine:
                     context=str(args.get("context", "") or ""),
                 )
                 return f"follow-up {item.id} set: '{item.what}' {store.when_text(item)}", False
+            if name == "raise_follow_up":
+                item = store.get(int(args.get("id", 0)))
+                if item is None or not item.active:
+                    return "no open follow-up with that id", True
+                if item.trigger != "conversation":
+                    return (
+                        f"follow-up {item.id} comes up {store.when_text(item)}, "
+                        "not in conversation — leave it be"
+                    ), True
+                if item.id not in self._raised_followups:
+                    self._raised_followups.append(item.id)
+                return f"follow-up {item.id} counts as raised", False
             if name == "list_follow_ups":
                 rows = store.describe()
                 return (json.dumps(rows) if rows else "no open follow-ups"), False
@@ -1767,11 +2361,15 @@ class RealtimeEngine:
             except (TypeError, ValueError):
                 return "ids must be integers", True
             state = "unread" if str(args.get("state", "read")).lower() == "unread" else "read"
-            changed = ann.mark_read(ids) if state == "read" else ann.mark_unread(ids)
-            if not changed:
+            found = [a for a in (ann.get(i) for i in ids) if a is not None]
+            if state == "read":
+                changing = [a.id for a in found if a.read is None and not a.cancelled]
+            else:
+                changing = [a.id for a in found if a.read is not None]
+            if not changing:
                 return "no notifications matched those ids", True
-            self._instructions_stale = True
-            return f"{changed} marked {state}", False
+            self._defer_read(state, changing)
+            return f"{len(changing)} marked {state}", False
         # announcement_history is the pre-M11 name; it lives on as scope=all
         scope = "all" if name == "announcement_history" else str(args.get("scope", "") or "unread").lower()
         kind = str(args.get("kind", "") or "").strip()
@@ -1781,16 +2379,17 @@ class RealtimeEngine:
             if item is None:
                 return "I haven't announced anything yet", False
             row = ann.to_row(item)
-            if ann.mark_read([item.id]):
-                self._instructions_stale = True
+            if item.read is None and not item.cancelled:
+                self._defer_read("read", [item.id])
             return json.dumps([row]), False
         if scope == "unread":
             rows = ann.unread(kinds=kinds)
             if not rows:
                 return "nothing unread", False
             out = [ann.to_row(a) for a in rows[-20:]]  # as they were: he is hearing them now
-            ann.mark_read([a.id for a in rows])  # listing them = he has heard them
-            self._instructions_stale = True
+            # Listing them is not hearing them: this waits for the answer that
+            # carries them to finish playing (_apply_deferred_reads).
+            self._defer_read("read", [a.id for a in rows])
             return json.dumps(out), False
         if scope != "all":
             return "scope must be unread, all, or last", True
@@ -1803,16 +2402,86 @@ class RealtimeEngine:
             return "I haven't announced anything in that window", False
         return json.dumps(rows), False
 
-    def _execute_panel_tool(self, name: str) -> tuple[str, bool]:
+    def _defer_read(self, state: str, ids: list[int]) -> None:
+        """Hold a read/unread marking until the words carrying it are heard.
+        A tool's result is not an answer — the answer is the audio that
+        follows it, and a barge-in over that means he never heard the list."""
+        if ids:
+            self._deferred_reads.append((state, list(ids)))
+
+    def _apply_deferred_reads(self, *, interrupted: bool = False) -> list[int]:
+        """The response carrying them finished playing. Cut off by a barge-in:
+        nothing is marked and the items stay where they were."""
+        held, self._deferred_reads = self._deferred_reads, []
+        if self._announcer is None or interrupted:
+            return []
+        applied: list[int] = []
+        for state, ids in held:
+            marker = self._announcer.mark_read if state == "read" else self._announcer.mark_unread
+            if marker(ids):
+                applied.extend(ids)
+                self._instructions_stale = True
+        return applied
+
+    def _settle_followups(self, stats: SessionStats) -> None:
+        """End of the conversation: retire only the promises she spoke."""
+        if self._followups is None or not self._pending_followups:
+            return
+        said = " ".join(text for who, text in stats.transcript if who == "alexa")
+        with contextlib.suppress(Exception):
+            self._followups.settle_conversation(
+                self._pending_followups, said, raised=self._raised_followups
+            )
+        self._pending_followups = []
+        self._raised_followups = []
+
+    def _execute_panel_tool(self, name: str, args: dict[str, Any] | None = None) -> tuple[str, bool]:
+        args = args or {}
         if self._panel is None:
             return "the settings panel isn't available in this session", True
         try:
             if name == "open_settings_panel":
                 return self._panel.open(), False
-            return self._panel.close(), False
+            if name == "close_settings_panel":
+                return self._panel.close(), False
+            if name == "list_audio_devices":
+                return json.dumps(
+                    {
+                        "microphones": self._panel.microphone_choices(),
+                        "speakers": self._panel.speaker_choices(),
+                        "saved": {
+                            "microphone": self._panel.snapshot().get("saved_microphone") or "System default",
+                            "speaker": self._panel.snapshot().get("saved_speaker") or "System default",
+                        },
+                    }
+                ), False
+            if name == "use_audio_device":
+                text = self._panel.save(
+                    microphone=str(args.get("microphone", "") or ""),
+                    speaker=str(args.get("speaker", "") or ""),
+                )
+                return text, not text.startswith("saved")
+            if name == "refresh_audio_devices":
+                return self._panel.refresh_devices(), False
+            return f"unknown panel tool {name}", True
         except Exception as err:  # noqa: BLE001 — a window that won't open is a spoken sentence
             verb = "open" if name == "open_settings_panel" else "close"
             return f"couldn't {verb} the settings panel: {err}", True
+
+    def _execute_latency_tool(self, args: dict[str, Any]) -> tuple[str, bool]:
+        """'How fast were you today?' — medians straight out of the turn log."""
+        if self._latency is None:
+            return "I'm not keeping a turn latency log right now", True
+        spec = str(args.get("since", "") or "today")
+        window = _spec_window(spec, time.time())
+        if isinstance(window, str):
+            return window, True
+        since, until = window
+        try:
+            rows = self._latency.read(since=since, until=until)
+        except Exception as err:  # noqa: BLE001 — an unreadable log is a spoken sentence
+            return f"I couldn't read my turn log: {err}", True
+        return latency_report(rows, since_label(spec)), False
 
     def _execute_journal_tool(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
         now = time.time()
@@ -1853,17 +2522,46 @@ class RealtimeEngine:
             return "memory is not enabled", True
         try:
             if name == "remember":
-                item = self._memory.add(str(args.get("kind", "")), str(args.get("text", "")))
-                if item.kind == "preference":
+                supersedes = args.get("supersedes")
+                item = self._memory.add(
+                    str(args.get("kind", "")),
+                    str(args.get("text", "")),
+                    subject=str(args.get("subject", "") or ""),
+                    supersedes=int(supersedes) if supersedes not in (None, "") else None,
+                )
+                if item.kind in ("preference", "house"):
                     self._instructions_stale = True
+                if item.supersedes is not None:
+                    return f"stored (id {item.id}); id {item.supersedes} retired", False
                 return f"stored (id {item.id})", False
+            if name == "update_memory":
+                subject = args.get("subject")
+                item = self._memory.replace(
+                    int(args.get("id", -1)),
+                    str(args.get("text", "")),
+                    subject=None if subject in (None, "") else str(subject),
+                )
+                if item.kind in ("preference", "house"):
+                    self._instructions_stale = True
+                return (
+                    f"updated in one step: id {item.id} now stands, "
+                    f"id {item.supersedes} retired"
+                ), False
             if name == "list_memories":
-                items = self._memory.items(args.get("kind") or None)
+                items = self._memory.items(
+                    args.get("kind") or None, subject=str(args.get("subject", "") or "")
+                )
                 if not items:
                     return "nothing stored yet", False
                 return json.dumps(
                     [
-                        {"id": i.id, "kind": i.kind, "text": i.text, "since": i.created}
+                        {
+                            "id": i.id,
+                            "kind": i.kind,
+                            "subject": i.scope,
+                            "text": i.text,
+                            "since": i.created,
+                        }
                         for i in items
                     ]
                 ), False
@@ -1948,21 +2646,52 @@ class RealtimeEngine:
         ui: Any,
         *,
         announce: bool = False,
+        trace: TurnTrace | None = None,
         ptt: Any | None = None,
         ptt_session: bool = False,
     ) -> SessionStats:
         """One wake-to-close conversation. `mic` must be a 24 kHz source.
         announce=True opens the session with HER speaking a queued
         announcement (nobody said the wake word) and closes right after.
-        `ptt` is the push-to-talk hotkey, watched for the whole session;
-        ptt_session=True means a press opened it, so turn detection is off
-        from the first breath and each hold is exactly one turn."""
+        `trace` is the runner's stopwatch, started at the wake; without one
+        the timings are kept in memory and written nowhere. `ptt` is the
+        push-to-talk hotkey, watched for the whole session; ptt_session=True
+        means a press opened it — on the runner's already-open streams — so
+        turn detection is off from the first breath and each hold is exactly
+        one turn."""
         stats = SessionStats()
+        self._trace = trace if trace is not None else TurnTrace()
+        self._session_opened = time.time()  # older promises are hers to keep
+        self._conversations += 1
+        self._live_conversation = self._conversations  # a thought asked here may interrupt
+        self._raised_followups = []
+        self._deferred_reads = []
         speaking = False
         response_active = False
         closing = False
         last_activity = time.monotonic()
         ended = asyncio.Event()
+        pending: list[asyncio.Task] = []
+
+        def supervise(task: asyncio.Task) -> None:
+            # A receiver, mic, tool or playback task that dies used to leave
+            # the session waiting on the idle timer — or forever, with her
+            # "speaking" flag stuck. One bounded path out: end the session,
+            # say why, and let the runner recover.
+            if task.cancelled() or ended.is_set():
+                return
+            err = task.exception()
+            if err is not None:
+                stats.ended_by = f"session error: {err}"[:160]
+                with contextlib.suppress(Exception):
+                    ui.error(str(err))
+                ended.set()
+
+        def spawn(coro: Any) -> asyncio.Task:
+            task = asyncio.create_task(coro)
+            task.add_done_callback(supervise)
+            pending.append(task)
+            return task
 
         self._ui_tool_hook = getattr(ui, "tool", None)  # observability: show tool outcomes
         if not announce and self._presence is not None:
@@ -1983,7 +2712,16 @@ class RealtimeEngine:
             announcing_opener = False  # ...and they opened this session (nobody spoke)
             waits_for_reply = False  # ...and they ask him something (question / arrival)
             opener_ids: list[int] = []  # everything spoken as an opener: read only if he replies
-            interrupted = False  # wake-word barge-in happened
+            interrupted = False  # wake-word barge-in cut THIS response (reset per response)
+            wrapup_heard = False  # he said "that's all": close after her goodbye, tool or no tool
+            thinking_until = 0.0  # "let me think": patient until this moment
+            possible_since: float | None = None  # playback held for a possible talk-over since
+            levels = _Levels()  # the room's level, and her echo during each reply
+            onset: list[bytes] = []  # frames above the threshold, waiting to become an onset
+            user_turns = 0  # finished user transcripts so far (a tool learns what he said meanwhile)
+            audio_in_response = False  # the current response produced speech
+            farewell_pending = False  # end_conversation fired without a word: a goodbye was requested
+            deferred_close = False  # a close decided under a tool: it waits for the words
             session_started = time.monotonic()
             # Push to talk: a hold in progress, when it began, and what the
             # mic has put on the wire since. `vad_off` is what the SERVER is
@@ -2003,10 +2741,17 @@ class RealtimeEngine:
                 said = " ".join(i.text for i in items)
                 kinds = {getattr(i, "kind", "") for i in items}
                 if kinds == {"thought"}:
+                    if self._context is not None:
+                        self._context.clear_job("think")  # it is no longer outstanding
+                        for item in items:
+                            ref = str(getattr(item, "ref", ""))
+                            if ref.startswith("thought:"):
+                                self._context.clear_job(f"think:{ref.split(':', 1)[1]}")
                     lead = (
                         f"Your deeper reasoning finished the question {self._owner} asked earlier — "
                         "give him the answer now, in your own words, as if you'd just "
-                        "worked it out: "
+                        "worked it out. If the event asks for an opening bridge, say "
+                        "that bridge first, in a few words: "
                     )
                 elif "presence" in kinds:
                     lead = (
@@ -2058,55 +2803,175 @@ class RealtimeEngine:
                     return stats
                 await deliver(items, opener=True)
 
-            async def pump_mic() -> None:
-                nonlocal speaking, interrupted, ptt_frames, ptt_peak
+            async def send_audio(frame: bytes) -> None:
+                await connection.send(
+                    {
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(frame).decode("ascii"),
+                    }
+                )
+
+            async def barge_in(heard_at: float, how: str) -> None:
+                """He cut in — the wake phrase, the push-to-talk key, or a
+                confirmed talk-over: stop her now, tell the server how much he
+                heard, take his turn."""
+                nonlocal speaking, interrupted, possible_since
                 nonlocal quick_close_armed, quick_close_window, quick_close_reason
+                interrupted = True
+                possible_since = None
+                onset.clear()
+                item = getattr(speaker, "current_item", "")
+                heard_ms = speaker.played_ms(item) if item and hasattr(speaker, "played_ms") else 0
+                speaker.clear()
+                self._trace.interrupted(time.monotonic() - heard_at)
+                if response_active:
+                    await connection.send({"type": "response.cancel"})
+                if item and heard_ms > 0:
+                    # Over WebSocket the server has no idea how much he heard:
+                    # tell it, so the unheard tail (and its transcript) leaves
+                    # the model's memory.
+                    await connection.send(
+                        {
+                            "type": "conversation.item.truncate",
+                            "item_id": item,
+                            "content_index": 0,
+                            "audio_end_ms": heard_ms,
+                        }
+                    )
+                speaking = False
+                mic.drain()
+                ui.interrupted()
+                if how != "wake phrase":
+                    note_fn = getattr(ui, "note", None)
+                    if note_fn is not None:
+                        note_fn(f"interrupted by {how}")
+                if speech_segments == 0:
+                    # he cut into an announcement: give him the question
+                    # window to say something, then close — never hover for
+                    # the full idle timeout
+                    quick_close_armed = True
+                    quick_close_window = self._info_close_s
+                    quick_close_reason = "interrupted announcement"
+
+            async def consider(frame: bytes, heard_at: float) -> None:
+                """Tentative talk-over on loudspeakers. Her first moments of a
+                reply teach us her echo; a sustained rise above it HOLDS
+                playback (nothing is thrown away) and streams the mic to the
+                server. Its speech detection confirms — see the receiver —
+                or, within a bounded window, nothing does and she resumes
+                exactly where she paused, the probe audio cleared."""
+                nonlocal possible_since
+                level = _rms(frame)
+                note_fn = getattr(ui, "note", None)
+                if possible_since is None:
+                    if levels.calibrating(heard_at):
+                        levels.echo(level)
+                        onset.clear()
+                        return
+                    if not levels.noted:
+                        # once per reply: the numbers the thresholds are tuned from
+                        levels.noted = True
+                        if note_fn is not None:
+                            note_fn(
+                                f"talk-over armed: echo {levels.echo_level:.0f}, room "
+                                f"{levels.quiet_level:.0f}, threshold {levels.threshold():.0f}"
+                            )
+                    if level > levels.threshold():
+                        onset.append(frame)
+                    else:
+                        onset.clear()
+                    if len(onset) < _ONSET_FRAMES:
+                        return
+                    possible_since = heard_at
+                    speaker.pause()
+                    if note_fn is not None:
+                        note_fn(
+                            f"possible interruption: mic {level:.0f} over echo "
+                            f"{levels.echo_level:.0f} — holding"
+                        )
+                    for held in onset:
+                        await send_audio(held)
+                    onset.clear()
+                    return
+                await send_audio(frame)  # probing: the server's speech_started confirms
+                if heard_at - possible_since > _FALSE_ALARM_S:
+                    possible_since = None
+                    await connection.send({"type": "input_audio_buffer.clear"})
+                    speaker.resume()
+                    if note_fn is not None:
+                        note_fn("false alarm — resuming")
+
+            async def pump_mic() -> None:
+                nonlocal ptt_frames, ptt_peak
                 while True:
                     frame = await mic.get_frame()
+                    heard_at = time.monotonic()
                     if speaking and not self._talk_over:
                         # Half-duplex: don't feed our own voice back. But keep
-                        # watching for the wake phrase = instant barge-in.
+                        # watching for the wake phrase = instant barge-in, and
+                        # (on loudspeakers) for him simply talking over her.
                         if wake is not None and wake.detect(downsample_24k_to_16k(frame)):
-                            interrupted = True
-                            speaker.clear()
-                            if response_active:
-                                await connection.send({"type": "response.cancel"})
-                            speaking = False
-                            mic.drain()
-                            ui.interrupted()
-                            if speech_segments == 0:
-                                # he cut into an announcement: give him the
-                                # question window to say something, then close —
-                                # never hover for the full idle timeout
-                                quick_close_armed = True
-                                quick_close_window = self._info_close_s
-                                quick_close_reason = "interrupted announcement"
+                            await barge_in(heard_at, "wake phrase")
+                        elif self._tentative and not vad_off:
+                            # A tentative hold waits for the SERVER's speech
+                            # detection to confirm it; with turn detection off
+                            # nothing ever will, so during a push-to-talk turn
+                            # the hotkey is the only way to cut in.
+                            await consider(frame, heard_at)
                         continue
+                    levels.quiet(_rms(frame))  # the room, while he can talk freely
                     if ptt_session and not ptt_active:
                         # Push to talk with nobody holding: the buffer must
                         # stay empty, or the next commit would carry every
                         # sound the room made since his last turn.
                         continue
-                    await connection.send(
-                        {
-                            "type": "input_audio_buffer.append",
-                            "audio": base64.b64encode(frame).decode("ascii"),
-                        }
-                    )
+                    await send_audio(frame)
                     if ptt_active:
                         ptt_frames += 1
                         ptt_peak = max(
                             ptt_peak, int(np.abs(np.frombuffer(frame, dtype=np.int16)).max())
                         )
 
-            pending: list[asyncio.Task] = []
-
-            async def finish_playback(close_after: bool, listening: bool = True) -> None:
+            async def finish_playback(
+                close_after: bool,
+                listening: bool = True,
+                announced: list[int] | None = None,
+                opener: bool = False,
+                more_coming: bool = False,
+            ) -> None:
                 nonlocal speaking
                 await speaker.wait_idle()
-                if close_after and not interrupted:
+                if announced and self._announcer is not None:
+                    # Delivered means PLAYED, not generated. Cut off by a
+                    # barge-in: spoken-but-unread, and never read by his reply
+                    # to the interruption — "what did I miss" still has it.
+                    self._announcer.mark_delivered(announced)
+                    stats.announced.extend(announced)
+                    if interrupted:
+                        for nid in announced:
+                            if nid in opener_ids:
+                                opener_ids.remove(nid)
+                        note_fn = getattr(ui, "note", None)
+                        if note_fn is not None:
+                            note_fn("announcement cut short — kept unread")
+                    elif not opener:
+                        self._announcer.mark_read(announced)  # slipped into a live conversation: heard
+                if self._deferred_reads and not more_coming:
+                    # She listed his notifications: they count as read only now,
+                    # and not at all if he cut the reading short.
+                    self._apply_deferred_reads(interrupted=interrupted)
+                    if interrupted:
+                        note_fn = getattr(ui, "note", None)
+                        if note_fn is not None:
+                            note_fn("notifications kept unread — she was cut off")
+                self._trace.playback_done()
+                if (close_after or wrapup_heard) and not interrupted and not more_coming:
                     # (a barge-in during the audio keeps the session open: he
-                    # wanted to say something)
+                    # wanted to say something; and a tool whose answer is still
+                    # being generated has not spoken yet — closing on its
+                    # silent response would cut off the reply he is owed)
+                    if wrapup_heard and not close_after:
+                        stats.ended_by = "wrap-up"  # he said so; the model never called the tool
                     speaking = False
                     mic.drain()
                     ended.set()
@@ -2141,19 +3006,17 @@ class RealtimeEngine:
 
             async def set_turn_detection(on: bool) -> None:
                 """Hand turn-taking to the server, or take it back. Only
-                `audio.input` is sent: the API leaves out what a session.update
-                omits, and `voice` must never appear once she has spoken."""
+                `audio.input` is sent, exactly as it was configured (noise
+                reduction, transcriber vocabulary and all): the API leaves out
+                what a session.update omits, and `voice` must never appear
+                once she has spoken."""
                 nonlocal vad_off
                 await connection.send(
                     {
                         "type": "session.update",
                         "session": {
                             "type": "realtime",
-                            "audio": {
-                                "input": self._audio_input(
-                                    self._transcription_model, turn_detection=on
-                                )
-                            },
+                            "audio": {"input": self.audio_input_update(turn_detection=on)},
                         },
                     }
                 )
@@ -2163,18 +3026,14 @@ class RealtimeEngine:
                 """He is holding the key: his turn starts now, whatever she
                 was in the middle of."""
                 nonlocal ptt_active, ptt_started, ptt_frames, ptt_peak
-                nonlocal speaking, interrupted, last_activity, quick_close_armed
+                nonlocal last_activity, quick_close_armed
                 if ptt_active:
                     return
                 if speaking or response_active:
-                    # Barge-in, exactly as the wake word does it: she stops
-                    # mid-word and he gets the floor.
-                    speaker.clear()
-                    if response_active:
-                        await connection.send({"type": "response.cancel"})
-                    interrupted = True
-                    speaking = False
-                    ui.interrupted()
+                    # Same barge-in the wake phrase gets: she stops mid-word,
+                    # the server is told how much of her he actually heard,
+                    # and he has the floor.
+                    await barge_in(time.monotonic(), "push to talk")
                 if not vad_off:
                     await set_turn_detection(False)
                 await connection.send({"type": "input_audio_buffer.clear"})
@@ -2203,8 +3062,9 @@ class RealtimeEngine:
                     self._cues.end(speaker)
                 if long_enough and ptt_frames == 0:
                     # The session was still connecting when he pressed: his
-                    # words are in the mic's own queue. Give them a moment to
-                    # reach the socket before deciding he said nothing.
+                    # words are in the microphone's own queue. Give them a
+                    # moment to reach the socket before deciding he said
+                    # nothing.
                     deadline = time.monotonic() + _PTT_FLUSH_S
                     while ptt_frames == 0 and time.monotonic() < deadline:
                         await asyncio.sleep(_PTT_POLL_S)
@@ -2242,21 +3102,156 @@ class RealtimeEngine:
                         await ptt_press()
                     await asyncio.sleep(_PTT_POLL_S)
 
+            async def after_response(event: Any, turn_at_start: int, had_audio: bool, segments_at_done: int) -> None:
+                """Everything that follows response.done — tool calls first —
+                as its own task, so the receiver keeps reading meanwhile.
+                `segments_at_done` is how often he had spoken when the response
+                finished: the close decisions are about that moment, not about
+                what he says while a tool runs."""
+                nonlocal tool_busy, closing, last_activity, announcing, announcing_opener
+                nonlocal command_pending, quick_close_armed, quick_close_window, quick_close_reason
+                nonlocal farewell_pending, deferred_close
+
+                def late_note() -> str:
+                    if user_turns <= turn_at_start:
+                        return ""
+                    latest = next((t for r, t in reversed(stats.transcript) if r == "you"), "")
+                    return (
+                        f"while this ran {self._owner} said: '{latest}' — if that changes or "
+                        "cancels the request, follow it and skip what is now moot"
+                    )
+
+                try:
+                    closing = await self._handle_response_done(connection, event, stats, late_note=late_note)
+                finally:
+                    tool_busy = False
+                    last_activity = time.monotonic()
+                announced_ids = list(announcing)
+                opener_batch = announcing_opener
+                if announced_ids:
+                    announcing = []
+                    announcing_opener = False
+                ran = self.last_response_tools
+                more_coming = self.last_response_followup  # a tool's answer is on its way
+                if any(t in COMMAND_TOOLS for t in ran):
+                    command_pending = True
+                elif not ran and ptt_session:
+                    # Each hold is one turn: she answers, then closes unless
+                    # he holds again. (No VAD ran, so segments_at_done can
+                    # never tell a first utterance from a fifth.)
+                    quick_close_armed = True
+                    quick_close_window = self._command_close_s
+                    quick_close_reason = "push to talk turn done"
+                elif not ran and segments_at_done <= 1:
+                    # the final spoken answer of a single-utterance
+                    # session: command confirmations close fast,
+                    # question answers get a longer follow-up window
+                    quick_close_armed = True
+                    if command_pending:
+                        quick_close_window = self._command_close_s
+                        quick_close_reason = "command complete"
+                    else:
+                        quick_close_window = self._info_close_s
+                        quick_close_reason = "question answered"
+                if closing and not had_audio and not farewell_pending:
+                    # The end tool fired without a word (LiveKit's pattern: the
+                    # tool's answer IS the goodbye). Ask for it; close after it plays.
+                    farewell_pending = True
+                    closing = False
+                    await connection.send(
+                        {
+                            "type": "conversation.item.create",
+                            "item": {
+                                "type": "message",
+                                "role": "system",
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": "Say a brief goodbye now — a few words, nothing more.",
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                    await connection.send({"type": "response.create"})
+                    last_activity = time.monotonic()
+                    return
+                if farewell_pending and not ran:
+                    farewell_pending = False
+                    closing = True
+                    stats.ended_by = "end_conversation"
+                close_after = closing or wrapup_heard or deferred_close
+                deferred_close = False
+                if wrapup_heard and not closing:
+                    stats.ended_by = "wrap-up"
+                if announced_ids and announce and segments_at_done == 0 and not interrupted:
+                    if waits_for_reply:
+                        # she asked him something (or welcomed him home):
+                        # hold the question window open, then close
+                        quick_close_armed = True
+                        quick_close_window = self._info_close_s
+                        quick_close_reason = "no reply"
+                    else:
+                        # she initiated, said her piece, nobody replied:
+                        # back to sleep as soon as the audio drains
+                        stats.ended_by = "announcement delivered"
+                        close_after = True
+                if close_after and more_coming:
+                    # The tool ran but she has not said a word yet: hold the
+                    # close for the answer she is about to give, and do not
+                    # lose the reason for it.
+                    deferred_close = True
+                spawn(
+                    finish_playback(
+                        close_after,
+                        listening=not more_coming,
+                        announced=announced_ids,
+                        opener=opener_batch,
+                        more_coming=more_coming,
+                    )
+                )
+
             async def receive() -> None:
                 nonlocal speaking, response_active, closing, last_activity
                 nonlocal speech_segments, command_pending, quick_close_armed
                 nonlocal quick_close_window, quick_close_reason, announcing, announcing_opener
-                nonlocal tool_busy
+                nonlocal tool_busy, interrupted, wrapup_heard, user_turns, audio_in_response
+                nonlocal thinking_until
                 heard = ""  # live accumulation of the user's words
+
+                async def set_eagerness(value: str) -> None:
+                    await connection.send(
+                        {
+                            "type": "session.update",
+                            "session": {
+                                "audio": {
+                                    "input": {
+                                        "turn_detection": {"type": "semantic_vad", "eagerness": value}
+                                    }
+                                }
+                            },
+                        }
+                    )
                 while True:
                     event = await connection.recv()
                     kind = event.type
                     last_activity = time.monotonic()
                     if kind.endswith("audio.delta") and "transcript" not in kind:
+                        if not audio_in_response:
+                            levels.new_playback(time.monotonic())  # a reply starts: learn its echo
                         speaking = True
+                        audio_in_response = True
+                        self._trace.audio_delta()
+                        begin = getattr(speaker, "begin_item", None)
+                        if begin is not None:  # per-item playback accounting (truncate needs it)
+                            begin(getattr(event, "item_id", "") or "")
                         speaker.enqueue(base64.b64decode(event.delta))
                     elif kind == "response.created":
                         response_active = True
+                        audio_in_response = False
+                        # a barge-in belongs to the response it cut; a stale flag
+                        # used to veto every later goodbye ("closing out" … ding)
+                        interrupted = False
                     elif kind.endswith("audio_transcript.done"):
                         said = getattr(event, "transcript", "")
                         stats.transcript.append(("alexa", said))
@@ -2265,11 +3260,26 @@ class RealtimeEngine:
                         heard += getattr(event, "delta", "") or ""
                         ui.user_partial(heard)
                     elif kind == "conversation.item.input_audio_transcription.completed":
+                        self._trace.transcribed()
                         heard = ""
                         said = getattr(event, "transcript", "")
                         stats.transcript.append(("you", said))
                         stats.replied = True
+                        user_turns += 1
                         ui.user_said(said)
+                        if is_thinking(said):
+                            # patience: no clock closes the conversation for a
+                            # while, and the server waits longer for his turn
+                            thinking_until = time.monotonic() + _THINKING_S
+                            await set_eagerness("low")
+                            note_fn = getattr(ui, "note", None)
+                            if note_fn is not None:
+                                note_fn(f"taking his time — patient for {_THINKING_S:.0f} s")
+                        elif thinking_until:
+                            thinking_until = 0.0  # he came back: normal pace again
+                            await set_eagerness(self._eagerness)
+                        if is_wrapup(said):
+                            wrapup_heard = True  # the engine closes after her goodbye
                         if is_stop_command(said):
                             # Instant hard stop: no model round-trip, works even
                             # when background audio keeps the session alive.
@@ -2279,6 +3289,11 @@ class RealtimeEngine:
                             stats.ended_by = "stop command"
                             ended.set()
                     elif kind == "input_audio_buffer.speech_started":
+                        if possible_since is not None and speaking:
+                            # the server heard speech in the probe: a real
+                            # interruption — stop her, his turn goes through
+                            await barge_in(time.monotonic(), "talk-over")
+                        self._trace.speech_started()  # a new turn rolls the log row
                         speech_segments += 1
                         if speech_segments > 1:
                             # they kept talking — it's a conversation now
@@ -2293,68 +3308,17 @@ class RealtimeEngine:
                             ui.interrupted()
                         ui.user_speaking()
                     elif kind == "input_audio_buffer.speech_stopped":
+                        self._trace.speech_stopped()
                         if self._cues is not None:
                             self._cues.end(speaker)
                     elif kind == "response.done":
                         response_active = False
-                        # A tool may take a while (a uv sync, a git operation):
-                        # the idle watchdog must not close the session under it.
+                        # A tool may take a while (a search, a uv sync): the
+                        # idle watchdog must not close the session under it, and
+                        # THIS loop must keep reading — his "actually, never
+                        # mind" is processed while the tool runs, not after.
                         tool_busy = True
-                        try:
-                            closing = await self._handle_response_done(connection, event, stats)
-                        finally:
-                            tool_busy = False
-                            last_activity = time.monotonic()
-                        announced_now = bool(announcing)
-                        if announced_now:
-                            if self._announcer is not None:
-                                self._announcer.mark_delivered(announcing)
-                                if not announcing_opener:
-                                    # slipped into a live conversation: he heard it
-                                    self._announcer.mark_read(announcing)
-                            stats.announced.extend(announcing)
-                            announcing = []
-                            announcing_opener = False
-                        ran = self.last_response_tools
-                        if any(t in COMMAND_TOOLS for t in ran):
-                            command_pending = True
-                        elif not ran and ptt_session:
-                            # Each hold is one turn: she answers, then closes
-                            # unless he holds again.
-                            quick_close_armed = True
-                            quick_close_window = self._command_close_s
-                            quick_close_reason = "push to talk turn done"
-                        elif not ran and speech_segments <= 1:
-                            # the final spoken answer of a single-utterance
-                            # session: command confirmations close fast,
-                            # question answers get a longer follow-up window
-                            quick_close_armed = True
-                            if command_pending:
-                                quick_close_window = self._command_close_s
-                                quick_close_reason = "command complete"
-                            else:
-                                quick_close_window = self._info_close_s
-                                quick_close_reason = "question answered"
-                        close_after = closing
-                        if announced_now and announce and speech_segments == 0 and not interrupted:
-                            if waits_for_reply:
-                                # she asked him something (or welcomed him home):
-                                # hold the question window open, then close
-                                quick_close_armed = True
-                                quick_close_window = self._info_close_s
-                                quick_close_reason = "no reply"
-                            else:
-                                # she initiated, said her piece, nobody replied:
-                                # back to sleep as soon as the audio drains
-                                stats.ended_by = "announcement delivered"
-                                close_after = True
-                        pending.append(
-                            asyncio.create_task(
-                                finish_playback(
-                                    close_after, listening=not self.last_response_followup
-                                )
-                            )
-                        )
+                        spawn(after_response(event, user_turns, audio_in_response, speech_segments))
                     elif kind == "error":
                         message = str(getattr(event, "error", event))
                         if self._cues is not None and self._cues.listening:
@@ -2386,7 +3350,15 @@ class RealtimeEngine:
                         if items:
                             await deliver(items, opener=False)
                             continue
+                    if time.monotonic() < thinking_until:
+                        continue  # "let me think": nothing closes the conversation yet
                     if not speaking and not response_active:
+                        if wrapup_heard and quiet > _WRAPUP_GRACE_S:
+                            # his transcript landed after her reply had already
+                            # finished (or she never replied): no listening window
+                            stats.ended_by = "wrap-up"
+                            ended.set()
+                            return
                         if quick_close_armed and quiet > quick_close_window:
                             stats.ended_by = quick_close_reason
                             ended.set()
@@ -2409,6 +3381,8 @@ class RealtimeEngine:
             ]
             if ptt is not None:
                 tasks.append(asyncio.create_task(ptt_watch()))
+            for task in tasks:
+                task.add_done_callback(supervise)
             try:
                 await ended.wait()
                 if stats.ended_by == "unknown":
@@ -2416,12 +3390,11 @@ class RealtimeEngine:
                 if stats.replied and opener_ids and self._announcer is not None:
                     # she opened with news and he answered: he heard it
                     self._announcer.mark_read(opener_ids)
-                if stats.replied and self._raised_followups and self._followups is not None:
-                    # a conversation happened: the follow-ups she was carrying are raised
-                    with contextlib.suppress(Exception):
-                        self._followups.mark_raised(self._raised_followups)
-                    self._raised_followups = []
+                self._settle_followups(stats)
             finally:
+                # Nothing is open any more: a thought answered after this is
+                # an ordinary announcement, not an interruption.
+                self._live_conversation = 0
                 if self._cues is not None:
                     self._cues.reset()  # the runner's goodbye chime ends it
                 for task in [*tasks, *pending]:

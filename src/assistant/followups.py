@@ -9,8 +9,10 @@ is one question.
 Time / arrival / departure follow-ups fire as urgent `followup`
 notifications (owner-set: they speak through quiet hours, and reach his
 phone when he is away — the point of "remind me to lock up when I leave").
-Conversation ones are rendered into her instructions and retired once a
-conversation with him has happened. Persisted in data/followups.json.
+Conversation ones are rendered into her instructions and retired only when
+she actually brought one up — she called raise_follow_up, or her own words
+overlap the promise. A session where he only asked for the hallway light
+leaves it waiting. Persisted in data/followups.json.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
@@ -27,6 +30,38 @@ from typing import Any
 from assistant.scheduler import _next_occurrence, spoken_time
 
 TRIGGERS = ("time", "arrival", "departure", "conversation")
+
+# Function words long enough to clear the four-letter bar. Without them
+# "you wanted me to tell you about that" would match every promise she has.
+# Kept deliberately short: too many, and a promise whose only content words
+# are ordinary verbs ("ask how the demo went") could never match at all.
+STOP_WORDS = frozenset(
+    {
+        "about", "after", "again", "also", "always", "another", "anything", "around",
+        "away", "back", "because", "been", "before", "being", "both", "could", "does",
+        "doing", "done", "down", "each", "else", "even", "ever", "every", "from", "going",
+        "gone", "have", "having", "here", "just", "like", "more", "most", "much", "never",
+        "next", "okay", "once", "only", "other", "over", "please", "really", "right",
+        "same", "should", "since", "some", "sorry", "still", "such", "sure", "than",
+        "thank", "thanks", "that", "thats", "their", "them", "then", "there", "these",
+        "they", "thing", "things", "this", "those", "through", "very", "well", "were",
+        "what", "when", "where", "which", "while", "will", "with", "would", "yeah",
+        "your", "yours",
+    }
+)
+
+
+def significant_words(text: str) -> set[str]:
+    """What a sentence is actually about: four letters or more, no filler."""
+    # The stem before any apostrophe, so "the hallway's off" still says hallway.
+    words = [w.split("'")[0] for w in re.findall(r"[a-z']+", str(text).lower().replace("’", "'"))]
+    return {w for w in words if len(w) >= 4} - STOP_WORDS
+
+
+def mentions(said: str, what: str) -> bool:
+    """Did she bring this up? Two words in common is the whole test — one
+    ("the demo") is the kind of coincidence an ordinary sentence produces."""
+    return len(significant_words(said) & significant_words(what)) >= 2
 
 
 @dataclass
@@ -153,6 +188,44 @@ class FollowUpStore:
         if count:
             self._save()
         return count
+
+    def settle_conversation(
+        self, ids: Iterable[int], said: str, *, raised: Iterable[int] = ()
+    ) -> tuple[list[int], list[int]]:
+        """A conversation just ended. Retire only the follow-ups she really
+        brought up — she called raise_follow_up on them, or her own words
+        overlap the promise. The rest keep waiting, and the journal says so:
+        a session happening is not the same as a promise being kept.
+
+        Returns (retired ids, still pending ids)."""
+        explicit = {int(i) for i in raised}
+        kept: list[int] = []
+        pending: list[int] = []
+        for item_id in (int(i) for i in ids):
+            item = self.get(item_id)
+            if item is None or not item.active:
+                continue
+            (kept if item_id in explicit or mentions(said, item.what) else pending).append(item_id)
+        if kept:
+            self.mark_raised(kept)
+        if self._journal is not None:
+            for item_id in kept:
+                with contextlib.suppress(Exception):
+                    self._journal.write(
+                        "followup",
+                        f"follow-up {item_id} raised in conversation",
+                        source="conversation",
+                        data={"id": item_id},
+                    )
+            for item_id in pending:
+                with contextlib.suppress(Exception):
+                    self._journal.write(
+                        "followup",
+                        f"follow-up {item_id} not raised: not mentioned",
+                        source="conversation",
+                        data={"id": item_id},
+                    )
+        return kept, pending
 
     # ── firing ─────────────────────────────────────────────────────────────
 

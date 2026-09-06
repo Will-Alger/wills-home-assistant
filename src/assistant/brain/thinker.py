@@ -47,9 +47,14 @@ class Thinker:
     def context(self, transcript: list[tuple[str, str]] | None) -> str:
         parts: list[str] = []
         if self._memory is not None:
-            prefs = self._memory.preferences_text()
-            if prefs and not prefs.startswith("("):
-                parts.append(f"Standing preferences:\n{prefs}")
+            # Not the scoped view the live session gets: this is one slow pass
+            # over the whole picture, so it sees every standing rule.
+            prefs = [i.text for i in self._memory.items("preference")]
+            if prefs:
+                parts.append("Standing preferences:\n- " + "\n- ".join(prefs[-30:]))
+            house = [i.text for i in self._memory.items("house")]
+            if house:
+                parts.append("House defaults (everyone):\n- " + "\n- ".join(house[-15:]))
             facts = [i.text for i in self._memory.items("fact")]
             if facts:
                 parts.append("Things the owner asked her to remember:\n- " + "\n- ".join(facts[-15:]))

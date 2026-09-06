@@ -26,20 +26,22 @@ from rich.console import Console
 from rich.markup import render
 
 from assistant.announce import Announcer
-from assistant.app import record_session, wait_for_trigger
-from assistant.audio import tones
+from assistant.app import RescanClock, record_session, reflect_session, wait_for_trigger
+from assistant.audio import devices, tones
 from assistant.audio.cues import VoiceCues
-from assistant.audio.mic import Microphone, describe_device
-from assistant.audio.speaker import Speaker
+from assistant.audio.io import AudioIO
+from assistant.audio.mic import describe_device
 from assistant.brain.thinker import Thinker
 from assistant.briefing import compose_briefing
 from assistant.config import code_root, home_dir, load_settings
+from assistant.context import WorkingContext
 from assistant.delivery import Courier, DeliveryPolicy, DeliverySettings
 from assistant.dispatch import Dispatcher, load_extra_routines, migrate_cloud_routines
 from assistant.engines.realtime_engine import (
     FRAME_SAMPLES_24K,
     REALTIME_RATE,
     RealtimeEngine,
+    downsample_24k_to_16k,
 )
 from assistant.events import EventWatcher, WatchStore
 from assistant.followups import FollowUpStore
@@ -47,21 +49,26 @@ from assistant.home import HomeAssistantClient
 from assistant.home.fake import FakeHome
 from assistant.hotkey import HotkeyError, build_push_to_talk
 from assistant.journal import Journal
+from assistant.latency import LatencyLog
 from assistant.learning import Reflector
 from assistant.llm.anthropic_provider import AnthropicProvider
 from assistant.memory import MemoryStore
 from assistant.panel import PanelOverrides, SettingsPanel
 from assistant.presence import Presence
 from assistant.push import PhoneActions, PhonePusher
+from assistant.receipts import ReceiptBook
 from assistant.routines import RoutineStore
 from assistant.scheduler import Scheduler
 from assistant.sessions import SessionLog
 from assistant.status import AssistantStatus
 from assistant.tasks import TaskBoard
+from assistant.thoughts import ThoughtBook
 from assistant.wake.detector import WakeDetector
 from assistant.web import WebSearch
 
 console = Console()
+RESCAN_S = 30.0  # on a fallback microphone: how often the idle loop looks for the real one again
+MIC_STALL_S = 5.0  # idle with no mic frame for this long: the device is gone, reopen
 
 
 def say(status, text: str, style: str = "") -> None:
@@ -159,6 +166,7 @@ def build_engine(fake: bool):
     memory = MemoryStore(root / "data" / "memory.json")
     journal = Journal(root / "data" / "journal", keep_days=settings.journal_keep_days)
     sessions = SessionLog(root / "data" / "sessions.json")
+    context = WorkingContext(root / "data" / "context.json")
     announcer = Announcer(
         root / "data" / "announcements.json",
         quiet_hours=settings.announce_quiet_hours,
@@ -186,6 +194,7 @@ def build_engine(fake: bool):
             journal=journal,
         )
     delivery = DeliverySettings(root / "data" / "delivery.json")
+    latency = LatencyLog(root / "logs" / "turns.jsonl")  # one row per turn, timings only
     announcer.policy = DeliveryPolicy(
         quiet=announcer.is_quiet,
         presence=presence,
@@ -233,6 +242,8 @@ def build_engine(fake: bool):
     )
     watches = WatchStore(root / "data" / "watches.json")
     routines = RoutineStore(root / "data" / "routines.json")
+    receipts = ReceiptBook(root / "data" / "receipts.json")
+    thoughts = ThoughtBook(root / "data" / "thoughts.json")
     scheduler = Scheduler(root / "data" / "schedule.json", announcer=announcer, journal=journal)
     followups = FollowUpStore(root / "data" / "followups.json", announcer=announcer, journal=journal)
     thinker = None
@@ -246,6 +257,7 @@ def build_engine(fake: bool):
             name=settings.assistant_name,
             owner=settings.owner_name,
         )
+    tones.set_output(settings.audio_output_device)  # chimes follow the chosen speaker
     hotkey = None
     hotkey_note = ""
     try:
@@ -254,6 +266,7 @@ def build_engine(fake: bool):
         hotkey_note = f"push to talk is off: {err}"
     status = AssistantStatus(
         mic=describe_device(settings.audio_input_device),
+        speaker=devices.describe(settings.audio_output_device, "output"),
         voice=settings.realtime_voice,
         wake_word=settings.wake_phrase,
         home="fake apartment" if fake else settings.ha_url,
@@ -272,12 +285,25 @@ def build_engine(fake: bool):
     if board is not None:
         board.on_restart = request_restart  # a background merge landed: restart when idle
 
+    def apply_audio(microphone: str, speaker: str) -> None:
+        # saved by the panel or by voice: the idle mic reopens on the new
+        # device at the next cycle, the next session's speaker follows too
+        settings.audio_input_device = microphone
+        settings.audio_output_device = speaker
+        tones.set_output(speaker)
+        engine.audio_reconfigure = True
+
+    def rescan_audio() -> None:
+        engine.audio_reconfigure = True  # PortAudio re-enumerates between idle cycles
+
     panel = SettingsPanel(
         status,
         overrides,
         restart=request_restart,
         models_dir=code_root() / "models",
         log=lambda m: console.print(f"[dim]{m}[/dim]"),
+        on_audio_change=apply_audio,
+        on_refresh_devices=rescan_audio,
     )
     engine = RealtimeEngine(
         api_key=settings.openai_api_key,
@@ -291,6 +317,8 @@ def build_engine(fake: bool):
         command_close_s=settings.realtime_command_close_s,
         info_close_s=settings.realtime_info_close_s,
         talk_over=settings.realtime_talk_over,
+        tentative_interrupt=settings.realtime_tentative_interrupt,
+        noise_reduction=settings.realtime_noise_reduction,
         eagerness=settings.realtime_eagerness,
         extra_instructions=settings.assistant_extra_instructions,
         memory=memory,
@@ -299,11 +327,14 @@ def build_engine(fake: bool):
         usage_log=root / ".usage.jsonl",
         announcer=announcer,
         thinker=thinker,
+        thoughts=thoughts,
         watches=watches,
         scheduler=scheduler,
         routines=routines,
+        receipts=receipts,
         journal=journal,
         sessions=sessions,
+        context=context,
         presence=presence,
         followups=followups,
         delivery=delivery,
@@ -314,12 +345,14 @@ def build_engine(fake: bool):
         ),
         cues=cues,
         panel=panel,
+        latency=latency,
     )
     scheduler._executor = engine._executor  # scheduled actions run through her tools
     scheduler.briefing = compose_briefing(calendar, board, scheduler, announcer, settings.owner_name)
     engine.scheduler = scheduler
     engine.journal = journal
     engine.sessions = sessions
+    engine.context = context
     engine.presence = presence
     engine.home = home
     engine.status = status  # what the settings panel shows
@@ -327,7 +360,9 @@ def build_engine(fake: bool):
     engine.hotkey_note = hotkey_note
     engine.cues = cues
     engine.panel = panel
+    engine.latency = latency
     engine.overrides = overrides
+    engine.audio_reconfigure = False  # set when the mic/speaker choice changes
     pusher = None
     if settings.phone_notify_service and not fake:
         pusher = PhonePusher(home, settings.phone_notify_service, name=settings.assistant_name, journal=journal)
@@ -468,18 +503,26 @@ async def voice(fake: bool) -> int:
     hotkey_task = asyncio.create_task(hotkey.run()) if hotkey is not None else None
     if getattr(engine, "hotkey_note", ""):
         say(status, engine.hotkey_note, "yellow")
+    # Read the music library once now, so the FIRST wake after a restart can
+    # already spell the owner's playlists and artists in its transcript.
+    music_task = engine.music_names.refresh_soon()
     console.print("Loading wake model...")
     wake, session_wake = load_wake_detectors(settings, getattr(engine, "overrides", None))
     total_cost = 0.0
     mic_name = describe_device(settings.audio_input_device)
+    speaker_name = devices.describe(settings.audio_output_device, "output")
     if status is not None:
-        status.configure(mic=mic_name, voice=settings.realtime_voice, wake_word=settings.wake_phrase)
+        status.configure(
+            mic=mic_name, speaker=speaker_name,
+            voice=settings.realtime_voice, wake_word=settings.wake_phrase,
+        )
         status.set_state("idle")
     hold = f" · or hold {hotkey.label} and speak" if hotkey is not None else ""
     say(
         status,
         f"Voice online. “{settings.wake_phrase}” to talk to {settings.assistant_name}"
         f"{hold} · voice: {settings.realtime_voice} · mic: {mic_name} · "
+        f"speaker: {speaker_name} · "
         f"home: {'fake apartment' if fake else settings.ha_url} · Ctrl+C quits.",
     )
     failures = 0
@@ -509,7 +552,7 @@ async def voice(fake: bool) -> int:
                 if actions is not None:
                     await actions.drain()  # never exit mid-merge from a phone tap
                 return 0  # the always-on service relaunches us in seconds
-    for background in (watcher_task, scheduler_task, courier_task, hotkey_task):
+    for background in (watcher_task, scheduler_task, courier_task, music_task, hotkey_task):
         if background is not None:
             background.cancel()
     console.print(f"\n[dim]total: ${total_cost:.4f}[/dim]")
@@ -519,76 +562,139 @@ async def voice(fake: bool) -> int:
 async def one_cycle(
     settings, engine, wake, session_wake, total_cost: float, reflector, hotkey=None
 ) -> float:
-    """One idle→wake→conversation cycle; returns the updated running cost."""
-    await asyncio.sleep(0.2)  # let PortAudio settle between 24k/16k stream switches
+    """One idle→wake→conversation cycle; returns the updated running cost.
+
+    One microphone and one speaker stay open across cycles (AudioIO): the
+    wake chime goes through the same stream her voice does, and what he
+    says right after the wake phrase queues on the same mic and reaches the
+    session first — push to talk rides those same streams, so a hold that
+    starts while she is idle is captured from the press. They are reopened
+    only when a device choice changes, a stream stalls, or the boot cycle
+    finds nothing open."""
     if engine.restart_requested:
         return total_cost  # a phone approve while idle: the runner exits for the watchdog
     status = getattr(engine, "status", None)
     cues = getattr(engine, "cues", None)
     announcer = getattr(engine, "announcer", None)
-    # Something to say already? Skip the mic and speak. Otherwise IDLE:
-    # wake-gate on a 16 kHz mic (local, free, private) while watching the
-    # announcement queue and the restart flag.
+    audio: AudioIO | None = engine.__dict__.get("_audio")
+    if audio is None:
+        audio = engine._audio = AudioIO(settings, rate=REALTIME_RATE, frame_samples=FRAME_SAMPLES_24K)
+    latency = engine.latency  # the turn log; its stopwatch starts at the wake
+    trace = None
+    quiet = False  # a periodic re-scan while on a fallback mic: repeat nothing unless it changed
+    if getattr(engine, "audio_reconfigure", False) or not audio.is_open:
+        engine.audio_reconfigure = False
+        quiet = getattr(engine, "_rescan", False)
+        engine._rescan = False
+        await audio.reopen()  # PortAudio looks at the machine again; both streams reopen, then stay
+        tones.set_output(settings.audio_output_device)
+        line = f"audio: mic {audio.mic_in_use} · speaker {audio.speaker_in_use}"
+        if not quiet or line != getattr(engine, "_audio_line", ""):
+            say(status, line, "dim")
+        engine._audio_line = line
+        notes = audio.notes()
+        known = getattr(engine, "_audio_notes", ())
+        for note in notes:
+            if note not in known:
+                say(status, note, "yellow")  # say it once per fallback, not per cycle
+        if known and not notes:
+            say(status, f"devices back: mic {audio.mic_in_use} · speaker {audio.speaker_in_use}", "green")
+        engine._audio_notes = tuple(notes)
+        if status is not None:
+            status.configure(mic=audio.mic_in_use, speaker=audio.speaker_in_use)  # what she is really on
+    mic, speaker = audio.mic, audio.speaker
+    assert mic is not None and speaker is not None
+    # Something to say already? Skip the wait and speak. Otherwise IDLE:
+    # wake-gate on the open mic (local, free, private) while watching the
+    # announcement queue, the restart flag, the audio-change flag and stalls.
     trigger = "announce" if announcer is not None and announcer.due() else ""
     if not trigger:
-        async with Microphone(settings.audio_input_device) as mic16:
-            if mic16.device_note and mic16.device_note != getattr(engine, "_mic_note", None):
-                engine._mic_note = mic16.device_note  # say it once per fallback, not per cycle
-                say(status, mic16.device_note, "yellow")
-            if status is not None:
-                status.configure(mic=mic16.device_in_use)  # the mic she is really on
-                status.set_state("idle")
+        if status is not None:
+            status.set_state("idle")
+        if not quiet:
             waiting = "say the wake phrase"
             if hotkey is not None:
                 waiting += f", or hold {hotkey.label}"
             console.print(f"[dim]○ idle — {waiting}[/dim]")
-            trigger = await wait_for_trigger(
-                mic16, wake, announcer, restart=lambda: engine.restart_requested, ptt=hotkey
-            )
-    if trigger == "restart":
+        rescan = RescanClock(audio.fallback, every_s=RESCAN_S)
+
+        def rescan_due() -> bool:
+            if getattr(engine, "audio_reconfigure", False):
+                return True
+            if rescan.due():  # on a fallback mic: look again for the real one
+                engine.audio_reconfigure = True
+                engine._rescan = True
+                return True
+            return False
+
+        def on_score(score: float, fired: bool) -> None:
+            # The wake starts the stopwatch; the near misses (loud
+            # enough to be someone trying, too quiet to fire) are
+            # kept so the threshold can be argued from real audio.
+            nonlocal trace
+            if fired:
+                trace = latency.wake(score)
+            else:
+                latency.near_miss(score, settings.wake_threshold)
+
+        mic.drain()  # whatever the mic caught since the last conversation ended
+        trigger = await wait_for_trigger(
+            mic, wake, announcer,
+            restart=lambda: engine.restart_requested,
+            reconfigure=rescan_due,
+            convert=downsample_24k_to_16k,
+            stall_s=MIC_STALL_S,
+            on_score=on_score,
+            ptt=hotkey,
+        )
+    if trigger == "stalled":
+        # an unplugged microphone gives no error, only silence: reopen
+        say(status, "the microphone went silent — reopening the audio devices", "yellow")
+        engine.audio_reconfigure = True
+        return total_cost
+    if trigger in ("restart", "reconfigure"):
         return total_cost
     announcing = trigger == "announce"
     push = trigger == "ptt"
+    if trace is None:
+        trace = latency.wake(None)  # she opened this one: no wake word, no score
     if not announcing and cues is not None:
-        # The listening ding, through a fresh stream: no session yet. Push to
-        # talk gets it the moment he presses — his hold and the microphone
-        # both start now, so by the time the socket is up his first words are
-        # already queued behind it.
-        cues.start()
-    # Session: 24 kHz mic + speaker, wake detector kept for barge-in
+        # The listening ding through the stream already open: no race, no
+        # wait. Push to talk gets it the moment he presses, and the same
+        # microphone keeps running, so the words he says while the socket
+        # is still connecting are already queued for this session.
+        # The log wants both moments — queued, and when it could be heard,
+        # which the speaker reports the instant its callback pulls that byte.
+        chime_at = speaker.enqueued
+        cues.start(speaker)
+        trace.stamp("chime_enqueued")
+        speaker.notify_when_played(chime_at, trace.audible)
+    trace.stamp("mic_ready")  # both streams were open before the wake word
     session_wake.reset()
-    async with (
-        Microphone(
-            settings.audio_input_device,
-            samplerate=REALTIME_RATE,
-            frame_samples=FRAME_SAMPLES_24K,
-        ) as mic24,
-        Speaker(REALTIME_RATE) as speaker,
-    ):
-        if announcing:
-            say(status, "◆ announcing", "cyan")
-            with contextlib.suppress(Exception):
-                speaker.enqueue(tones.pcm("announce", REALTIME_RATE))
-        elif push:
-            say(status, "● connected — keep holding, let go when you're done", "green")
-        else:
-            say(status, "● connected — talk", "green")
-        sessions = getattr(engine, "sessions", None)
-        row = None
-        if sessions is not None:
-            with contextlib.suppress(Exception):
-                row = sessions.start("announce" if announcing else "ptt" if push else "wake")
-        stats = await engine.run_conversation(
-            mic24, speaker, session_wake,
-            ConsoleUi(settings.assistant_name, status), announce=announcing,
-            ptt=hotkey, ptt_session=push,
-        )
-        # Goodbye chime through the SESSION speaker: a fresh sd.play stream
-        # right after this one closes silently loses the race on Windows.
+    if announcing:
+        say(status, "◆ announcing", "cyan")
         with contextlib.suppress(Exception):
-            if cues is not None:
-                cues.session_end(speaker)
-            await asyncio.wait_for(speaker.wait_idle(), timeout=3.0)
+            speaker.enqueue(tones.pcm("announce", REALTIME_RATE))
+    elif push:
+        say(status, "● connected — keep holding, let go when you're done", "green")
+    else:
+        say(status, "● connected — talk", "green")
+    sessions = getattr(engine, "sessions", None)
+    row = None
+    if sessions is not None:
+        with contextlib.suppress(Exception):
+            row = sessions.start("announce" if announcing else "ptt" if push else "wake")
+    stats = await engine.run_conversation(
+        mic, speaker, session_wake,
+        ConsoleUi(settings.assistant_name, status), announce=announcing,
+        trace=trace, ptt=hotkey, ptt_session=push,
+    )
+    with contextlib.suppress(Exception):
+        if cues is not None:
+            cues.session_end(speaker)  # the goodbye chime, same stream
+        await asyncio.wait_for(speaker.wait_idle(), timeout=3.0)
+    if speaker.stalled:
+        engine.audio_reconfigure = True  # the speaker stopped taking audio: reopen next cycle
     total_cost += stats.cost_usd
     if engine.voice_note:
         say(status, engine.voice_note, "yellow")
@@ -598,6 +704,7 @@ async def one_cycle(
     reason = {
         "idle timeout": "quiet too long — closed to stop the meter; say the wake word anytime",
         "end_conversation": "she wrapped up",
+        "wrap-up": "you wrapped up — closed after her goodbye",
         "question answered": "question answered — closed after quiet",
         "announcement delivered": "announced, back to sleep",
         "nothing to announce": "announcement was already handled",
@@ -606,20 +713,38 @@ async def one_cycle(
         "push to talk turn done": "answered — hold the key again to carry on",
         "nothing said": "nothing was said — back to sleep",
     }.get(stats.ended_by, stats.ended_by)
+    with contextlib.suppress(Exception):  # the log is an instrument, never a blocker
+        trace.finish(stats.ended_by, session=getattr(row, "id", None))
+    timed = trace.console_note()  # 'first audio 0.9 s' for the last turn
     say(
         status,
         f"conversation closed ({reason}) · {stats.responses} replies · "
-        f"tools: {stats.tool_calls or 'none'} · ${stats.cost_usd:.4f} "
-        f"(${total_cost:.4f} session)",
+        f"tools: {stats.tool_calls or 'none'} · "
+        + (f"{timed} · " if timed else "")
+        + f"${stats.cost_usd:.4f} (${total_cost:.4f} session)",
     )
-    reflection = await record_session(
-        sessions, getattr(engine, "journal", None), stats, row, reflector
+    await record_session(
+        sessions, getattr(engine, "journal", None), stats, row, None,
+        timings=trace.compact(), context=getattr(engine, "context", None),
     )
-    if reflection is not None:
-        for lesson in reflection.lessons:
-            console.print(f"[magenta]✎ learned:[/magenta] {lesson}")
-        for obs in reflection.observations:
-            console.print(f"[magenta]✎ noticed (will ask):[/magenta] {obs}")
+    if reflector is not None and stats.transcript:
+        # Reflection is a Claude CLI call (seconds). It used to run here, in
+        # line, with the wake-word mic closed: "hey alexa" right after a
+        # conversation went unheard. Now the mic reopens at once.
+        async def reflect_later() -> None:
+            reflection = await reflect_session(
+                reflector, sessions, row, stats, getattr(engine, "context", None)
+            )
+            if reflection is not None:
+                for lesson in reflection.lessons:
+                    console.print(f"[magenta]✎ learned:[/magenta] {lesson}")
+                for obs in reflection.observations:
+                    console.print(f"[magenta]✎ noticed (will ask):[/magenta] {obs}")
+
+        keep = engine.__dict__.setdefault("_reflections", set())
+        task = asyncio.create_task(reflect_later())
+        keep.add(task)
+        task.add_done_callback(keep.discard)
     return total_cost
 
 

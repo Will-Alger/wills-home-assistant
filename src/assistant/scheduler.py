@@ -21,6 +21,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from assistant.brain.outcome import unavailable
+
 _DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 KINDS = ("timer", "alarm", "reminder", "action", "briefing")
 _CONFIRM_WINDOW_S = 1800.0  # an unanswered "shall I ...?" is skipped after this
@@ -381,11 +383,15 @@ class Scheduler:
         if self._executor is None:
             return f"I couldn't run the scheduled {item.label}: no home connection."
         try:
-            result, is_error = await self._executor.execute(tool, payload)
+            outcome = await self._executor.run(tool, payload)
         except Exception as err:  # noqa: BLE001 — a bad action must not kill the loop
-            result, is_error = f"{type(err).__name__}: {err}", True
-        if is_error:
-            return f"The scheduled {item.label} failed: {str(result)[:160]}"
+            outcome = unavailable(f"{type(err).__name__}: {err}")
+        if outcome.status in ("unavailable", "needs_clarification"):
+            return f"The scheduled {item.label} failed: {outcome.summary[:160]}"
+        if outcome.status == "partial":
+            # She speaks this one out loud on her own: a half-worked action
+            # must never be announced as "Done".
+            return f"The scheduled {item.label}: {outcome.summary[:160]}"
         return f"Done: {item.label}." + (f" {item.message}" if item.message else "")
 
     async def run(self, interval_s: float = 1.0) -> None:

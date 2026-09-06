@@ -39,12 +39,18 @@ class VoiceCues:
         self.listening = False
         self.played: list[str] = []  # the last few earcons, newest last
 
-    def _sound(self, kind: str, speaker: Any | None) -> None:
+    def _sound(
+        self, kind: str, speaker: Any | None, on_audible: Callable[[], None] | None = None
+    ) -> None:
         self.played.append(kind)
         del self.played[:-20]  # a days-long process keeps a window, not a history
         with contextlib.suppress(Exception):  # no output device is never a crash
             if speaker is not None:
+                # Mixed into a stream we don't own the callback of: nobody can
+                # say when it was heard, so the latency log gets no stamp.
                 speaker.enqueue(self._render(kind, self._rate))
+            elif on_audible is not None:
+                self._play(kind, on_audible)
             else:
                 self._play(kind)
 
@@ -54,12 +60,14 @@ class VoiceCues:
                 self._status.set_state(state)
                 self._status.set_listening(self.listening)
 
-    def start(self, speaker: Any | None = None) -> bool:
+    def start(
+        self, speaker: Any | None = None, on_audible: Callable[[], None] | None = None
+    ) -> bool:
         """A listening window opened. False when one already was."""
         if self.listening:
             return False
         self.listening = True
-        self._sound("wake", speaker)
+        self._sound("wake", speaker, on_audible)
         self._state("listening")
         return True
 
