@@ -475,6 +475,9 @@ async def voice(fake: bool) -> int:
     scheduler_task = asyncio.create_task(scheduler.run()) if scheduler is not None else None
     courier = getattr(engine, "courier", None)
     courier_task = asyncio.create_task(courier.run()) if courier is not None else None
+    # Read the music library once now, so the FIRST wake after a restart can
+    # already spell the owner's playlists and artists in its transcript.
+    music_task = engine.music_names.refresh_soon()
     console.print("Loading wake model...")
     wake, session_wake = load_wake_detectors(settings, getattr(engine, "overrides", None))
     total_cost = 0.0
@@ -519,7 +522,7 @@ async def voice(fake: bool) -> int:
                 if actions is not None:
                     await actions.drain()  # never exit mid-merge from a phone tap
                 return 0  # the always-on service relaunches us in seconds
-    for background in (watcher_task, scheduler_task, courier_task):
+    for background in (watcher_task, scheduler_task, courier_task, music_task):
         if background is not None:
             background.cancel()
     console.print(f"\n[dim]total: ${total_cost:.4f}[/dim]")

@@ -38,6 +38,7 @@ from assistant.home.base import HomeApi, device_table, media_table
 from assistant.latency import LatencyLog, TurnTrace, latency_report, since_label
 from assistant.memory import MemoryStore
 from assistant.tasks import TaskBoard
+from assistant.vocabulary import MusicNames, vocabulary
 
 _STOP_COMMAND = re.compile(
     r"^(alexa[,!. ]*)?(stop( listening| it)?|be quiet|shut up|enough)[,!. ]*$"
@@ -1282,6 +1283,8 @@ class RealtimeEngine:
         self.voice_note: str | None = None
         self.restart_requested = False  # set by restart_self; the runner acts on it
         self._home = home
+        # Proper names for the transcriber, warmed off the critical path.
+        self.music_names = MusicNames(home)
         self._calendar = calendar
         self._executor = ToolExecutor(home, calendar, web, routines)
         self._scheduler = scheduler  # timers/alarms/scheduled actions
@@ -1341,12 +1344,14 @@ class RealtimeEngine:
         )
         if self._followups is not None:
             self._raised_followups = [f.id for f in self._followups.for_conversation()]
+        lights = await self._home.get_lights()
+        players = await self._home.media_players()
         instructions = _INSTRUCTIONS.format(
             name=self._name,
             owner=self._owner,
             wake_phrase=self._wake_phrase,
-            devices=device_table(await self._home.get_lights()),
-            media=media_table(await self._home.media_players()),
+            devices=device_table(lights),
+            media=media_table(players),
             preferences=(
                 self._memory.preferences_text() if self._memory else "(memory not enabled)"
             ),
@@ -1373,7 +1378,26 @@ class RealtimeEngine:
             "turn_detection": {"type": "semantic_vad", "eagerness": self._eagerness},
         }
         if transcription_model:
-            audio_in["transcription"] = {"model": transcription_model}
+            transcription: dict[str, Any] = {"model": transcription_model}
+            # The transcriber is a second model that never hears the audio the
+            # way she does; these are the names it would otherwise invent
+            # spellings for. Kick off the next library refresh while we're here
+            # — it lands in the background, in time for the session after this.
+            self.music_names.refresh_soon()
+            names = vocabulary(
+                name=self._name,
+                owner=self._owner,
+                lights=lights,
+                players=players,
+                playlists=self.music_names.playlists,
+                artists=self.music_names.artists,
+                tasks=[t.title for t in self._board.tasks() if not t.closed]
+                if self._board is not None
+                else (),
+            )
+            if names:
+                transcription["prompt"] = names
+            audio_in["transcription"] = transcription
         if self._noise_reduction in ("near_field", "far_field"):
             audio_in["noise_reduction"] = {"type": self._noise_reduction}
         tools = realtime_tools(calendar=self._calendar is not None) + (

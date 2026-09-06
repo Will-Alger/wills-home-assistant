@@ -141,6 +141,53 @@ async def test_noise_reduction_is_sent_only_when_configured() -> None:
     assert "noise_reduction" not in json.dumps(await odd._session_config(None))  # never an invalid value
 
 
+async def test_the_transcriber_is_handed_the_house_s_names() -> None:
+    """audio.input.transcription.prompt (SDK: AudioTranscriptionParam.prompt) —
+    only when a transcriber is actually running, and only names."""
+    from assistant.engines.realtime_engine import RealtimeEngine
+    from assistant.home.fake import FakeHome
+    from assistant.vocabulary import MAX_VOCABULARY_CHARS
+
+    engine = RealtimeEngine(
+        api_key="k", model="m", voice="v", home=FakeHome(), owner="Will", name="Alexa"
+    )
+    await engine.music_names.refresh()  # the boot warm-up, done inline
+
+    off = await engine._session_config(None)
+    assert "transcription" not in off["audio"]["input"]  # no transcriber, no prompt
+
+    on = await engine._session_config("gpt-4o-mini-transcribe")
+    transcription = on["audio"]["input"]["transcription"]
+    assert transcription["model"] == "gpt-4o-mini-transcribe"
+    prompt = transcription["prompt"]
+    assert len(prompt) <= MAX_VOCABULARY_CHARS
+    assert prompt.startswith("Alexa, Will, Bedroom, Hallway, Kitchen, Living Room, ")
+    names = prompt.split(", ")
+    for earlier, later in (
+        ("Apple TV", "Kitchen Strip"),  # players before plain light names
+        ("Cleveland 10K", "Kitchen Strip"),  # so is the owner's library
+        ("Dave Brubeck", "Bedroom Lamp"),
+    ):
+        assert names.index(earlier) < names.index(later)
+
+
+async def test_open_task_titles_reach_the_transcriber_and_closed_ones_do_not(tmp_path) -> None:
+    from assistant.dispatch import Dispatcher
+    from assistant.engines.realtime_engine import RealtimeEngine
+    from assistant.home.fake import FakeHome
+    from assistant.tasks import TaskBoard
+
+    board = TaskBoard(tmp_path, runner=Dispatcher(tmp_path, routine_id="r", routine_token="t"))
+    board.draft("Transcriber vocabulary", "spec")
+    board.draft("Delayed playback replay tests", "spec").closed = True
+    engine = RealtimeEngine(
+        api_key="k", model="m", voice="v", home=FakeHome(), owner="Will", task_board=board
+    )
+    prompt = (await engine._session_config("whisper-1"))["audio"]["input"]["transcription"]["prompt"]
+    assert "Transcriber vocabulary" in prompt
+    assert "Delayed playback replay tests" not in prompt
+
+
 def test_wrapup_phrases_are_recognised_whole_not_by_fragment() -> None:
     from assistant.engines.realtime_engine import is_wrapup
 
