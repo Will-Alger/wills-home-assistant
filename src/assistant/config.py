@@ -189,6 +189,13 @@ class Settings(BaseSettings):
     realtime_turn_detection: str = "server_vad"
     realtime_silence_ms: int = 800
 
+    # What the wake word (and a push-to-talk press) is answered with, before
+    # the session exists: "voice" plays one of the short clips rendered in her
+    # own voice under assets/voice/ack (scripts/render_acks.py) — "Yes?",
+    # "Go ahead.", "Morning." — "ding" is the rising chime, "off" is silence.
+    # A missing clip falls back to the ding with a boot note.
+    wake_ack: str = "voice"
+
     # Push to talk: hold this system-wide hotkey and speak; letting go ends
     # the turn (turn detection is off while it is held, so a pause can never
     # cut him off). Modifier-only by default — Ctrl+Alt on its own means

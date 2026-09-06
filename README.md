@@ -284,6 +284,18 @@ speaking (no echo loop on open speakers); true talk-over needs headphones/AEC
 and is a later upgrade. Swap voices anytime via `REALTIME_VOICE` in `.env`
 (marin/cedar recommended). Costs land in `.usage.jsonl` like everything else.
 
+**She answers her name** (`WAKE_ACK`, default `voice`): say "alexa" and she
+says "Yes?" — or "Go ahead.", "Mm-hm?", "Morning." — in her own voice, off the
+disk, in the same instant the wake word fires, while the session is still
+connecting underneath. Eight clips, rendered once through the Realtime API in
+her actual voice (`uv run scripts/render_acks.py`, committed under
+`assets/voice/ack/`), picked at random and never the same one twice in a row;
+the greetings only come up at their hour. Because her voice comes back into
+the microphone, the frames captured while the clip plays (plus a 0.15 s echo
+tail) are dropped — and everything after it is not, so "alexa, turn off the
+hallway" in one breath still lands. `WAKE_ACK=ding` brings back the rising
+chime, `off` is silence.
+
 **Push to talk** (`PTT_HOTKEY`, default `ctrl+alt`) is the second way in:
 hold the hotkey anywhere on the desktop and speak. Your hold IS the turn —
 turn detection is switched off while the key is down, so a three-second pause
@@ -315,6 +327,7 @@ src/assistant/
 scripts/m1_smoke.py         M1 proof: list + control lights, zero voice
 scripts/m2_repl.py          M2 proof: typed commands → LLM tools → lights
 scripts/check_calendar.py   M6 proof: iCloud calendar reads (and --write-test)
+scripts/render_acks.py      re-renders her spoken wake acknowledgments (spends)
 tests/                      free stub tests + opt-in live evals (RUN_EVALS=1)
 ```
 

@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import contextlib
 import os
+import time
 import wave
 from pathlib import Path
 
@@ -28,6 +29,7 @@ from rich.markup import render
 from assistant.announce import Announcer
 from assistant.app import RescanClock, record_session, reflect_session, wait_for_trigger
 from assistant.audio import devices, tones
+from assistant.audio.acks import ECHO_TAIL_S, WakeAcks
 from assistant.audio.cues import VoiceCues
 from assistant.audio.fallbacks import SpokenFallbacks
 from assistant.audio.io import AudioIO
@@ -88,6 +90,35 @@ def recover(err: BaseException, failures: int, cues, fallbacks, speaker) -> floa
         if fallbacks is not None:
             fallbacks.after_failure(err, speaker)
     return min(5.0 * 2 ** (failures - 1), 60.0)
+
+
+def acknowledge(cues, acks, speaker, mic, trace) -> float:
+    """Answer the wake, before there is a session to answer with.
+
+    WAKE_ACK=voice says one of the short lines rendered in her own voice
+    (audio/acks.py) through the stream already open — no race, no wait — and
+    the ding stands down; `ding`, or a clip that would not load, rings as it
+    always has; `off` does neither. The listening flag, the panel state and
+    the level meter are the cues' bookkeeping either way.
+
+    Her voice then comes straight back in through the microphone, and a server
+    that ends turns on silence would answer it as if HE had spoken, so
+    everything captured until the clip has died away is dropped — and nothing
+    after it, because the command he gives the instant she stops is the whole
+    point. Returns the seconds she spoke for (0.0 when she didn't).
+
+    The log wants both moments — queued, and when it could be heard, which
+    the speaker reports the instant its callback pulls that byte."""
+    at = speaker.enqueued  # where the answer starts in the byte stream
+    spoken = acks.acknowledge(speaker) if acks is not None else 0.0
+    silent = acks is not None and acks.silent
+    cues.start(speaker, sound=not spoken and not silent)
+    trace.stamp("chime_enqueued")
+    if speaker.enqueued > at:
+        speaker.notify_when_played(at, trace.audible)
+    if spoken:
+        mic.ignore_before(time.monotonic() + spoken + ECHO_TAIL_S)
+    return spoken
 
 
 def say(status, text: str, style: str = "") -> None:
@@ -299,6 +330,9 @@ def build_engine(fake: bool):
     # One player for the runner and the engine, so a collapse both of them
     # see is spoken once (audio/fallbacks.py).
     fallbacks = SpokenFallbacks()
+    # Her answer to the wake word, read off the disk now so the wake itself
+    # only has to queue it (audio/acks.py).
+    acks = WakeAcks(mode=settings.wake_ack, rate=REALTIME_RATE)
 
     def request_restart() -> None:
         # the runner exits after this cycle; the watchdog brings her back
@@ -385,6 +419,7 @@ def build_engine(fake: bool):
     engine.hotkey_note = hotkey_note
     engine.cues = cues
     engine.fallbacks = fallbacks  # the runner's recovery path speaks too
+    engine.acks = acks  # "Yes?" in her own voice, the instant the wake fires
     engine.panel = panel
     engine.latency = latency
     engine.overrides = overrides
@@ -517,6 +552,9 @@ async def voice(fake: bool) -> int:
     spoken = getattr(engine, "fallbacks", None)
     if spoken is not None and (gap := spoken.note()):
         say(status, gap, "yellow")  # she would have nothing to say when a service dies
+    acks = getattr(engine, "acks", None)
+    if acks is not None and (gap := acks.note()):
+        say(status, gap, "yellow")  # said once at boot, never again per wake
     presence = getattr(engine, "presence", None)
     if presence is not None:
         with contextlib.suppress(Exception):  # HA down at boot: keep what we knew
@@ -690,16 +728,11 @@ async def one_cycle(
     if trace is None:
         trace = latency.wake(None)  # she opened this one: no wake word, no score
     if not announcing and cues is not None:
-        # The listening ding through the stream already open: no race, no
-        # wait. Push to talk gets it the moment he presses, and the same
-        # microphone keeps running, so the words he says while the socket
-        # is still connecting are already queued for this session.
-        # The log wants both moments — queued, and when it could be heard,
-        # which the speaker reports the instant its callback pulls that byte.
-        chime_at = speaker.enqueued
-        cues.start(speaker)
-        trace.stamp("chime_enqueued")
-        speaker.notify_when_played(chime_at, trace.audible)
+        # "Yes?" in her own voice (or the ding) through the stream already
+        # open. Push to talk gets it the moment he presses, and the same
+        # microphone keeps running, so the words he says while the socket is
+        # still connecting are already queued for this session.
+        acknowledge(cues, getattr(engine, "acks", None), speaker, mic, trace)
     trace.stamp("mic_ready")  # both streams were open before the wake word
     session_wake.reset()
     if announcing:

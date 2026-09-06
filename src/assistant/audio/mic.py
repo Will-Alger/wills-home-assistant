@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from typing import Self
 
 import sounddevice as sd
@@ -69,6 +70,10 @@ class Microphone:
 
     Defaults to the wake-word format (16 kHz, 80 ms frames); the realtime
     engine opens it at 24 kHz instead — pass matching samplerate/frame_samples.
+
+    Every frame is stamped with `time.monotonic()` in the PortAudio callback,
+    at capture, so `ignore_before` can throw away the moment she spoke into
+    the room and keep everything he said after it (audio/acks.py).
     """
 
     def __init__(
@@ -83,7 +88,8 @@ class Microphone:
         self._device = resolve_device(device)
         self._samplerate = samplerate
         self._frame_samples = frame_samples
-        self._queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=queue_frames)
+        self._queue: asyncio.Queue[tuple[float, bytes]] = asyncio.Queue(maxsize=queue_frames)
+        self._ignore_before = 0.0  # frames captured before this stamp are dropped
         self._stream: sd.RawInputStream | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self.device_note: str | None = None  # set when a fallback device was used
@@ -92,9 +98,10 @@ class Microphone:
 
     def _open(self, device: int | str | None) -> sd.RawInputStream:
         def callback(indata, _frames, _time, _status) -> None:  # PortAudio thread
+            captured = time.monotonic()  # when the room made this sound, not when we read it
             data = bytes(indata)
             assert self._loop is not None
-            self._loop.call_soon_threadsafe(self._offer, data)
+            self._loop.call_soon_threadsafe(self._offer, captured, data)
 
         stream = sd.RawInputStream(
             samplerate=self._samplerate,
@@ -187,14 +194,27 @@ class Microphone:
                 self._stream.close()
             self._stream = None
 
-    def _offer(self, data: bytes) -> None:
+    def _offer(self, captured: float, data: bytes) -> None:
         with contextlib.suppress(asyncio.QueueFull):
-            self._queue.put_nowait(data)
+            self._queue.put_nowait((captured, data))
+
+    def ignore_before(self, deadline: float) -> None:
+        """Drop every frame captured before `deadline` (a `time.monotonic()`
+        stamp). This is how her spoken wake acknowledgment does not become his
+        turn: it comes out of the speaker and straight back in here, and
+        silence-based turn detection would hand it to the server as speech.
+        Frames captured AFTER the deadline are delivered exactly as they
+        always were — the command he gives the instant she stops must still
+        reach the session first. Only ever moves forward."""
+        self._ignore_before = max(self._ignore_before, deadline)
 
     async def get_frame(self) -> bytes:
         if self._stream is None:
             raise AudioSourceClosed
-        return await self._queue.get()
+        while True:
+            captured, frame = await self._queue.get()
+            if captured >= self._ignore_before:
+                return frame
 
     def drain(self) -> None:
         while not self._queue.empty():
