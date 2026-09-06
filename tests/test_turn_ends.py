@@ -26,7 +26,7 @@ def make(**kw) -> tuple[RealtimeEngine, FakeClient, VoiceCues, QuietUi]:
 
 
 async def test_a_pause_does_not_ding_but_a_commit_does() -> None:
-    engine, client, cues, ui = make(idle_timeout_s=0.6)
+    engine, client, cues, ui = make(idle_timeout_s=3.0)  # long enough for the ding's beat
     conn = client.connection
     seen: list[list[str]] = []
 
@@ -41,14 +41,17 @@ async def test_a_pause_does_not_ding_but_a_commit_does() -> None:
         conn.push("input_audio_buffer.speech_stopped")
         conn.push("input_audio_buffer.committed")  # now the turn is over
         await asyncio.sleep(0.1)
+        seen.append(list(cues.played))  # not yet: the ding waits a beat for a continuation
+        await asyncio.sleep(1.2)
         seen.append(list(cues.played))
 
     turn = asyncio.create_task(owner())
     await asyncio.wait_for(engine.run_conversation(NeverMic(), InstantSpeaker(), None, ui), 6)
     await turn
-    after_pause, after_commit = seen
+    after_pause, right_after_commit, a_beat_later = seen
     assert after_pause.count("listen_end") == 0  # the breath got no "stopped listening"
-    assert after_commit.count("listen_end") == 1  # the commit did, once
+    assert right_after_commit.count("listen_end") == 0  # nor did the commit itself, yet
+    assert a_beat_later.count("listen_end") == 1  # it stood: one ding
 
 
 async def test_a_fragment_followed_by_the_rest_drops_the_reply_to_the_fragment() -> None:
@@ -144,6 +147,62 @@ async def test_the_mic_still_hot_after_a_commit_drops_the_reply_from_local_frame
     await turn
     assert conn.kinds().count("response.cancel") == 1  # once, from the frames — the server never had to notice
     assert any("still talking after the turn ended" in n for n in ui.notes)
+
+
+async def test_a_regurgitated_vocabulary_prompt_is_noise_not_a_turn() -> None:
+    engine, client, _cues, ui = make(idle_timeout_s=0.6)
+    conn = client.connection
+    conn.ack_cancel = True
+    # the fake house's own vocabulary prompt (built at connect): what the
+    # transcriber spits back on noise
+    regurgitated = "Alexa, Will, Bedroom, Hallway, Kitchen, Living Room, Apple TV, Cleveland 10K, Dave Brubeck, Kitchen Strip, Bedroom Lamp"
+
+    async def owner() -> None:
+        await asyncio.sleep(0.15)
+        conn.push("input_audio_buffer.speech_started")
+        conn.push("input_audio_buffer.speech_stopped")
+        conn.push("input_audio_buffer.committed")
+        conn.push("response.created")  # the server is about to answer the room
+        conn.push("conversation.item.input_audio_transcription.completed", transcript=regurgitated)
+        await asyncio.sleep(0.2)
+        conn.user_says("turn off the porch light", reply="Off.")  # a real sentence still counts
+
+    turn = asyncio.create_task(owner())
+    stats = await asyncio.wait_for(engine.run_conversation(NeverMic(), InstantSpeaker(), None, ui), 6)
+    await turn
+    assert [t for r, t in stats.transcript if r == "you"] == ["turn off the porch light"]
+    assert conn.kinds().count("response.cancel") == 1  # the reply to the noise was dropped
+    assert any("echoed its vocabulary" in n for n in ui.notes)
+
+
+async def test_a_dropped_fragment_gets_no_listening_ding_and_a_standing_commit_dings_once_later() -> None:
+    engine, client, cues, ui = make(idle_timeout_s=4.0)  # long enough for two beats
+    conn = client.connection
+    conn.ack_cancel = True
+    cues.start()  # the window opened at the wake
+
+    async def owner() -> None:
+        await asyncio.sleep(0.15)
+        conn.push("input_audio_buffer.speech_started")
+        conn.push("input_audio_buffer.speech_stopped")
+        conn.push("input_audio_buffer.committed")  # a pause the server took for the end
+        conn.push("conversation.item.input_audio_transcription.completed", transcript="I want you to Google if")
+        conn.push("response.created")
+        await asyncio.sleep(0.2)
+        conn.push("input_audio_buffer.speech_started")  # …he kept going: the reply is dropped
+        await asyncio.sleep(1.2)  # the turn-over ding's beat passes: nothing should have dinged
+        assert cues.played.count("listen_end") == 0 and cues.played.count("wake") == 1
+        conn.push("input_audio_buffer.speech_stopped")
+        conn.push("input_audio_buffer.committed")
+        conn.push("conversation.item.input_audio_transcription.completed", transcript="Aldi uses beef from Venezuela.")
+        await asyncio.sleep(1.2)  # nothing follows this commit: the ding stands
+        assert cues.played.count("listen_end") == 1
+        conn._reply("There's no evidence of that.")
+
+    turn = asyncio.create_task(owner())
+    await asyncio.wait_for(engine.run_conversation(NeverMic(), InstantSpeaker(), None, ui), 8)
+    await turn
+    assert cues.played.count("listen_end") == 1  # the beat after her reply never adds one
 
 
 async def test_a_real_second_turn_after_her_reply_is_not_a_fragment() -> None:

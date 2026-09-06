@@ -364,10 +364,13 @@ async def test_every_turn_dings_open_and_closed(tmp_path: Path) -> None:
     await side
 
     assert stats.replied
-    # opened for his answer, closed when he finished — both through the open
-    # session speaker, never a second output stream
-    assert cues.played == ["wake", "listen_end"]
-    assert b"wake" in speaker.chunks and b"listen_end" in speaker.chunks
+    # opened for his answer, through the open session speaker, never a second
+    # output stream. The falling tone waits a beat after his answer's commit
+    # and the session closes inside that beat, so the goodbye chime (played by
+    # the runner) is the closing sound here, not listen_end.
+    assert cues.played == ["wake"]
+    assert not cues.listening  # the window did close at the commit
+    assert b"wake" in speaker.chunks and b"listen_end" not in speaker.chunks
     assert not cues.listening  # the session is over; nothing claims to be hearing him
 
 

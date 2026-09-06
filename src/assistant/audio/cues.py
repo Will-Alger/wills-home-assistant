@@ -64,24 +64,40 @@ class VoiceCues:
                 self._status.set_listening(self.listening)
 
     def start(
-        self, speaker: Any | None = None, on_audible: Callable[[], None] | None = None
+        self,
+        speaker: Any | None = None,
+        on_audible: Callable[[], None] | None = None,
+        *,
+        sound: bool = True,
     ) -> bool:
-        """A listening window opened. False when one already was."""
+        """A listening window opened. False when one already was. With
+        `sound=False` only the flag and the panel change — a window re-opened
+        because he never stopped talking, or one announced by a spoken
+        acknowledgment instead of the ding."""
         if self.listening:
             return False
         self.listening = True
-        self._sound("wake", speaker, on_audible)
+        if sound:
+            self._sound("wake", speaker, on_audible)
         self._state("listening")
         return True
 
-    def end(self, speaker: Any | None = None) -> bool:
-        """The listening window closed normally (you stopped talking)."""
+    def end(self, speaker: Any | None = None, *, sound: bool = True) -> bool:
+        """The listening window closed normally (you stopped talking). With
+        `sound=False` only the flag drops: the engine plays the falling tone
+        a beat later, through `turn_over`, and only if the turn really stood
+        — a pause mid-sentence used to ding at once."""
         if not self.listening:
             return False
         self.listening = False
-        self._sound("listen_end", speaker)
+        if sound:
+            self._sound("listen_end", speaker)
         self._state("working")
         return True
+
+    def turn_over(self, speaker: Any | None = None) -> None:
+        """The falling tone on its own, after the flag already dropped."""
+        self._sound("listen_end", speaker)
 
     def level(self, value: float) -> None:
         """How loud the room is right now (0..1), for the panel's bar. Sound-

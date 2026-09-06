@@ -628,8 +628,10 @@ _WORKING_CUE_EVERY_S = 6.0
 _THINKING_S = 30.0  # after "let me think": no clock closes the conversation, VAD waits longer
 # The server ended his turn and he spoke again within this long, before she
 # said anything: one sentence split at a pause, not two turns.
-_CONTINUATION_S = 1.2
+_CONTINUATION_S = 3.0  # bounded in practice by her first audio, which ends the window
 _STILL_TALKING_FRAMES = 2  # mic frames still hot right after a commit: he was cut off
+_ECHO_TAIL_S = 0.6  # after she stops, a Bluetooth speaker keeps sounding this long at the mic
+_TURN_OVER_DING_S = 1.0  # the "turn over" ding plays only if nothing followed the commit by then
 _PATIENT_SILENCE_MS = 2500  # "let me think" on server_vad: silence that ends a turn
 
 # Tentative talk-over on loudspeakers (docs/PLAN-VOICE-2026-09-05.md phase 4).
@@ -1583,12 +1585,26 @@ class RealtimeEngine:
         # The audio.input block of the last session.update, so a mid-session
         # turn-detection toggle resends it unchanged (audio_input_update).
         self._audio_input_sent: dict[str, Any] = {}
+        self._vocab_words: set[str] = set()  # the transcription prompt's words (see _looks_like_vocabulary)
         self._usage_log = usage_log
 
     @property
     def voice(self) -> str:
         """The voice actually in use — a gated one falls back on connect."""
         return self._voice
+
+    def _looks_like_vocabulary(self, said: str) -> bool:
+        """A transcript that is mostly the vocabulary prompt's own words, and
+        long: the transcriber regurgitating its prompt on noise, not speech.
+        ("Alexa, Will, Living Room, Apple TV, 500 Random tracks (from
+        library)…" was logged as his turn twice.)"""
+        if not self._vocab_words:
+            return False
+        words = [w for w in re.split(r"[^a-z0-9']+", said.lower()) if len(w) >= 3]
+        if len(words) < 6:
+            return False
+        hits = sum(1 for w in words if w in self._vocab_words)
+        return hits / len(words) >= 0.7
 
     def _turn_detection(self, on: bool, *, patient: bool = False) -> dict[str, Any] | None:
         """Who decides a turn has ended. None is push to talk: the API reads
@@ -1712,6 +1728,8 @@ class RealtimeEngine:
             )
             if names:
                 transcription["prompt"] = names
+                # what a regurgitated prompt looks like, so it can be ignored
+                self._vocab_words = {w for w in re.split(r"[^a-z0-9']+", names.lower()) if len(w) >= 3}
             audio_in["transcription"] = transcription
         if self._noise_reduction in ("near_field", "far_field"):
             audio_in["noise_reduction"] = {"type": self._noise_reduction}
@@ -2984,11 +3002,14 @@ class RealtimeEngine:
 
             async def pump_mic() -> None:
                 nonlocal ptt_frames, ptt_peak, fragment_cancelled, hot_after_commit
+                last_muted_at = -1e9  # the last frame taken while she was speaking
                 while True:
                     frame = await mic.get_frame()
                     heard_at = time.monotonic()
                     level = _rms(frame)
                     muted = speaking and not self._talk_over
+                    if muted:
+                        last_muted_at = heard_at
                     if self._cues is not None:
                         # The panel's bar, straight off the frames: it rises
                         # with his voice and falls flat about a second after
@@ -3020,10 +3041,17 @@ class RealtimeEngine:
                         # He was cut off. Drop that reply now, from the local
                         # frames, without waiting for the server to notice him
                         # again; the next reply sees the whole sentence.
-                        hot_after_commit = hot_after_commit + 1 if level > 2 * _ABS_FLOOR else 0
+                        # Her own tail is not him: a Bluetooth speaker keeps
+                        # sounding after our buffer drained, so the first
+                        # moments after she stops never count (it cancelled
+                        # "Got it." at "Got" once).
+                        hot = level > 2 * _ABS_FLOOR and heard_at - last_muted_at > _ECHO_TAIL_S
+                        hot_after_commit = hot_after_commit + 1 if hot else 0
                         if hot_after_commit >= _STILL_TALKING_FRAMES:
                             fragment_cancelled = True
                             await connection.send({"type": "response.cancel"})
+                            if self._cues is not None:
+                                self._cues.start(speaker, sound=False)  # still his turn: the window re-opens, silently
                             note_fn = getattr(ui, "note", None)
                             if note_fn is not None:
                                 note_fn(
@@ -3315,7 +3343,9 @@ class RealtimeEngine:
                 spawn(
                     finish_playback(
                         close_after,
-                        listening=not more_coming,
+                        # no "your turn" ding after a reply dropped because he
+                        # never stopped talking (or because the turn was noise)
+                        listening=not more_coming and not fragment_cancelled,
                         announced=announced_ids,
                         opener=opener_batch,
                         more_coming=more_coming,
@@ -3330,6 +3360,23 @@ class RealtimeEngine:
                 nonlocal thinking_until, quiet_since, working_ticks, last_commit_at
                 nonlocal fragment_cancelled, hot_after_commit
                 heard = ""  # live accumulation of the user's words
+
+                async def turn_over_ding(commit_at: float) -> None:
+                    """The falling "your turn is over" ding, a beat after the
+                    commit — and only if that commit stood: not when he kept
+                    talking (the reply was dropped), not when she has already
+                    started answering (her voice is the cue), not when a newer
+                    commit superseded it. A sentence with pauses used to ding
+                    at every one of them."""
+                    await asyncio.sleep(_TURN_OVER_DING_S)
+                    if (
+                        last_commit_at == commit_at
+                        and not fragment_cancelled
+                        and not speaking
+                        and not audio_in_response
+                        and self._cues is not None
+                    ):
+                        self._cues.turn_over(speaker)
 
                 async def set_patience(patient: bool) -> None:
                     """Widen (or restore) how long the server waits for his turn to end."""
@@ -3385,6 +3432,18 @@ class RealtimeEngine:
                         self._trace.transcribed()
                         heard = ""
                         said = getattr(event, "transcript", "")
+                        if self._looks_like_vocabulary(said):
+                            # The transcriber regurgitated its own vocabulary
+                            # prompt — what it does on noise, not speech. That
+                            # turn was the room, not him: no transcript, no
+                            # reply to it.
+                            note_fn = getattr(ui, "note", None)
+                            if note_fn is not None:
+                                note_fn("the transcriber echoed its vocabulary — that was noise, ignored")
+                            if response_active and not speaking and not fragment_cancelled:
+                                fragment_cancelled = True
+                                await connection.send({"type": "response.cancel"})
+                            continue
                         stats.transcript.append(("you", said))
                         stats.replied = True
                         user_turns += 1
@@ -3428,6 +3487,8 @@ class RealtimeEngine:
                             # talk-over path owns it.)
                             fragment_cancelled = True
                             await connection.send({"type": "response.cancel"})
+                            if self._cues is not None:
+                                self._cues.start(speaker, sound=False)  # still his turn: the window re-opens, silently
                             note_fn = getattr(ui, "note", None)
                             if note_fn is not None:
                                 note_fn("he kept talking — the reply to the fragment is dropped")
@@ -3453,8 +3514,13 @@ class RealtimeEngine:
                         self._trace.speech_stopped()
                     elif kind == "input_audio_buffer.committed":
                         last_commit_at = time.monotonic()
-                        if self._cues is not None:
-                            self._cues.end(speaker)  # his turn really ended
+                        fragment_cancelled = False  # a new turn: the last fragment's fate is history
+                        hot_after_commit = 0
+                        # the listening flag drops now; the tone waits a beat, and
+                        # only if a window was actually open to close
+                        window_closed = self._cues is not None and self._cues.end(speaker, sound=False)
+                        if window_closed:
+                            spawn(turn_over_ding(last_commit_at))  # only if nothing follows
                     elif kind == "response.done":
                         response_active = False
                         # A tool may take a while (a search, a uv sync): the

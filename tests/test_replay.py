@@ -327,8 +327,10 @@ async def test_an_interrupted_announcement_keeps_both_items_unread(tmp_path: Pat
     assert truncate["item_id"] == "item_1" and truncate["content_index"] == 0
     assert 550 < truncate["audio_end_ms"] < 900, truncate  # what he heard, not the 1400 sent
     assert speaker.clears == 1 and speaker.played_ms("item_1") == truncate["audio_end_ms"]
-    # one window for the turn he cut in with, one after her answer to it
-    assert cues.played == ["wake", "listen_end", "wake"]
+    # one window for the turn he cut in with, one after her answer to it; the
+    # falling tone is withheld because her answer followed the commit within
+    # the beat — her voice is the cue
+    assert cues.played == ["wake", "wake"]
 
 
 # ── 5. "that's all" under a running tool ───────────────────────────────────
