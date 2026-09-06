@@ -9,11 +9,11 @@
 | 2 output ownership | done | `210d83b` — `audio/io.py`, one mic and one speaker across idle and talk |
 | 3 receiver, playback, closing | done | `ad460cf` — supervised tasks, "since" note, delivered = played, farewell first |
 | 4 tentative interruption | done, tuning by ear | `762927d` — `REALTIME_TENTATIVE_INTERRUPT`, levels in the log |
-| 5 detection tuning | far_field live (`e50fa81`); `WAKE_THRESHOLD` 0.5→0.4 from two logged misses; task 14 building; task 10 awaits Will | |
-| 6 continuity | tasks 21, 22 drafted | |
-| 7 conversation quality | "let me think" patience state shipped; thinker jobs, scoped memory, contracts not started | `is_thinking`, `_THINKING_S` |
+| 5 detection tuning | far_field live (`e50fa81`); `WAKE_THRESHOLD` 0.5→0.4 from two logged misses; task 14 vocabulary merged (`410f400`); task 10 awaits Will | |
+| 6 continuity | task 20 (follow-ups/notifications count only when spoken) building; 21 working context, 22 receipts and undo drafted | |
+| 7 conversation quality | "let me think" patience state shipped (`c71f441`); 23 thinker jobs, 24 scoped memory, 25 tool contracts drafted | `is_thinking`, `_THINKING_S` |
 
-Also drafted: task 20 (follow-ups and notifications count only when spoken, phase 3's board item).
+Board order from here, one build at a time: 20 → 21 → 22 → 23 → 24 → 25; task 16 (spoken reply rules) folds into 25's instructions pass; 11, 13, 15 when their phase data exists; 17, 18 deferred.
 
 2026-09-05, 12:46. Inputs reconciled: `wills-home-assistant-audit.md` (ChatGPT Astra, 11
 findings + a 7-step delivery order + an 18-item voice acceptance script),
