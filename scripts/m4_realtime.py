@@ -32,6 +32,7 @@ from assistant.audio.mic import describe_device
 from assistant.brain.thinker import Thinker
 from assistant.briefing import compose_briefing
 from assistant.config import code_root, home_dir, load_settings
+from assistant.context import WorkingContext
 from assistant.delivery import Courier, DeliveryPolicy, DeliverySettings
 from assistant.dispatch import Dispatcher, load_extra_routines, migrate_cloud_routines
 from assistant.engines.realtime_engine import (
@@ -160,6 +161,7 @@ def build_engine(fake: bool):
     memory = MemoryStore(root / "data" / "memory.json")
     journal = Journal(root / "data" / "journal", keep_days=settings.journal_keep_days)
     sessions = SessionLog(root / "data" / "sessions.json")
+    context = WorkingContext(root / "data" / "context.json")
     announcer = Announcer(
         root / "data" / "announcements.json",
         quiet_hours=settings.announce_quiet_hours,
@@ -314,6 +316,7 @@ def build_engine(fake: bool):
         routines=routines,
         journal=journal,
         sessions=sessions,
+        context=context,
         presence=presence,
         followups=followups,
         delivery=delivery,
@@ -331,6 +334,7 @@ def build_engine(fake: bool):
     engine.scheduler = scheduler
     engine.journal = journal
     engine.sessions = sessions
+    engine.context = context
     engine.presence = presence
     engine.home = home
     engine.status = status  # what the settings panel shows
@@ -679,14 +683,16 @@ async def one_cycle(settings, engine, wake, session_wake, total_cost: float, ref
     )
     await record_session(
         sessions, getattr(engine, "journal", None), stats, row, None,
-        timings=trace.compact(),
+        timings=trace.compact(), context=getattr(engine, "context", None),
     )
     if reflector is not None and stats.transcript:
         # Reflection is a Claude CLI call (seconds). It used to run here, in
         # line, with the wake-word mic closed: "hey alexa" right after a
         # conversation went unheard. Now the mic reopens at once.
         async def reflect_later() -> None:
-            reflection = await reflect_session(reflector, sessions, row, stats)
+            reflection = await reflect_session(
+                reflector, sessions, row, stats, getattr(engine, "context", None)
+            )
             if reflection is not None:
                 for lesson in reflection.lessons:
                     console.print(f"[magenta]✎ learned:[/magenta] {lesson}")

@@ -34,6 +34,7 @@ from scipy.signal import resample_poly
 
 from assistant.brain.tools import CALENDAR_TOOLS, TOOL_DEFINITIONS, ToolExecutor
 from assistant.calendar.base import CalendarApi, spoken_now
+from assistant.context import WorkingContext
 from assistant.home.base import HomeApi, device_table, media_table
 from assistant.latency import LatencyLog, TurnTrace, latency_report, since_label
 from assistant.memory import MemoryStore
@@ -172,6 +173,16 @@ Things they ask you to keep for later go in remember(kind="fact"); answer \
 "what do you remember?" via list_memories, and delete with forget after \
 checking ids. Store only what the speaker deliberately tells you — never \
 ambient chatter.
+
+Working context — the last few minutes, carried across the close so "it", \
+"that", "them", "the same ones", "a little dimmer" or "the second option" \
+still land. It expires on its own (half an hour; an unanswered question, \
+ten minutes), so what is not written here is genuinely gone: {context} \
+Resolving a reference: with ONE fresh candidate, just act on it — never ask \
+which. With TWO plausible candidates, ask ONE specific question naming both \
+("the living room lamps, or the kitchen?") and nothing else. With none, ask \
+what they mean. This is not memory: never offer it as something you \
+remember about {owner}, and never let it override what he just said.
 {calendar}
 Recent conversations — so you can pick up where you left off; refer to them \
 naturally ("about that thermostat thing from earlier"), never read them out \
@@ -1274,6 +1285,7 @@ class RealtimeEngine:
         routines: Any | None = None,
         journal: Any | None = None,
         sessions: Any | None = None,
+        context: WorkingContext | None = None,
         presence: Any | None = None,
         followups: Any | None = None,
         delivery: Any | None = None,
@@ -1284,6 +1296,7 @@ class RealtimeEngine:
         self._client = AsyncOpenAI(api_key=api_key)
         self._journal = journal  # what she did and saw, by day
         self._sessions = sessions  # recent conversations, for continuity
+        self._context = context  # the expiring last-few-minutes record ("it", "that")
         self._presence = presence  # is the owner home? (a wake session is proof)
         self._followups = followups  # things she promised to bring up later
         self._delivery = delivery  # DeliverySettings: focus + per-kind preferences
@@ -1391,6 +1404,11 @@ class RealtimeEngine:
             staged=self._board.staged_paragraph() if self._board else "",
             unread=self._announcer.unread_summary() if self._announcer is not None else "none",
             recent=self._sessions.recent_text() if self._sessions is not None else "none",
+            context=(
+                self._context.text()
+                if self._context is not None
+                else "(not kept between sessions)"
+            ),
             presence=self._presence.describe() if self._presence is not None else "(not tracked)",
             followups=self._followups.text() if self._followups is not None else "none",
             delivery=self._delivery.text() if self._delivery is not None else "defaults",
@@ -1585,6 +1603,9 @@ class RealtimeEngine:
                 tool_hook(call_name, result_text, is_error)
             outcome = "ERROR: " if is_error else ""
             stats.transcript.append((f"tool {call_name}", outcome + result_text[:200]))
+            if not is_error:
+                with contextlib.suppress(Exception):  # continuity never breaks a command
+                    self._note_context(call_name, args, result_text)
             payload: dict[str, Any] = {"error" if is_error else "result": result_text}
             applied = getattr(self._executor, "last_routines", [])
             if self._journal is not None and call_name not in _QUIET_TOOLS:
@@ -1640,6 +1661,22 @@ class RealtimeEngine:
         # another response is on its way: the listening cue must wait for it
         self.last_response_followup = bool(outputs) and not closing
         return closing
+
+    def _note_context(self, name: str, args: dict[str, Any], result: str) -> None:
+        """A tool succeeded: leave behind what "it", "that" or "a little
+        dimmer" should bind to after this session closes (context.py). Only
+        things worth referring to — a lookup is not an action."""
+        ctx = self._context
+        if ctx is None:
+            return
+        if name in COMMAND_TOOLS:
+            ctx.note_entities(getattr(self._executor, "last_entities", []))
+            ctx.note_action(name, args, result)
+        elif name == "think":
+            question = " ".join(str(args.get("question", "")).split())[:80]
+            ctx.note_job("think", f"thinking over '{question}'")
+        elif name in ("start_task", "revise_task"):
+            ctx.note_job(f"task:{args.get('id') or 'latest'}", result)
 
     async def _execute_task_tool(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
         board = self._board
@@ -2337,6 +2374,8 @@ class RealtimeEngine:
                 said = " ".join(i.text for i in items)
                 kinds = {getattr(i, "kind", "") for i in items}
                 if kinds == {"thought"}:
+                    if self._context is not None:
+                        self._context.clear_job("think")  # it is no longer outstanding
                     lead = (
                         f"Your deeper reasoning finished the question {self._owner} asked earlier — "
                         "give him the answer now, in your own words, as if you'd just "

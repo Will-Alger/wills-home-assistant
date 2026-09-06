@@ -388,12 +388,16 @@ class ToolExecutor:
         self._web = web  # WebSearch, or None when no key is configured
         self._routines = routines  # RoutineStore: deterministic defaults/overrides
         self.last_routines: list[str] = []  # descriptions applied on the last call
+        # (entity_id, friendly name) the last call actually touched — the
+        # working context binds "it" and "that" to these (context.py).
+        self.last_entities: list[tuple[str, str]] = []
         self._home = home
         self._calendar = calendar
 
     async def execute(self, name: str, tool_input: dict[str, Any]) -> tuple[str, bool]:
         """Returns (result_text, is_error)."""
         self.last_routines = []
+        self.last_entities = []
         if self._routines is not None and isinstance(tool_input, dict):
             try:
                 tool_input, applied = self._routines.apply(name, tool_input)
@@ -425,6 +429,7 @@ class ToolExecutor:
                     # Hand back what actually exists so the retry can succeed.
                     detail = str(err) or type(err).__name__
                     return f"play failed: {detail}.{await self._media_hint(media_id, media_type)}", True
+                self.last_entities = [(player.entity_id, player.name)]
                 note = "Woke the TV first. " if woke else ""
                 return (
                     f"{note}Started on {player.name} (audio may take a few seconds to begin).",
@@ -465,6 +470,7 @@ class ToolExecutor:
                     action,
                     volume_pct=tool_input.get("volume_pct"),
                 )
+                self.last_entities = [(player.entity_id, player.name)]
                 kept_awake = ""
                 if action == "pause" and player.kind == "music":
                     # Apple TVs sleep the instant their AirPlay session pauses
@@ -509,7 +515,11 @@ class ToolExecutor:
                     or service.startswith("reload")
                 ):
                     return f"service {domain}.{service} is not allowed from voice", True
-                await self._home.generic_call(domain, service, dict(tool_input.get("data") or {}))
+                data = dict(tool_input.get("data") or {})
+                await self._home.generic_call(domain, service, data)
+                target = data.get("entity_id")
+                ids = [target] if isinstance(target, str) else list(target or [])
+                self.last_entities = [(str(i), str(i)) for i in ids if i]
                 return f"called {domain}.{service}", False
             if name in _CALENDAR_TOOL_NAMES:
                 return await self._calendar_tool(name, tool_input), False
@@ -527,6 +537,7 @@ class ToolExecutor:
                 player = await self._resolve_player(tool_input.get("player"), kind="tv")
                 await self._wake_tv_if_off()
                 await self._home.launch_app(player.entity_id, str(tool_input["app"]))
+                self.last_entities = [(player.entity_id, player.name)]
                 return f"Opened {tool_input['app']} on {player.name}.", False
             return f"Unknown tool: {name}", True
         except Exception as err:  # noqa: BLE001 — any tool failure must become an
@@ -558,6 +569,9 @@ class ToolExecutor:
                     )
                 )
         await self._home.apply(commands)
+        by_id = {light.entity_id: light.name for light in lights}
+        touched = dict.fromkeys(c.entity_id for c in commands)  # ordered, deduped
+        self.last_entities = [(eid, by_id.get(eid, eid)) for eid in touched]
         return f"Done: {len(commands)} light(s) updated."
 
     async def _calendar_tool(self, name: str, tool_input: dict[str, Any]) -> str:
