@@ -64,6 +64,22 @@ _WRAPUP = re.compile(
 )
 
 
+# "Let me think" is a request for patience, not a turn: for a while the
+# engine stops every clock that could close the conversation and asks the
+# server to wait longer before deciding he is done speaking.
+_THINKING = re.compile(
+    r"^(?:(?:ok(?:ay)?|hmm+|um+|uh+|alexa)[,!. ]*)*"
+    r"(?:let me think(?: about (?:it|that))?|(?:hold|hang) on(?: a (?:sec(?:ond)?|moment|minute))?|"
+    r"(?:give me|just) a (?:sec(?:ond)?|moment|minute)|one (?:sec(?:ond)?|moment|minute)|"
+    r"wait a (?:sec(?:ond)?|moment|minute)|i'?m thinking|thinking)[,!. ]*$"
+)
+
+
+def is_thinking(transcript: str) -> bool:
+    """He asked for a moment ("let me think", "hang on")."""
+    return bool(_THINKING.match(transcript.strip().lower().replace("’", "'")))
+
+
 def is_wrapup(transcript: str) -> bool:
     """The speaker said the conversation is over ("that's all", "thanks, bye")."""
     text = transcript.strip().lower().replace("’", "'")
@@ -445,6 +461,7 @@ _QUIET_TOOLS = frozenset(
 _INJECT_QUIET_S = 2.0
 _INJECT_MIN_AGE_S = 3.0
 _WRAPUP_GRACE_S = 1.5  # after "that's all" with nothing playing: close, don't listen
+_THINKING_S = 30.0  # after "let me think": no clock closes the conversation, VAD waits longer
 
 # Tentative talk-over on loudspeakers (docs/PLAN-VOICE-2026-09-05.md phase 4).
 _TENTATIVE_COOLDOWN_S = 0.8  # the first moments of a reply: learn her echo, never interrupt
@@ -2202,6 +2219,7 @@ class RealtimeEngine:
             opener_ids: list[int] = []  # everything spoken as an opener: read only if he replies
             interrupted = False  # wake-word barge-in cut THIS response (reset per response)
             wrapup_heard = False  # he said "that's all": close after her goodbye, tool or no tool
+            thinking_until = 0.0  # "let me think": patient until this moment
             possible_since: float | None = None  # playback held for a possible talk-over since
             levels = _Levels()  # the room's level, and her echo during each reply
             onset: list[bytes] = []  # frames above the threshold, waiting to become an onset
@@ -2542,7 +2560,22 @@ class RealtimeEngine:
                 nonlocal speech_segments, command_pending, quick_close_armed
                 nonlocal quick_close_window, quick_close_reason, announcing, announcing_opener
                 nonlocal tool_busy, interrupted, wrapup_heard, user_turns, audio_in_response
+                nonlocal thinking_until
                 heard = ""  # live accumulation of the user's words
+
+                async def set_eagerness(value: str) -> None:
+                    await connection.send(
+                        {
+                            "type": "session.update",
+                            "session": {
+                                "audio": {
+                                    "input": {
+                                        "turn_detection": {"type": "semantic_vad", "eagerness": value}
+                                    }
+                                }
+                            },
+                        }
+                    )
                 while True:
                     event = await connection.recv()
                     kind = event.type
@@ -2578,6 +2611,17 @@ class RealtimeEngine:
                         stats.replied = True
                         user_turns += 1
                         ui.user_said(said)
+                        if is_thinking(said):
+                            # patience: no clock closes the conversation for a
+                            # while, and the server waits longer for his turn
+                            thinking_until = time.monotonic() + _THINKING_S
+                            await set_eagerness("low")
+                            note_fn = getattr(ui, "note", None)
+                            if note_fn is not None:
+                                note_fn(f"taking his time — patient for {_THINKING_S:.0f} s")
+                        elif thinking_until:
+                            thinking_until = 0.0  # he came back: normal pace again
+                            await set_eagerness(self._eagerness)
                         if is_wrapup(said):
                             wrapup_heard = True  # the engine closes after her goodbye
                         if is_stop_command(said):
@@ -2648,6 +2692,8 @@ class RealtimeEngine:
                         if items:
                             await deliver(items, opener=False)
                             continue
+                    if time.monotonic() < thinking_until:
+                        continue  # "let me think": nothing closes the conversation yet
                     if not speaking and not response_active:
                         if wrapup_heard and quiet > _WRAPUP_GRACE_S:
                             # his transcript landed after her reply had already

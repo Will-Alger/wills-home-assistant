@@ -5,13 +5,13 @@
 | Phase | State | Where |
 |---|---|---|
 | 0 ship the fixes | done | `3b363ec` `211bdd5` `238ba13` |
-| 1 measure | task 12 merged (`e8e9197`); task 19 replay tests building | `logs/turns.jsonl`, "how fast were you today?" |
+| 1 measure | task 12 merged (`e8e9197`); task 19 replay tests merged (`3141673`, and it caught a closing bug) | `logs/turns.jsonl`, `tests/test_replay.py` |
 | 2 output ownership | done | `210d83b` — `audio/io.py`, one mic and one speaker across idle and talk |
 | 3 receiver, playback, closing | done | `ad460cf` — supervised tasks, "since" note, delivered = played, farewell first |
 | 4 tentative interruption | done, tuning by ear | `762927d` — `REALTIME_TENTATIVE_INTERRUPT`, levels in the log |
-| 5 detection tuning | far_field committed (`e50fa81`); task 10 awaits Will; task 14 next filler | |
+| 5 detection tuning | far_field live (`e50fa81`); `WAKE_THRESHOLD` 0.5→0.4 from two logged misses; task 14 building; task 10 awaits Will | |
 | 6 continuity | tasks 21, 22 drafted | |
-| 7 conversation quality | not started | |
+| 7 conversation quality | "let me think" patience state shipped; thinker jobs, scoped memory, contracts not started | `is_thinking`, `_THINKING_S` |
 
 Also drafted: task 20 (follow-ups and notifications count only when spoken, phase 3's board item).
 
