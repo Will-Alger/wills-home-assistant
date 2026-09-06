@@ -3,7 +3,9 @@
 One ding when a listening window opens — the wake, a push-to-talk hold, and
 every follow-up turn in the same conversation — a smaller, falling one when it
 closes normally, and the low error tone when capture fails, times out, or the
-session errors. While she is off running a tool and the room would hear
+session errors. The wake one is the only one that can be answered instead of
+rung: `start(sound=False)` keeps every bit of the bookkeeping and leaves the
+noise to her own voice (WAKE_ACK, audio/acks.py). While she is off running a tool and the room would hear
 nothing at all, a soft low tick repeats (the engine decides when:
 realtime_engine.working_cue).
 A failure never plays the listening ding and clears the listening flag, so
@@ -70,10 +72,13 @@ class VoiceCues:
         *,
         sound: bool = True,
     ) -> bool:
-        """A listening window opened. False when one already was. With
-        `sound=False` only the flag and the panel change — a window re-opened
-        because he never stopped talking, or one announced by a spoken
-        acknowledgment instead of the ding."""
+        """A listening window opened. False when one already was.
+
+        `sound=False` when something else has already said so out loud — her
+        spoken wake acknowledgment (audio/acks.py) answers in place of the
+        ding — or when a window re-opens because he never stopped talking
+        (a dropped fragment). Either way the flag, the panel state and the
+        level meter behave exactly as they do behind a chime."""
         if self.listening:
             return False
         self.listening = True
