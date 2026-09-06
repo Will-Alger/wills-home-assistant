@@ -31,7 +31,10 @@ def test_list_notifications_windows_and_marks_read(tmp_path: Path) -> None:
     rows = json.loads(text)
     assert rows[0]["text"] == "Task 7 is built." and rows[0]["kind"] == "task" and rows[0]["when"]
     assert rows[0]["state"] == "spoken"
-    assert announcer.get(item.id).read is not None and engine._instructions_stale  # listing = heard
+    # Listing is not hearing: the marking waits for the answer to play out.
+    assert announcer.get(item.id).unread and engine._deferred_reads == [("read", [item.id])]
+    assert engine._apply_deferred_reads() == [item.id] and engine._deferred_reads == []
+    assert announcer.get(item.id).read is not None and engine._instructions_stale  # heard = read
     text, _ = engine._execute_system_tool("list_notifications", {"scope": "all", "since": "2"})
     assert json.loads(text)[0]["state"] == "read"
     text, _ = engine._execute_system_tool("list_notifications", {"scope": "last"})
@@ -39,7 +42,9 @@ def test_list_notifications_windows_and_marks_read(tmp_path: Path) -> None:
     text, is_error = engine._execute_system_tool("list_notifications", {"scope": "all", "since": "whenever"})
     assert is_error
     text, is_error = engine._execute_system_tool("mark_notifications", {"ids": [item.id], "state": "unread"})
-    assert not is_error and announcer.get(item.id).unread
+    assert not is_error and text == "1 marked unread"
+    assert not announcer.get(item.id).unread, "marked before she had said so"
+    assert engine._apply_deferred_reads() == [item.id] and announcer.get(item.id).unread
     text, is_error = engine._execute_system_tool("mark_notifications", {"ids": [99], "state": "read"})
     assert is_error
     text, is_error = engine._execute_system_tool("announcement_history", {"since": "today"})  # legacy name

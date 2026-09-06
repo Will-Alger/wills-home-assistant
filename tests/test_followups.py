@@ -112,6 +112,6 @@ async def test_engine_follow_up_tools_and_waiting_on(tmp_path: Path) -> None:
     config = await engine._session_config(None)
     assert "[id 2] ask about the demo" in config["instructions"]
     assert {"follow_up", "waiting_on", "confirm_action"} <= {t["name"] for t in config["tools"]}
-    assert engine._raised_followups == [2]
+    assert engine._pending_followups == [2] and engine._raised_followups == []
     assert "dropped" in engine._execute_followup_tool("cancel_follow_up", {"id": 1})[0]
     assert json.loads(engine._execute_followup_tool("list_follow_ups", {})[0])[0]["id"] == 2
