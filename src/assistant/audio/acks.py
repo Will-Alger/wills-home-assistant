@@ -18,10 +18,12 @@ Four rules, each paid for elsewhere in this repo:
   after 18:00, so a greeting is only ever spoken when it is true.
 - Her voice comes straight back in through the microphone, and with
   silence-based turn detection the server would answer it as if HE had
-  spoken. The runner therefore tells the microphone to drop everything
-  captured before the clip ends plus `ECHO_TAIL_S` (`mic.ignore_before`) —
-  and nothing captured after it, because the command he says the moment she
-  stops is the whole reason for answering at all.
+  spoken. The runner therefore flags everything captured before the clip
+  ends plus `ECHO_TAIL_S` (`mic.suspect_before`): the engine drops the loud
+  frames of that moment — her, off a loudspeaker — and keeps the quiet ones,
+  because the command he says right over her "Yes?" is the whole reason for
+  answering at all. A transcript that is exactly one of her lines is her
+  echo too, and is never his turn (`spoken_lines`).
 - A missing or unreadable clip is the old ding plus one boot note, never a
   crash: an acknowledgment that can take the app down is worse than a chime.
 """
@@ -58,6 +60,26 @@ GREETINGS: dict[str, tuple[int, int]] = {"morning": (0, 11), "evening": (18, 24)
 NEUTRAL: tuple[str, ...] = tuple(slug for slug in PHRASES if slug not in GREETINGS)
 GREETING_WEIGHT = 3  # how much likelier the right greeting is than any one neutral line
 
+# The other cues, in her voice instead of a tone (audio/cues.py): what she
+# says when his turn is over and she is about to answer, while a tool keeps
+# the room silent, and when something broke. Will: "anywhere we have dings
+# should be replaced with her audio feedback". Rendered to assets/voice/cue/.
+CUE_PHRASES: dict[str, str] = {
+    "mm-hm-ok": "Mm-hm.",  # falling — "heard you" — unlike the wake ack's rising "Mm-hm?"
+    "mm": "Mm.",
+    "one-moment": "One moment.",
+    "still-on-it": "Still on it.",
+    "sorry": "Sorry, something went wrong.",
+}
+# earcon kind (cues.py) -> the slugs that may stand in for it, in order of
+# use where order matters (a tool that runs long says the second one once).
+CUE_VOICES: dict[str, tuple[str, ...]] = {
+    "listen_end": ("mm-hm-ok", "mm"),
+    "working": ("one-moment", "still-on-it"),
+    "error": ("sorry",),
+}
+CUE_MAX_S: dict[str, float] = {"sorry": 2.6}  # the one line that is a sentence (takes run 2.2–2.4 s)
+
 
 def ack_dir() -> Path:
     """Where the rendered acknowledgments live — beside the code, like the
@@ -65,9 +87,44 @@ def ack_dir() -> Path:
     return voice_dir() / "ack"
 
 
+def cue_dir() -> Path:
+    return voice_dir() / "cue"
+
+
 def phrase(slug: str, owner: str = "Will") -> str:
     """What the clip with this slug says, with the owner's name filled in."""
-    return PHRASES[slug].format(owner=owner)
+    text = PHRASES.get(slug) or CUE_PHRASES[slug]
+    return text.format(owner=owner)
+
+
+def spoken_lines(owner: str = "Will") -> set[str]:
+    """Every line she can say off the disk, normalised the way a transcript
+    of it would be — so the engine can tell her own echo from his turn."""
+    return {normalise(phrase(slug, owner)) for slug in (*PHRASES, *CUE_PHRASES)}
+
+
+def normalise(text: str) -> str:
+    return " ".join("".join(c if c.isalnum() or c.isspace() else " " for c in text.lower()).split())
+
+
+def load_cues(directory: Path | None = None, *, rate: int = RATE) -> tuple[dict[str, list[bytes]], list[str]]:
+    """The voiced cues by earcon kind, and the clip files that are missing."""
+    directory = directory if directory is not None else cue_dir()
+    clips: dict[str, bytes] = {}
+    gone: list[str] = []
+    for slug in CUE_PHRASES:
+        path = directory / f"{slug}.wav"
+        pcm = b""
+        with contextlib.suppress(Exception):
+            pcm = read_wav(path, rate)
+        if pcm:
+            clips[slug] = pcm
+        else:
+            gone.append(path.name)
+    voices = {
+        kind: [clips[slug] for slug in slugs if slug in clips] for kind, slugs in CUE_VOICES.items()
+    }
+    return {kind: pcms for kind, pcms in voices.items() if pcms}, gone
 
 
 class WakeAcks:

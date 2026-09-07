@@ -29,7 +29,7 @@ from rich.markup import render
 from assistant.announce import Announcer
 from assistant.app import RescanClock, record_session, reflect_session, wait_for_trigger
 from assistant.audio import devices, tones
-from assistant.audio.acks import ECHO_TAIL_S, WakeAcks
+from assistant.audio.acks import ECHO_TAIL_S, WakeAcks, load_cues
 from assistant.audio.cues import VoiceCues
 from assistant.audio.fallbacks import SpokenFallbacks
 from assistant.audio.io import AudioIO
@@ -330,13 +330,16 @@ def build_engine(fake: bool):
         status.note(f"settings panel: {change}")
     if hotkey_note:
         status.note(hotkey_note)
-    cues = VoiceCues(rate=REALTIME_RATE, status=status)
+    # Her answer to the wake word, read off the disk now so the wake itself
+    # only has to queue it (audio/acks.py) — and, in the same voice, the
+    # cues that used to be dings (WAKE_ACK=voice covers both).
+    acks = WakeAcks(mode=settings.wake_ack, rate=REALTIME_RATE)
+    voices, missing_cues = load_cues(rate=REALTIME_RATE) if acks.mode == "voice" else ({}, [])
+    cues = VoiceCues(rate=REALTIME_RATE, status=status, voices=voices)
+    cues.missing = missing_cues  # said once at boot (below)
     # One player for the runner and the engine, so a collapse both of them
     # see is spoken once (audio/fallbacks.py).
     fallbacks = SpokenFallbacks()
-    # Her answer to the wake word, read off the disk now so the wake itself
-    # only has to queue it (audio/acks.py).
-    acks = WakeAcks(mode=settings.wake_ack, rate=REALTIME_RATE)
 
     def request_restart() -> None:
         # the runner exits after this cycle; the watchdog brings her back
@@ -570,6 +573,14 @@ async def voice(fake: bool) -> int:
     acks = getattr(engine, "acks", None)
     if acks is not None and (gap := acks.note()):
         say(status, gap, "yellow")  # said once at boot, never again per wake
+    missing_cues = getattr(getattr(engine, "cues", None), "missing", None)
+    if missing_cues:
+        say(
+            status,
+            f"voiced cues missing ({', '.join(missing_cues)}) — the tones stand in; "
+            "re-render with scripts/render_acks.py --cues",
+            "yellow",
+        )
     presence = getattr(engine, "presence", None)
     if presence is not None:
         with contextlib.suppress(Exception):  # HA down at boot: keep what we knew

@@ -33,6 +33,7 @@ import numpy as np
 from openai import AsyncOpenAI
 from scipy.signal import resample_poly
 
+from assistant.audio.acks import ECHO_TAIL_S, normalise, spoken_lines
 from assistant.audio.fallbacks import SpokenFallbacks
 from assistant.audio.level import LevelMeter
 from assistant.audio.level import rms as _rms
@@ -675,18 +676,35 @@ _ONSET_WINDOW = 4  # syllables dip: three of four, not three in a row
 _ECHO_FACTOR = 1.6  # the mic must rise this far above her own echo
 _QUIET_FACTOR = 4.0  # ...and above the room while nobody spoke
 _ABS_FLOOR = 400.0  # int16 RMS: below this nothing is speech at a desk mic
-_FALSE_ALARM_S = 1.5  # held this long with no server speech detection: resume
+_FALSE_ALARM_S = 1.0  # held this long with no server speech detection: resume (a cough held her 1.5 s)
+
+
+_CAL_FRAMES = 12  # frames of her audibly playing that teach the coupling (~1 s)
+_PLAYING = 100.0  # played RMS above this: the speaker is audibly saying something
 
 
 class _Levels:
     """Mic level bookkeeping for tentative talk-over: the room while he can
-    talk freely, and her own echo during the first moments of each reply."""
+    talk freely, and her own echo while she speaks.
+
+    With a speaker that reports what it is playing (`played_level`), the
+    echo is predicted, not remembered: the first second of her audibly
+    playing teaches the coupling — mic RMS per unit of played RMS — and from
+    then on the expected echo is that times what she is playing right now.
+    A loud word of hers no longer looks like him (recorded: a reply whose
+    first 0.8 s had not reached the mic yet calibrated its echo at 1, and
+    her next loud passage at 432 was "confirmed" as an interruption).
+    Without that report, the old rule: the mic's maximum during the first
+    moments of playback."""
 
     def __init__(self) -> None:
         self.quiet_level = 0.0
         self.echo_level = 0.0
+        self.coupling = 0.0  # mic RMS per played RMS, learned each reply
         self.noted = False
         self._playback_started: float | None = None
+        self._heard = 0  # frames of her audibly playing seen this reply
+        self._ratio = 0.0  # the coupling being learned
 
     def quiet(self, level: float) -> None:
         self.quiet_level = level if not self.quiet_level else 0.95 * self.quiet_level + 0.05 * level
@@ -694,16 +712,34 @@ class _Levels:
     def new_playback(self, now: float) -> None:
         self._playback_started = now
         self.echo_level = 0.0
+        self._heard = 0
+        self._ratio = 0.0
         self.noted = False  # the "armed" line is printed once per reply
 
-    def calibrating(self, now: float) -> bool:
+    def calibrating(self, now: float, played: float | None = None) -> bool:
+        if played is not None:
+            return self._heard < _CAL_FRAMES
         return self._playback_started is not None and now - self._playback_started < _TENTATIVE_COOLDOWN_S
 
-    def echo(self, level: float) -> None:
+    def echo(self, level: float, played: float | None = None) -> None:
+        if played is None:
+            self.echo_level = max(self.echo_level, level)
+            return
+        if played < _PLAYING:
+            return  # she is not audibly playing yet: nothing to learn from this frame
+        self._heard += 1
+        self._ratio = max(self._ratio, level / played)
+        self.coupling = self._ratio
         self.echo_level = max(self.echo_level, level)
 
-    def threshold(self) -> float:
-        return max(self.echo_level * _ECHO_FACTOR, self.quiet_level * _QUIET_FACTOR, _ABS_FLOOR)
+    def expected_echo(self, played: float | None = None) -> float:
+        """How loud her voice is at the mic right now."""
+        if played is None or self.coupling <= 0:
+            return self.echo_level
+        return self.coupling * played
+
+    def threshold(self, played: float | None = None) -> float:
+        return max(self.expected_echo(played) * _ECHO_FACTOR, self.quiet_level * _QUIET_FACTOR, _ABS_FLOOR)
 
 
 class _SpeechGate:
@@ -1694,6 +1730,9 @@ class RealtimeEngine:
         # and every decision below lands on its timeline while one runs.
         # None costs one attribute read per decision.
         self.tap: Callable[..., None] | None = None
+        # Her own lines off the disk ("Yes?", "Mm-hm.", …): a transcript that
+        # is exactly one of them is her echo through the microphone, not him.
+        self._own_lines = spoken_lines(owner)
         self.last_response_followup = False  # a tool ran: more audio is coming
         self._instructions_stale = False  # a preference changed mid-session
         # The last few tools she actually used — what "in play" means when
@@ -2915,6 +2954,15 @@ class RealtimeEngine:
             pending.append(task)
             return task
 
+        def suspect(seconds: float) -> None:
+            """She is about to say a line off the disk (a voiced cue): flag
+            the microphone for it, as the runner does for the wake
+            acknowledgment — the loud frames of that moment are her."""
+            flag = getattr(mic, "suspect_before", None)
+            if flag is not None:
+                with contextlib.suppress(Exception):
+                    flag(time.monotonic() + seconds + ECHO_TAIL_S)
+
         self._ui_tool_hook = getattr(ui, "tool", None)  # observability: show tool outcomes
         if not announce and self._presence is not None:
             with contextlib.suppress(Exception):
@@ -2943,6 +2991,7 @@ class RealtimeEngine:
             heard_speech = False  # the local gate opened at least once: somebody is here
             possible_since: float | None = None  # playback held for a possible talk-over since
             levels = _Levels()  # the room's level, and her echo during each reply
+            played_level = getattr(speaker, "played_level", None)  # what she is playing, if the speaker can say
             gate = _SpeechGate()  # speech or clean silence to the server, never the room
             meter = LevelMeter()  # the same frames, smoothed, for the panel's bar
             onset: list[tuple[bytes, bool]] = []  # the last few frames and whether each was hot
@@ -3097,33 +3146,38 @@ class RealtimeEngine:
                 exactly where she paused, the probe audio cleared."""
                 nonlocal possible_since
                 note_fn = getattr(ui, "note", None)
+                # what she is playing right now (None: a speaker that cannot say)
+                played = played_level(0.3) if played_level is not None else None
                 if possible_since is None:
-                    if levels.calibrating(heard_at):
-                        levels.echo(level)
+                    if levels.calibrating(heard_at, played):
+                        levels.echo(level, played)
                         onset.clear()
                         return
+                    threshold = levels.threshold(played)
                     if not levels.noted:
                         # once per reply: the numbers the thresholds are tuned from
                         levels.noted = True
                         if note_fn is not None:
                             note_fn(
-                                f"talk-over armed: echo {levels.echo_level:.0f}, room "
-                                f"{levels.quiet_level:.0f}, threshold {levels.threshold():.0f}"
+                                f"talk-over armed: echo {levels.echo_level:.0f}"
+                                + (f" (coupling {levels.coupling:.2f})" if levels.coupling else "")
+                                + f", room {levels.quiet_level:.0f}, threshold {threshold:.0f}"
                             )
-                    onset.append((frame, level > levels.threshold()))
+                    onset.append((frame, level > threshold))
                     del onset[:-_ONSET_WINDOW]
                     if sum(1 for _, hot in onset if hot) < _ONSET_FRAMES:
                         return
                     possible_since = heard_at
                     speaker.pause()
+                    expected = levels.expected_echo(played)
                     self._tap(
-                        "talk_over", what="hold", level=round(level), echo=round(levels.echo_level),
-                        threshold=round(levels.threshold()),
+                        "talk_over", what="hold", level=round(level), echo=round(expected),
+                        threshold=round(threshold), played=None if played is None else round(played),
                     )
                     if note_fn is not None:
                         note_fn(
                             f"possible interruption: mic {level:.0f} over echo "
-                            f"{levels.echo_level:.0f} — holding"
+                            f"{expected:.0f} — holding"
                         )
                     for held, _ in onset:
                         await send_audio(held)
@@ -3523,7 +3577,9 @@ class RealtimeEngine:
                         and self._cues is not None
                     ):
                         self._tap("turn_over_ding")
-                        self._cues.turn_over(speaker)
+                        spoken = self._cues.turn_over(speaker)
+                        if spoken:
+                            suspect(spoken)  # her "Mm-hm." coming back in is not his next turn
                     else:
                         self._tap(
                             "turn_over_ding_withheld",
@@ -3539,11 +3595,12 @@ class RealtimeEngine:
                         {
                             "type": "session.update",
                             "session": {
+                                "type": "realtime",  # required on every update (it silently failed without)
                                 "audio": {
                                     "input": {
                                         "turn_detection": self._turn_detection(True, patient=patient)
                                     }
-                                }
+                                },
                             },
                         }
                     )
@@ -3589,6 +3646,18 @@ class RealtimeEngine:
                         self._trace.transcribed()
                         heard = ""
                         said = getattr(event, "transcript", "")
+                        if normalise(said) in self._own_lines:
+                            # Her own "Yes?" or "Mm-hm." off the disk, back in
+                            # through the microphone and transcribed as a turn
+                            # of his. It is not one: no transcript, no reply.
+                            self._tap("own_echo", text=said, cancelled=response_active and not speaking)
+                            note_fn = getattr(ui, "note", None)
+                            if note_fn is not None:
+                                note_fn(f"heard her own “{said.strip()}” come back — ignored")
+                            if response_active and not speaking and not fragment_cancelled:
+                                fragment_cancelled = True
+                                await connection.send({"type": "response.cancel"})
+                            continue
                         if self._looks_like_vocabulary(said):
                             # The transcriber regurgitated its own vocabulary
                             # prompt — what it does on noise, not speech. That
@@ -3642,6 +3711,7 @@ class RealtimeEngine:
                             and not speaking
                             and not fragment_cancelled
                             and not tools_this_turn
+                            and not wrapup_heard  # the goodbye is owed, whatever the room does next
                             and time.monotonic() - last_commit_at < _CONTINUATION_S
                         ):
                             # The server ended his turn at a pause and he kept
@@ -3710,7 +3780,9 @@ class RealtimeEngine:
                             # Only when he was mid-turn: a stale response.cancel
                             # after a barge-in is a protocol grumble, not a
                             # failure worth a tone. The panel logs both.
-                            self._cues.error(message, speaker)
+                            spoken = self._cues.error(message, speaker)
+                            if spoken:
+                                suspect(spoken)
                         ui.error(message)
 
             async def working_cue() -> None:
@@ -3735,7 +3807,9 @@ class RealtimeEngine:
                     due = quiet_since + _WORKING_CUE_AFTER_S + working_ticks * _WORKING_CUE_EVERY_S
                     if time.monotonic() >= due:
                         working_ticks += 1
-                        self._cues.working(speaker)
+                        spoken = self._cues.working(speaker)
+                        if spoken:
+                            suspect(spoken)
 
             async def idle_watchdog() -> None:
                 while True:

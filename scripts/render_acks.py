@@ -34,7 +34,7 @@ from pathlib import Path
 
 import numpy as np
 
-from assistant.audio.acks import PHRASES, RATE, ack_dir, phrase
+from assistant.audio.acks import CUE_MAX_S, CUE_PHRASES, PHRASES, RATE, ack_dir, cue_dir, phrase
 from assistant.audio.fallbacks import write_wav
 from assistant.config import load_settings
 from assistant.engines.realtime_engine import RealtimeEngine
@@ -84,7 +84,7 @@ def words(text: str) -> list[str]:
     return [word for word in re.split(r"[^a-z0-9']+", text.lower()) if word]
 
 
-def problem(line: str, transcript: str, pcm: bytes, rate: int = RATE) -> str:
+def problem(line: str, transcript: str, pcm: bytes, rate: int = RATE, max_s: float = MAX_S) -> str:
     """Why this take cannot be kept — "" when it can.
 
     Length is the hard rule and is judged from the audio itself; the
@@ -93,8 +93,8 @@ def problem(line: str, transcript: str, pcm: bytes, rate: int = RATE) -> str:
     if not pcm:
         return "no audio came back"
     seconds = len(pcm) / 2 / rate
-    if seconds > MAX_S:
-        return f"{seconds:.2f}s, over the {MAX_S:.1f}s ceiling"
+    if seconds > max_s:
+        return f"{seconds:.2f}s, over the {max_s:.1f}s ceiling"
     if transcript.strip() and words(transcript) != words(line):
         return f"she said “{transcript.strip()}”"
     return ""
@@ -117,6 +117,7 @@ async def render(out: Path, slugs: list[str], tries: int) -> int:
     failed: list[str] = []
     for slug in slugs:
         line = phrase(slug, settings.owner_name)
+        max_s = CUE_MAX_S.get(slug, MAX_S)
         keep, why = b"", "nothing was rendered"
         for _attempt in range(tries):
             transcript, audio, stats = await engine.text_probe(ask(line))
@@ -125,12 +126,12 @@ async def render(out: Path, slugs: list[str], tries: int) -> int:
             if engine.voice_note:
                 print(f"  {engine.voice_note}")
                 engine.voice_note = None
-            why = problem(line, transcript, audio, RATE)
+            why = problem(line, transcript, audio, RATE, max_s)
             if not why:
                 keep = audio
                 break
             print(f"  retaking {slug}: {why}")
-            if not keep and audio and len(audio) / 2 / RATE <= MAX_S:
+            if not keep and audio and len(audio) / 2 / RATE <= max_s:
                 keep = audio  # the right length, only the words looked wrong
         if not keep:
             failed.append(slug)
@@ -151,18 +152,23 @@ def main() -> int:
     parser.add_argument("--out", type=Path, default=None, help="where to write the WAVs")
     parser.add_argument("--tries", type=int, default=TRIES, help=f"takes per clip (default {TRIES})")
     parser.add_argument("--list", action="store_true", help="print the lines and stop")
+    parser.add_argument(
+        "--cues", action="store_true",
+        help="render the other voiced cues (Mm-hm, One moment, …) to assets/voice/cue/ instead",
+    )
     args = parser.parse_args()
     owner = load_settings().owner_name
+    table = CUE_PHRASES if args.cues else PHRASES
     if args.list:
-        for slug in PHRASES:
-            print(f"{slug:>10}  “{phrase(slug, owner)}”")
+        for slug in table:
+            print(f"{slug:>12}  “{phrase(slug, owner)}”")
         return 0
-    slugs = args.only or list(PHRASES)
-    unknown = [slug for slug in slugs if slug not in PHRASES]
+    slugs = args.only or list(table)
+    unknown = [slug for slug in slugs if slug not in table]
     if unknown:
-        print(f"unknown clip(s): {', '.join(unknown)} — one of {', '.join(PHRASES)}")
+        print(f"unknown clip(s): {', '.join(unknown)} — one of {', '.join(table)}")
         return 2
-    return asyncio.run(render(args.out or ack_dir(), slugs, max(1, args.tries)))
+    return asyncio.run(render(args.out or (cue_dir() if args.cues else ack_dir()), slugs, max(1, args.tries)))
 
 
 if __name__ == "__main__":

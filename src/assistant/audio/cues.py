@@ -3,11 +3,19 @@
 One ding when a listening window opens — the wake, a push-to-talk hold, and
 every follow-up turn in the same conversation — a smaller, falling one when it
 closes normally, and the low error tone when capture fails, times out, or the
-session errors. The wake one is the only one that can be answered instead of
-rung: `start(sound=False)` keeps every bit of the bookkeeping and leaves the
-noise to her own voice (WAKE_ACK, audio/acks.py). While she is off running a tool and the room would hear
+session errors. While she is off running a tool and the room would hear
 nothing at all, a soft low tick repeats (the engine decides when:
 realtime_engine.working_cue).
+
+Or, in her voice (`voices`, from audio/acks.py — WAKE_ACK=voice): the wake is
+answered by the acknowledgment ("Yes?"), the end of his turn by "Mm-hm.", a
+slow tool by "One moment." and then "Still on it.", a failure by "Sorry,
+something went wrong." — and the two dings that had no words fall silent: the
+window that re-opens after her reply (she is simply waiting, as a person
+would) and the goodbye chime (she has already said goodbye). Will: "anywhere
+we have dings should be replaced with her audio feedback". Every voiced cue
+returns how long it runs, so the engine can flag the microphone for her
+echo the way the wake acknowledgment does.
 A failure never plays the listening ding and clears the listening flag, so
 neither the tone nor the Settings panel can tell you she's listening when
 she isn't. The live microphone level rides the same path (`level`), so the
@@ -22,10 +30,17 @@ multi-step reply raises "now listening" several times and must ding once.
 from __future__ import annotations
 
 import contextlib
+import random
 from collections.abc import Callable
 from typing import Any
 
 from assistant.audio import tones
+
+# In her voice, which earcons fall silent: a listening window that re-opens
+# after her reply is just her waiting (a person does not ding after
+# answering), and a goodbye she has already said needs no chime after it.
+_SILENT_WHEN_VOICED = frozenset({"wake", "close"})
+_WORKING_LINES = 2  # "One moment." … "Still on it." — then the room is quiet on purpose
 
 
 class VoiceCues:
@@ -36,19 +51,53 @@ class VoiceCues:
         status: Any | None = None,
         play: Callable[[str], None] = tones.play,
         render: Callable[[str, int], bytes] = tones.pcm,
+        voices: dict[str, list[bytes]] | None = None,
+        rng: Any | None = None,
     ) -> None:
+        """`voices` maps an earcon kind to clips of her voice (audio/acks.py
+        `load_cues`): with it, every cue that has a clip is spoken instead
+        of rung, and the two that are better left silent are (see
+        `_SILENT_WHEN_VOICED`). Without it, the tones."""
         self._rate = rate
         self._status = status
         self._play = play
         self._render = render
+        self._voices = voices or {}
+        self._rng = rng if rng is not None else random.Random()
+        self._last_voice: dict[str, int] = {}  # kind -> index of the clip used last
+        self._working_said = 0  # voiced working lines said in this stretch
         self.listening = False
         self.played: list[str] = []  # the last few earcons, newest last
 
+    @property
+    def voiced(self) -> bool:
+        return bool(self._voices)
+
     def _sound(
         self, kind: str, speaker: Any | None, on_audible: Callable[[], None] | None = None
-    ) -> None:
+    ) -> float:
+        """Ring (or say) the cue; returns how long her VOICE runs, in
+        seconds — 0.0 for a tone or silence — so the engine can flag the
+        microphone for her echo the way the wake acknowledgment does."""
         self.played.append(kind)
         del self.played[:-20]  # a days-long process keeps a window, not a history
+        if self._voices and kind in _SILENT_WHEN_VOICED:
+            return 0.0
+        clips = self._voices.get(kind)
+        if clips and speaker is not None:
+            if kind == "working":
+                if self._working_said >= min(_WORKING_LINES, len(clips)):
+                    return 0.0  # she said she is on it, twice: the rest is patience
+                index = self._working_said
+                self._working_said += 1
+            else:
+                choices = [i for i in range(len(clips)) if i != self._last_voice.get(kind)] or [0]
+                index = self._rng.choice(choices)
+            self._last_voice[kind] = index
+            pcm = clips[index]
+            with contextlib.suppress(Exception):  # a speaker that won't take it: the tone below
+                speaker.enqueue(pcm)
+                return len(pcm) / 2 / self._rate
         with contextlib.suppress(Exception):  # no output device is never a crash
             if speaker is not None:
                 # Mixed into a stream we don't own the callback of: nobody can
@@ -58,6 +107,7 @@ class VoiceCues:
                 self._play(kind, on_audible)
             else:
                 self._play(kind)
+        return 0.0
 
     def _state(self, state: str) -> None:
         if self._status is not None:
@@ -82,6 +132,7 @@ class VoiceCues:
         if self.listening:
             return False
         self.listening = True
+        self._working_said = 0  # a new turn: the next slow tool may say so again
         if sound:
             self._sound("wake", speaker, on_audible)
         self._state("listening")
@@ -100,9 +151,10 @@ class VoiceCues:
         self._state("working")
         return True
 
-    def turn_over(self, speaker: Any | None = None) -> None:
-        """The falling tone on its own, after the flag already dropped."""
-        self._sound("listen_end", speaker)
+    def turn_over(self, speaker: Any | None = None) -> float:
+        """The falling tone — or her "Mm-hm." — on its own, after the flag
+        already dropped. Returns the seconds her voice runs (0.0 for a tone)."""
+        return self._sound("listen_end", speaker)
 
     def level(self, value: float) -> None:
         """How loud the room is right now (0..1), for the panel's bar. Sound-
@@ -113,27 +165,33 @@ class VoiceCues:
             with contextlib.suppress(Exception):
                 self._status.set_level(value)
 
-    def working(self, speaker: Any | None = None) -> None:
+    def working(self, speaker: Any | None = None) -> float:
         """She is away doing something and the room would otherwise be silent:
-        the soft tick, and the panel says "working". Never a listening window
-        — the flag is untouched, so a tick can't claim she is hearing you."""
-        self._sound("working", speaker)
+        the soft tick — or "One moment.", then "Still on it.", then nothing —
+        and the panel says "working". Never a listening window — the flag is
+        untouched, so a tick can't claim she is hearing you. Returns the
+        seconds her voice runs (0.0 for a tone or silence)."""
+        spoken = self._sound("working", speaker)
         self._state("working")
+        return spoken
 
-    def error(self, message: str = "", speaker: Any | None = None) -> None:
-        """Capture failed, timed out, or the session errored."""
+    def error(self, message: str = "", speaker: Any | None = None) -> float:
+        """Capture failed, timed out, or the session errored. Returns the
+        seconds her voice runs (0.0 for the tone)."""
         self.listening = False
-        self._sound("error", speaker)
+        spoken = self._sound("error", speaker)
         if self._status is not None:
             with contextlib.suppress(Exception):
                 self._status.error(message or "capture failed")
                 self._status.set_listening(False)
+        return spoken
 
     def idle(self) -> None:
         """Nobody is being listened to and nothing is being worked on, but the
         session is still open — push to talk between holds, or a hold so short
         it caught nothing. Silent on purpose: a tone here would be a lie."""
         self.listening = False
+        self._working_said = 0
         self._state("idle")
 
     def session_end(self, speaker: Any | None = None) -> None:

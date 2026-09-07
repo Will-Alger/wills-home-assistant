@@ -17,9 +17,11 @@ import asyncio
 import contextlib
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from typing import Self
 
+import numpy as np
 import sounddevice as sd
 
 from assistant.audio import devices
@@ -78,6 +80,18 @@ class Speaker:
         self._last_callback = time.monotonic()
         self._marks: list[tuple[int, Callable[[], None]]] = []  # (byte position, callback)
         self._paused = False
+        # What the device has been playing, as RMS per callback chunk with its
+        # time: the engine's talk-over guard reads it to know how loud her
+        # own voice is right now, and so how loud the mic's echo of it will be.
+        self._played_levels: deque[tuple[float, float]] = deque(maxlen=64)
+
+    def played_level(self, window_s: float = 0.3) -> float:
+        """The loudest chunk the device pulled in the last `window_s` seconds
+        (int16 RMS; 0.0 in silence). The mic hears the room a little after
+        the device plays it, so the guard asks for a window, not an instant."""
+        now = time.monotonic()
+        levels = [rms for at, rms in list(self._played_levels) if now - at <= window_s]
+        return max(levels) if levels else 0.0
 
     @property
     def is_open(self) -> bool:
@@ -146,6 +160,9 @@ class Speaker:
                 fn()
         if len(chunk) < need:
             chunk += b"\x00" * (need - len(chunk))  # underflow = silence
+        with contextlib.suppress(Exception):
+            samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+            self._played_levels.append((time.monotonic(), float(np.sqrt(np.mean(samples * samples)))))
         tap = self.tap
         if tap is not None:
             with contextlib.suppress(Exception):

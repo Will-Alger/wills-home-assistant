@@ -43,6 +43,7 @@ class NeverWake:
 
 def quick(monkeypatch) -> None:
     monkeypatch.setattr(mod, "_TENTATIVE_COOLDOWN_S", 0.08)
+    monkeypatch.setattr(mod, "_CAL_FRAMES", 1)
     monkeypatch.setattr(mod, "_FALSE_ALARM_S", 0.3)
 
 

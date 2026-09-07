@@ -106,12 +106,43 @@ async def test_turns_end_semantically_at_auto_by_default_and_silence_mode_widens
     turn = asyncio.create_task(owner())
     await asyncio.wait_for(engine.run_conversation(NeverMic(), InstantSpeaker(), None, ui), 6)
     await turn
+    updates = [e["session"] for e in conn.sent if e["type"] == "session.update"]
     silences = [
-        e["session"]["audio"]["input"]["turn_detection"]["silence_duration_ms"]
-        for e in conn.sent
-        if e["type"] == "session.update" and "audio" in e["session"] and "turn_detection" in e["session"]["audio"]["input"]
+        s["audio"]["input"]["turn_detection"]["silence_duration_ms"]
+        for s in updates
+        if "audio" in s and "turn_detection" in s["audio"]["input"]
     ]
     assert silences[-2:] == [2500, 800]  # patient, then back
+    # every update names its session type: the API refuses one without, and
+    # the patience update did exactly that for a day ("Missing required
+    # parameter: 'session.type'") — "let me think" never took
+    assert all(s.get("type") == "realtime" for s in updates)
+
+
+async def test_the_goodbye_after_that_is_all_is_never_dropped() -> None:
+    """He said "that's all"; the server heard something 0.7 s after the
+    commit (his chair, his breath) and the fragment guard cancelled her
+    goodbye. A wrap-up owes the goodbye, whatever the room does next."""
+    engine, client, _cues, ui = make(idle_timeout_s=0.8)
+    conn = client.connection
+    conn.auto_reply = False
+
+    async def owner() -> None:
+        await asyncio.sleep(0.15)
+        conn.push("input_audio_buffer.speech_started")
+        conn.push("input_audio_buffer.speech_stopped")
+        conn.push("input_audio_buffer.committed")
+        conn.push("conversation.item.input_audio_transcription.completed", transcript="That's all.")
+        conn.push("response.created")  # the goodbye, being generated
+        await asyncio.sleep(0.05)
+        conn.push("input_audio_buffer.speech_started")  # a chair scrape
+        await asyncio.sleep(0.05)
+        conn.push_response_done()
+
+    turn = asyncio.create_task(owner())
+    await asyncio.wait_for(engine.run_conversation(NeverMic(), InstantSpeaker(), None, ui), 6)
+    await turn
+    assert "response.cancel" not in conn.kinds()
 
 
 async def test_a_loud_room_after_a_commit_never_drops_the_reply_on_its_own() -> None:
