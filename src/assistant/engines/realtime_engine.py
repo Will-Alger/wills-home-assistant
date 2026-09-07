@@ -681,6 +681,7 @@ _FALSE_ALARM_S = 1.0  # held this long with no server speech detection: resume (
 
 _CAL_FRAMES = 12  # frames of her audibly playing that teach the coupling (~1 s)
 _PLAYING = 100.0  # played RMS above this: the speaker is audibly saying something
+_COUPLING_CAP = 2.0  # a mic beside a loud Echo Dot hears about 1x what is played; more is a glitch
 
 
 class _Levels:
@@ -705,6 +706,8 @@ class _Levels:
         self._playback_started: float | None = None
         self._heard = 0  # frames of her audibly playing seen this reply
         self._ratio = 0.0  # the coupling being learned
+        self._mic_sum = 0.0
+        self._played_sum = 0.0
 
     def quiet(self, level: float) -> None:
         self.quiet_level = level if not self.quiet_level else 0.95 * self.quiet_level + 0.05 * level
@@ -714,6 +717,8 @@ class _Levels:
         self.echo_level = 0.0
         self._heard = 0
         self._ratio = 0.0
+        self._mic_sum = 0.0
+        self._played_sum = 0.0
         self.noted = False  # the "armed" line is printed once per reply
 
     def calibrating(self, now: float, played: float | None = None) -> bool:
@@ -728,8 +733,14 @@ class _Levels:
         if played < _PLAYING:
             return  # she is not audibly playing yet: nothing to learn from this frame
         self._heard += 1
-        self._ratio = max(self._ratio, level / played)
-        self.coupling = self._ratio
+        # Energy over the window, not the worst single frame: the mic hears
+        # the room a beat after the device plays it, so a loud mic frame over
+        # a quiet played one is alignment, not coupling (the Echo Dot logged
+        # couplings of 4 and 7 that way, and thresholds nobody could reach).
+        self._mic_sum += level
+        self._played_sum += played
+        self._ratio = self._mic_sum / self._played_sum
+        self.coupling = min(self._ratio, _COUPLING_CAP)
         self.echo_level = max(self.echo_level, level)
 
     def expected_echo(self, played: float | None = None) -> float:
@@ -1631,6 +1642,7 @@ class RealtimeEngine:
         turn_detection: str = "semantic_vad",
         silence_ms: int = 1000,
         speech_gate: bool = True,
+        transcribe_language: str = "en",  # pinned: short turns drifted into "Oh ja." and "Tamam,"
         eagerness: str = "auto",  # semantic_vad: auto (= medium) waits while a sentence sounds unfinished
         extra_instructions: str = "",
         memory: MemoryStore | None = None,
@@ -1712,6 +1724,7 @@ class RealtimeEngine:
         self._turn_mode = "semantic_vad" if turn_detection.strip().lower() == "semantic_vad" else "server_vad"
         self._silence_ms = int(silence_ms)  # server_vad: silence that ends a turn
         self._speech_gate = speech_gate  # the server hears speech or clean silence, never the room
+        self._transcribe_language = (transcribe_language or "").strip().lower()
         self._extra_instructions = extra_instructions
         self._memory = memory
         self._board = task_board  # her own Jira: specs, builds, approvals
@@ -1867,6 +1880,10 @@ class RealtimeEngine:
         }
         if transcription_model:
             transcription: dict[str, Any] = {"model": transcription_model}
+            if self._transcribe_language:
+                # ISO-639-1; the SDK's AudioTranscription.language. Without it
+                # a one-word turn came back as German or Turkish.
+                transcription["language"] = self._transcribe_language
             # The transcriber is a second model that never hears the audio the
             # way she does; these are the names it would otherwise invent
             # spellings for. Kick off the next library refresh while we're here

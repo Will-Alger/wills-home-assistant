@@ -99,6 +99,30 @@ def test_the_expected_echo_follows_what_the_speaker_plays() -> None:
     old.echo(300)  # a speaker that cannot say what it plays: the old rule
     assert old.calibrating(0.5) and not old.calibrating(5.0) and old.threshold() == 480
 
+    # The mic hears the room a beat after the device plays it: a loud mic
+    # frame over a quiet played one is alignment, not coupling. Energy over
+    # the window, not the worst frame — the Echo Dot logged couplings of 4
+    # and 7 the other way, and thresholds of 25,000 nobody could talk over.
+    skewed = _Levels()
+    skewed.new_playback(0.0)
+    for i in range(12):
+        skewed.echo(500, 100 if i % 2 else 2000)
+    assert abs(skewed.coupling - 6000 / 12600) < 0.01  # not 5.0
+    loud = _Levels()
+    loud.new_playback(0.0)
+    for _ in range(12):
+        loud.echo(9000, 1000)
+    assert loud.coupling == 2.0  # capped: past this it is a glitch, and she would be deaf to him
+
+
+async def test_the_transcriber_is_told_the_language() -> None:
+    engine, _client, _ui = make()
+    transcription = (await engine._session_config("whisper-1"))["audio"]["input"]["transcription"]
+    assert transcription["language"] == "en"
+    engine, _client, _ui = make(transcribe_language="")
+    transcription = (await engine._session_config("whisper-1"))["audio"]["input"]["transcription"]
+    assert "language" not in transcription
+
 
 def make(**kw) -> tuple[RealtimeEngine, FakeClient, QuietUi]:
     engine = RealtimeEngine(

@@ -198,6 +198,9 @@ class Settings(BaseSettings):
     # the microphone (with a short pre-roll) keeps a vacuum cleaner, the fridge
     # and her own tail from ever becoming a "turn".
     realtime_speech_gate: bool = True
+    # The language the transcriber is told to expect (ISO-639-1). Unpinned,
+    # a one-word turn came back as "Oh ja." and "Tamam,". "" = let it guess.
+    realtime_transcribe_language: str = "en"
 
     # What the wake word (and a push-to-talk press) is answered with, before
     # the session exists: "voice" plays one of the short clips rendered in her

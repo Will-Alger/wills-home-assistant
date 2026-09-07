@@ -389,6 +389,7 @@ def build_engine(fake: bool):
         turn_detection=settings.realtime_turn_detection,
         silence_ms=settings.realtime_silence_ms,
         speech_gate=settings.realtime_speech_gate,
+        transcribe_language=settings.realtime_transcribe_language,
         eagerness=settings.realtime_eagerness,
         extra_instructions=settings.assistant_extra_instructions,
         memory=memory,
