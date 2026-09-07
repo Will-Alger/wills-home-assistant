@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from assistant.config import wake_phrase
-from assistant.recording import SCRIPT, describe
+from assistant.recording import SCRIPT, clock, describe
 
 # The Realtime voices the API accepts (verified against the installed openai
 # SDK: RealtimeAudioConfigOutput), plus "sol" — Will's pick, still org-gated,
@@ -238,6 +238,7 @@ class SettingsPanel:
         data["saved_microphone"] = self._overrides.microphone
         data["saved_speaker"] = self._overrides.speaker
         data["recording"] = self.recording
+        data["recording_elapsed"] = self.recording_elapsed()
         return data
 
     def meter(self) -> tuple[bool, float]:
@@ -357,26 +358,42 @@ class SettingsPanel:
 
     @property
     def recording(self) -> bool:
-        """Armed: every conversation from the next one is recorded."""
+        """A recording is running right now (from Start until End)."""
         if self._recorder is None:
             return False
         try:
-            return bool(self._recorder.armed)
+            return bool(self._recorder.active)
         except Exception:  # noqa: BLE001
             return False
 
+    def recording_elapsed(self) -> float:
+        if self._recorder is None:
+            return 0.0
+        try:
+            return float(self._recorder.elapsed)
+        except Exception:  # noqa: BLE001
+            return 0.0
+
     def set_recording(self, on: bool) -> str:
+        """Start a recording (a running one keeps going), or end it."""
         if self._recorder is None:
             return "recording isn't wired up in this session"
-        self._recorder.arm(bool(on))
         if on:
+            if self._recorder.active:
+                return f"already recording — {clock(self._recorder.elapsed)} so far"
+            self._recorder.start()
             text = (
-                "recording sessions — both sides of the audio and every turn-taking "
-                "decision, in data/recordings, from the next conversation"
+                "recording — both sides of the audio and every turn-taking decision, "
+                "across every conversation until you end it"
             )
         else:
-            text = "not recording sessions"
+            summary = self._recorder.stop()
             self._script_pos = 0
+            if summary is None:
+                return "nothing was recording"
+            text = (
+                f"recording ended — {describe(summary)} → data/recordings/{summary['name']}"
+            )
         self.note(text)
         return text
 
@@ -439,13 +456,13 @@ class SettingsPanel:
 
     def next_step(self) -> tuple[int, str, str] | None:
         """The owner reached the next step: stamp it into the recording
-        (arming the recorder if it was off) and return (n, say, expect);
+        (starting one if none is running) and return (n, say, expect);
         None past the end."""
         if self._script_pos >= len(SCRIPT):
             return None
         if self._recorder is not None and not self.recording:
-            self._recorder.arm(True)
-            self.note("recording sessions — the test script turned it on")
+            self._recorder.start()
+            self.note("recording — the test script started it; end it from the panel when you're done")
         self._script_pos += 1
         say, expect = SCRIPT[self._script_pos - 1]
         if self._recorder is not None:
@@ -615,10 +632,8 @@ class _TkPanel:
         # debugging her turn-taking: record sessions, browse them, read the script
         debug = ttk.Frame(frame)
         debug.grid(row=10, column=0, columnspan=3, sticky="w", pady=(0, 4))
-        self._record = tk.BooleanVar(value=self._panel.recording)
-        ttk.Checkbutton(
-            debug, text="Record sessions", variable=self._record, command=self._on_record
-        ).pack(side="left")
+        self._record_button = ttk.Button(debug, text="Start recording", width=24, command=self._on_record)
+        self._record_button.pack(side="left")
         ttk.Button(debug, text="Recordings…", command=self._open_recordings).pack(side="left", padx=6)
         ttk.Button(debug, text="Test script…", command=self._open_script).pack(side="left")
         self._rec_win: Any = None
@@ -647,7 +662,17 @@ class _TkPanel:
     # recordings (Tk thread)
 
     def _on_record(self) -> None:
-        self._message.configure(text=self._panel.set_recording(bool(self._record.get())))
+        self._message.configure(text=self._panel.set_recording(not self._panel.recording))
+        self._refresh_record_button()
+        self._reload_recordings()
+
+    def _refresh_record_button(self) -> None:
+        """"Start recording", or "End recording" with the timer running."""
+        with contextlib.suppress(Exception):
+            if self._panel.recording:
+                self._record_button.configure(text=f"● End recording  {clock(self._panel.recording_elapsed())}")
+            else:
+                self._record_button.configure(text="Start recording")
 
     def _window_alive(self, win: Any) -> bool:
         try:
@@ -671,9 +696,11 @@ class _TkPanel:
         body.pack(fill="both", expand=True)
         ttk.Label(
             body,
-            text="Each recording: mic.wav (what she heard, from 3 s before the wake), "
-            "speaker.wav (what she played), events.jsonl (every decision, with the numbers) "
-            "and summary.json. Playback goes through the default speaker — she hears it too.",
+            text="Each recording runs from Start to End, across every conversation in between: "
+            "mic.wav (what she heard, idle stretches included), speaker.wav (what she played, as "
+            "it played), events.jsonl (every decision, with the numbers) and summary.json (the "
+            "conversations and their transcripts). Playback goes through the default speaker — "
+            "she hears it too.",
             wraplength=720, justify="left",
         ).pack(anchor="w")
         rows = ttk.Frame(body)
@@ -707,7 +734,7 @@ class _TkPanel:
         for row in self._rec_rows:
             self._rec_list.insert("end", describe(row))
         if not self._rec_rows:
-            self._rec_list.insert("end", "(no recordings yet — tick Record sessions, then talk to her)")
+            self._rec_list.insert("end", "(no recordings yet — click Start recording, talk to her, then End recording)")
 
     def _rec_selected(self) -> str:
         try:
@@ -795,15 +822,15 @@ class _TkPanel:
         total = len(self._panel.script())
         if done:
             self._script_head.configure(text=f"Done — all {total} steps are stamped into the recording.")
-            self._script_set(self._script_say, "Untick Record sessions when you are finished, or leave it on.")
-            self._script_set(self._script_expect, "Open Recordings… to add a note about what went wrong, and play back the mic side.")
+            self._script_set(self._script_say, "Click End recording on the panel when you are finished.")
+            self._script_set(self._script_expect, "Then open Recordings… to add a note about what went wrong, and play back the mic side.")
             return
         if n == 0:
             self._script_head.configure(text=f"{total} steps. Click Next step as you reach each one.")
             self._script_set(
                 self._script_say,
                 "Every click is stamped into the recording's timeline, so the events can be read "
-                "against the script. Recording turns itself on at the first click.",
+                "against the script. The first click starts a recording if none is running.",
             )
             self._script_set(self._script_expect, "Read the step, do it, watch what she does, click Next step.")
             return
@@ -814,8 +841,7 @@ class _TkPanel:
 
     def _script_next(self) -> None:
         result = self._panel.next_step()
-        with contextlib.suppress(Exception):
-            self._record.set(self._panel.recording)
+        self._refresh_record_button()
         self._render_step(done=result is None)
 
     def _script_restart(self) -> None:
@@ -875,6 +901,7 @@ class _TkPanel:
         hotkey = str(snapshot.get("hotkey") or "")
         self._values["hotkey"].configure(text=f"hold {hotkey}" if hotkey else "off")
         self._values["summary"].configure(text=str(snapshot.get("summary", "")))
+        self._refresh_record_button()  # the timer ticks with the panel
         lines = list(snapshot.get("log", []))  # type: ignore[arg-type]
         if lines != self._shown:
             self._shown = lines

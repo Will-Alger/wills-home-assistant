@@ -1,23 +1,24 @@
 """Record a session: both sides of the audio and every decision the engine
-made, on one timeline.
+made, on one timeline, from "Start recording" until "End recording".
 
 Debugging her turn-taking from the log after the fact is guesswork — the
 log says "the reply to the fragment is dropped", not what the microphone
 actually heard at that moment. A recording is ground truth: `mic.wav` is the
-raw microphone (every frame the pump saw, the gate's silence and the echo
-window included — the events say what became of each), `speaker.wav` is
-everything queued to the speaker (her voice, the chimes, the "Yes?"), and
-`events.jsonl` is one row per engine decision with the numbers it used, `t`
-in seconds from the start of the WAVs. `summary.json` is what the panel
-lists: when, how long, how it ended, how many turns, and the owner's note.
+raw microphone, continuously, idle stretches included (so a false wake shows
+what set it off, and a wake that never fired shows what she heard instead);
+`speaker.wav` is everything the speaker played, as it played (her voice, the
+chimes, the "Yes?", and the silence between); `events.jsonl` is one row per
+engine decision with the numbers it used, `t` in seconds from the start of
+both WAVs; `summary.json` lists the conversations inside it (kind, how each
+ended, its transcript) and the owner's note.
 
-Both WAVs start `preroll_s` BEFORE the wake — the last seconds of the room
-while she was idle — so a false wake shows what set it off. Audio is written
-as raw PCM while the session runs and turned into WAV at the end; a crash
-leaves the PCM, and the next start repairs it into a readable file.
-
-Opt-in (the panel's "Record sessions", or "Alexa, record this session"), and
-it all lives in `data/recordings/`, which is never committed.
+The owner starts one from the panel ("Start recording", with a running
+timer), by voice ("Alexa, record this"), or by clicking the test script's
+first step; it runs across every conversation until "End recording" — or
+`max_s`, so a forgotten one cannot fill the disk. Audio is written as raw
+PCM while it runs and turned into WAV at the end; a crash leaves the PCM,
+and the next start repairs it. Everything lives in `data/recordings/`,
+which is never committed.
 """
 
 from __future__ import annotations
@@ -28,15 +29,14 @@ import shutil
 import threading
 import time
 import wave
-from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 _RATE = 24_000
 _WIDTH = 2  # int16 mono
-_PREROLL_S = 3.0
 _KEEP = 50  # recordings kept; the oldest go when a new one starts
+_MAX_S = 30 * 60  # a recording nobody ended stops itself here (~170 MB)
 
 # The read-aloud test script: what to say, what should happen. Each step is
 # stamped into the recording when the owner clicks "Next step", so the
@@ -48,7 +48,7 @@ SCRIPT: tuple[tuple[str, str], ...] = (
     ),
     (
         "\"Alexa\" — then say nothing at all.",
-        "She answers \"Yes?\" and closes quietly on her own within about six seconds. No ding, no reply to the room.",
+        "She answers \"Yes?\" and closes quietly on her own within about eight seconds. No ding, no reply to the room.",
     ),
     (
         "\"Alexa, turn off the hallway light.\"",
@@ -103,27 +103,25 @@ SCRIPT: tuple[tuple[str, str], ...] = (
 
 
 class Recorder:
-    """One recording at a time; armed or not, persisted beside the recordings."""
+    """One recording at a time, from start() to stop(), across conversations."""
 
     def __init__(
         self,
         root: Path,
         *,
         rate: int = _RATE,
-        preroll_s: float = _PREROLL_S,
         keep: int = _KEEP,
+        max_s: float = _MAX_S,
         now: Callable[[], float] = time.time,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.root = Path(root)
         self.rate = rate
         self.keep = keep
+        self.max_s = max_s
         self._now = now
         self._clock = clock
-        self._state = self.root / "state.json"
         self._lock = threading.Lock()
-        frame_bytes = int(rate * 0.08) * _WIDTH  # the pump's 80 ms frames
-        self._ring: deque[bytes] = deque(maxlen=max(1, int(preroll_s * rate * _WIDTH / frame_bytes)))
         self._folder: Path | None = None
         self._mic: Any = None
         self._spk: Any = None
@@ -131,29 +129,14 @@ class Recorder:
         self._events: Any = None
         self._t0 = 0.0
         self._started = 0.0
-        self._kind = ""
-        self._pending: list[dict[str, Any]] = []  # script steps clicked before a session opened
         self._count = 0
+        self._steps = 0
+        self._sessions: list[dict[str, Any]] = []
+        self.stopped_by: str = ""  # why the last recording ended (the panel says so)
         with contextlib.suppress(Exception):
             self.repair()
 
-    # ── armed ──────────────────────────────────────────────────────────────
-
-    @property
-    def armed(self) -> bool:
-        try:
-            return bool(json.loads(self._state.read_text(encoding="utf-8")).get("armed"))
-        except (OSError, ValueError):
-            return False
-
-    def arm(self, on: bool = True) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
-        self._state.write_text(json.dumps({"armed": bool(on)}), encoding="utf-8")
-        if not on:
-            self._ring.clear()
-
-    def disarm(self) -> None:
-        self.arm(False)
+    # ── state ──────────────────────────────────────────────────────────────
 
     @property
     def active(self) -> bool:
@@ -163,22 +146,26 @@ class Recorder:
     def current(self) -> str:
         return self._folder.name if self._folder is not None else ""
 
+    @property
+    def elapsed(self) -> float:
+        """Seconds since start() (0.0 when nothing is recording)."""
+        return self._clock() - self._t0 if self._folder is not None else 0.0
+
     # ── the taps ───────────────────────────────────────────────────────────
 
     def mic(self, frame: bytes) -> None:
-        """Every frame the microphone delivered — while idle it feeds the
-        pre-roll ring, in a session it goes to disk."""
+        """Every frame the microphone delivered — idle or in a conversation."""
         if self._folder is None:
-            if self.armed_cached():
-                self._ring.append(frame)
             return
         with self._lock, contextlib.suppress(Exception):
             self._mic.write(frame)
             self._flush_spoken()
+        if self._clock() - self._t0 > self.max_s:
+            self.stop(reason=f"stopped itself after {self.max_s / 60:.0f} minutes")
 
     def spoke(self, pcm: bytes) -> None:
-        """Everything the speaker actually played (her voice, chimes, the
-        "Yes?", and the silence between), as it played. Called on the audio
+        """Everything the speaker actually played, as it played (her voice,
+        chimes, the "Yes?", and the silence between). Called on the audio
         thread, so it only stashes the bytes; the mic tap on the loop thread
         writes them out a few times a second."""
         if self._folder is None or not pcm:
@@ -207,19 +194,54 @@ class Recorder:
             self._count += 1
 
     def step(self, n: int, say: str = "") -> None:
-        """The owner reached step `n` of the script. Before a session opens
-        it is held and stamped first thing when one does."""
+        """The owner reached step `n` of the script."""
         if self._folder is None:
-            self._pending.append({"kind": "script_step", "n": n, "say": say})
             return
+        self._steps += 1
         self.event("script_step", n=n, say=say)
 
-    # ── a session ──────────────────────────────────────────────────────────
+    # ── conversations inside the recording ─────────────────────────────────
 
-    def begin(self, kind: str = "wake") -> str | None:
-        """Open a recording (no-op unless armed, or when one is open)."""
-        if self._folder is not None or not self.armed:
-            return None
+    def session_started(self, kind: str = "wake") -> bool:
+        """A conversation opened; True when it is being recorded."""
+        if self._folder is None:
+            return False
+        self._sessions.append({"kind": kind, "t": round(self.elapsed, 3)})
+        self.event("session", what="opened", session=kind)
+        with contextlib.suppress(Exception):
+            self._write_summary(self._folder, ended_by="recording")  # a crash mid-conversation still lists it
+        return True
+
+    def session_ended(
+        self,
+        *,
+        ended_by: str = "",
+        transcript: list[tuple[str, str]] | None = None,
+        replied: bool = False,
+    ) -> None:
+        if self._folder is None:
+            return
+        lines = [list(pair) for pair in (transcript or [])]
+        if self._sessions and "ended_by" not in self._sessions[-1]:
+            self._sessions[-1].update(
+                {
+                    "t_end": round(self.elapsed, 3),
+                    "ended_by": ended_by or "unknown",
+                    "turns": sum(1 for role, _ in lines if role == "you"),
+                    "replied": replied,
+                    "transcript": lines,
+                }
+            )
+        self.event("session", what="closed", by=ended_by, replied=replied)
+        with contextlib.suppress(Exception):
+            self._write_summary(self._folder, ended_by="recording")
+
+    # ── start / stop ───────────────────────────────────────────────────────
+
+    def start(self) -> str:
+        """Open a recording; the name of the one already running if any."""
+        if self._folder is not None:
+            return self._folder.name
         self.root.mkdir(parents=True, exist_ok=True)
         self._prune()
         name = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(self._now()))
@@ -229,54 +251,30 @@ class Recorder:
             folder = self.root / f"{name}-{n}"
             n += 1
         folder.mkdir(parents=True)
-        preroll = b"".join(self._ring)
-        self._ring.clear()
-        preroll_s = len(preroll) / (self.rate * _WIDTH)
         with self._lock:
             self._mic = (folder / "mic.pcm").open("ab")
             self._spk = (folder / "speaker.pcm").open("ab")
             self._events = (folder / "events.jsonl").open("a", encoding="utf-8")
-            self._mic.write(preroll)
-            self._spk.write(bytes(len(preroll)))  # silence: both sides share t = 0
             self._spk_pending.clear()
             self._folder = folder
-            self._t0 = self._clock() - preroll_s
+            self._t0 = self._clock()
             self._started = self._now()
-            self._kind = kind
             self._count = 0
-        (folder / "summary.json").write_text(
-            json.dumps(
-                {
-                    "name": folder.name,
-                    "started": _iso(self._started),
-                    "kind": kind,
-                    "preroll_s": round(preroll_s, 3),
-                    "rate": self.rate,
-                    "ended_by": "recording",
-                    "note": "",
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        self.event("recording", session=kind, preroll_s=round(preroll_s, 3))
-        for row in self._pending:
-            self.event(**row)
-        self._pending.clear()
+            self._steps = 0
+            self._sessions = []
+            self.stopped_by = ""
+        self._write_summary(folder, ended_by="recording")
+        self.event("recording", what="started")
         return folder.name
 
-    def end(
-        self,
-        *,
-        ended_by: str = "",
-        transcript: list[tuple[str, str]] | None = None,
-        replied: bool = False,
-    ) -> dict[str, Any] | None:
+    def stop(self, *, reason: str = "ended") -> dict[str, Any] | None:
         """Close the recording: WAVs out of the PCM, the summary written."""
         if self._folder is None:
             return None
-        self.event("ended", by=ended_by)
+        self.event("recording", what="stopped", by=reason)
         folder = self._folder
+        with contextlib.suppress(Exception):
+            self._write_summary(folder, ended_by=reason)  # the counts, while they are still ours
         with self._lock:
             self._flush_spoken()
             for handle in (self._mic, self._spk, self._events):
@@ -284,15 +282,27 @@ class Recorder:
                     handle.close()
             self._folder = None
             self._mic = self._spk = self._events = None
-        lines = [list(pair) for pair in (transcript or [])]
-        summary = self._finalize(
-            folder,
-            ended_by=ended_by or "unknown",
-            turns=sum(1 for role, _ in lines if role == "you"),
-            replied=replied,
-            transcript=lines,
-            events=self._count,
+        self.stopped_by = reason
+        return self._finalize(folder, ended_by=reason)
+
+    def _write_summary(self, folder: Path, **fields: Any) -> dict[str, Any]:
+        summary = self._read_summary(folder)
+        summary.update(
+            {
+                "name": folder.name,
+                "started": _iso(self._started),
+                "rate": self.rate,
+                "sessions": self._sessions,
+                "conversations": len(self._sessions),
+                "turns": sum(int(s.get("turns", 0) or 0) for s in self._sessions),
+                "steps": self._steps,
+                "events": self._count,
+                "elapsed_s": round(self.elapsed, 1),
+                **fields,
+            }
         )
+        summary.setdefault("note", "")
+        (folder / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
         return summary
 
     def _finalize(self, folder: Path, **fields: Any) -> dict[str, Any]:
@@ -307,6 +317,7 @@ class Recorder:
         summary.update(fields)
         summary["duration_s"] = round(duration, 1)
         summary.setdefault("note", "")
+        summary.setdefault("conversations", len(summary.get("sessions", []) or []))
         with contextlib.suppress(OSError):
             (folder / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
         return summary
@@ -377,20 +388,6 @@ class Recorder:
         except (OSError, wave.Error):
             return None
 
-    # ── internals ──────────────────────────────────────────────────────────
-
-    _armed_at = 0.0
-    _armed_value = False
-
-    def armed_cached(self) -> bool:
-        """The idle mic tap runs twelve times a second: read the flag from
-        disk once a second, not once a frame."""
-        now = self._clock()
-        if now - self._armed_at > 1.0:
-            self._armed_value = self.armed
-            self._armed_at = now
-        return self._armed_value
-
     @staticmethod
     def _read_summary(folder: Path) -> dict[str, Any]:
         try:
@@ -430,14 +427,28 @@ def _iso(ts: float) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
 
+def clock(seconds: float) -> str:
+    """mm:ss (h:mm:ss past an hour) for the panel's timer."""
+    seconds = max(0, int(seconds))
+    h, rest = divmod(seconds, 3600)
+    m, s = divmod(rest, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
 def describe(summary: dict[str, Any]) -> str:
     """One line for the panel's list."""
     started = str(summary.get("started", summary.get("name", "")))
     duration = float(summary.get("duration_s", 0) or 0)
+    n = int(summary.get("conversations", 0) or 0)
     turns = int(summary.get("turns", 0) or 0)
     ended = str(summary.get("ended_by", "") or "")
-    kind = str(summary.get("kind", "") or "")
     note = str(summary.get("note", "") or "")
-    bits = [started, f"{duration:.0f} s", kind, f"{turns} turn{'s' if turns != 1 else ''}", ended]
+    bits = [
+        started,
+        clock(duration),
+        f"{n} conversation{'s' if n != 1 else ''}",
+        f"{turns} turn{'s' if turns != 1 else ''}",
+        ended if ended not in ("ended", "recording") else "",
+    ]
     line = " · ".join(b for b in bits if b)
     return f"{line} — {note}" if note else line

@@ -1458,17 +1458,17 @@ PANEL_TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "name": "start_recording",
         "description": (
-            "Start recording sessions for debugging — 'record this session', "
-            "'start recording', 'record our conversations'. Both sides of the "
-            "audio and every turn-taking decision go to data/recordings, "
-            "browsable from the Settings panel. Stays on until stopped."
+            "Start a recording for debugging — 'start recording', 'record this'. "
+            "From this moment, across every conversation until it is ended: "
+            "both sides of the audio and every turn-taking decision go to "
+            "data/recordings, browsable from the Settings panel."
         ),
         "parameters": {"type": "object", "properties": {}},
     },
     {
         "type": "function",
         "name": "stop_recording",
-        "description": "Stop recording sessions — 'stop recording'.",
+        "description": "End the recording — 'end recording', 'stop recording'.",
         "parameters": {"type": "object", "properties": {}},
     },
 ]
@@ -1690,11 +1690,10 @@ class RealtimeEngine:
         self._latency = latency  # logs/turns.jsonl: how long each step took
         self._trace = TurnTrace()  # replaced per conversation; this one writes nothing
         self._panel = panel  # the desktop Settings panel she opens by voice
-        # A session recording (recording.py): the runner points `tap` at it
-        # while one is open, and every decision below lands on its timeline.
+        # A session recording (recording.py): the runner points `tap` at it,
+        # and every decision below lands on its timeline while one runs.
         # None costs one attribute read per decision.
         self.tap: Callable[..., None] | None = None
-        self.recorder: Any = None
         self.last_response_followup = False  # a tool ran: more audio is coming
         self._instructions_stale = False  # a preference changed mid-session
         # The last few tools she actually used — what "in play" means when
@@ -2660,14 +2659,7 @@ class RealtimeEngine:
             if name == "close_settings_panel":
                 return self._panel.close(), False
             if name == "start_recording":
-                text = self._panel.set_recording(True)
-                recorder = self.recorder
-                if recorder is not None and not recorder.active and recorder.begin("wake"):
-                    # from here, not from the next conversation: the mic and
-                    # speaker taps are already in place, the timeline starts now
-                    self.tap = recorder.event
-                    text += " — and this conversation is being recorded from here"
-                return text, False
+                return self._panel.set_recording(True), False  # from this moment, across conversations
             if name == "stop_recording":
                 return self._panel.set_recording(False), False
             if name == "list_audio_devices":

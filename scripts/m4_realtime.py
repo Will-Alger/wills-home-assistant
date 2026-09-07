@@ -427,7 +427,7 @@ def build_engine(fake: bool):
     engine.fallbacks = fallbacks  # the runner's recovery path speaks too
     engine.acks = acks  # "Yes?" in her own voice, the instant the wake fires
     engine.panel = panel
-    engine.recorder = recorder  # "record this session": the tool opens one mid-conversation
+    engine.recorder = recorder  # the runner taps the streams and the engine into it
     engine.latency = latency
     engine.overrides = overrides
     engine.audio_reconfigure = False  # set when the mic/speaker choice changes
@@ -691,11 +691,11 @@ async def one_cycle(
     assert mic is not None and speaker is not None
     recorder = getattr(engine, "recorder", None)
     if recorder is not None:
-        # Always tapped, rarely writing: idle frames feed a three-second
-        # ring only while armed, and nothing at all reaches disk until a
-        # recording opens.
+        # Always tapped, writing only between Start and End: the idle room,
+        # every conversation, and every decision, on one timeline.
         mic.tap = recorder.mic
         speaker.tap = recorder.spoke
+        engine.tap = recorder.event
     # Something to say already? Skip the wait and speak. Otherwise IDLE:
     # wake-gate on the open mic (local, free, private) while watching the
     # announcement queue, the restart flag, the audio-change flag and stalls.
@@ -751,18 +751,14 @@ async def one_cycle(
     push = trigger == "ptt"
     if trace is None:
         trace = latency.wake(None)  # she opened this one: no wake word, no score
-    recording = ""
-    if recorder is not None:
-        # Armed from the panel or by voice: the timeline opens before the
-        # acknowledgment, with the three seconds of room before the wake.
-        recording = recorder.begin("announce" if announcing else "ptt" if push else "wake") or ""
-        if recording:
-            engine.tap = recorder.event
-            if trigger == "wake":
-                recorder.event(
-                    "wake", score=wake_score, threshold=settings.wake_threshold,
-                    effective=getattr(wake, "effective_threshold", None),
-                )
+    recording = recorder is not None and recorder.session_started(
+        "announce" if announcing else "ptt" if push else "wake"
+    )
+    if recording and trigger == "wake":
+        recorder.event(
+            "wake", score=wake_score, threshold=settings.wake_threshold,
+            effective=getattr(wake, "effective_threshold", None),
+        )
     if not announcing and cues is not None:
         # "Yes?" in her own voice (or the ding) through the stream already
         # open. Push to talk gets it the moment he presses, and the same
@@ -797,13 +793,9 @@ async def one_cycle(
         await asyncio.wait_for(speaker.wait_idle(), timeout=3.0)
     if speaker.stalled:
         engine.audio_reconfigure = True  # the speaker stopped taking audio: reopen next cycle
-    if recorder is not None and recorder.active:
-        # (opened above, or mid-conversation by "record this session")
-        engine.tap = None
-        with contextlib.suppress(Exception):
-            summary = recorder.end(ended_by=stats.ended_by, transcript=stats.transcript, replied=stats.replied)
-            if summary:
-                say(status, f"recorded → data/recordings/{summary['name']} ({summary['duration_s']:.0f} s)", "dim")
+    if recorder is not None:
+        with contextlib.suppress(Exception):  # no-op unless a recording is running
+            recorder.session_ended(ended_by=stats.ended_by, transcript=stats.transcript, replied=stats.replied)
     if trigger == "wake":
         # A wake nobody followed up counts against the detector; two in three
         # minutes (the vacuum cleaner) raise its bar for ten. A real one
