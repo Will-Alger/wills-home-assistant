@@ -19,6 +19,8 @@ import argparse
 import asyncio
 import contextlib
 import os
+import sys
+import threading
 import time
 import wave
 from pathlib import Path
@@ -34,6 +36,7 @@ from assistant.audio.cues import VoiceCues
 from assistant.audio.fallbacks import SpokenFallbacks
 from assistant.audio.io import AudioIO
 from assistant.audio.mic import describe_device
+from assistant.audio.windows_default import DefaultOutputWatch
 from assistant.brain.thinker import Thinker
 from assistant.briefing import compose_briefing
 from assistant.config import code_root, home_dir, load_settings
@@ -646,6 +649,19 @@ async def voice(fake: bool) -> int:
                 actions = getattr(engine, "phone_actions", None)
                 if actions is not None:
                     await actions.drain()  # never exit mid-merge from a phone tap
+                # Leave nothing for the interpreter's shutdown to wait on: the
+                # Settings panel's Tk thread and the open PortAudio streams once
+                # kept the process alive for twenty minutes after this line —
+                # deaf, on the old speaker, while he clicked Restart again.
+                panel = getattr(engine, "panel", None)
+                if panel is not None:
+                    with contextlib.suppress(Exception):
+                        panel.close()
+                audio = engine.__dict__.get("_audio")
+                if audio is not None:
+                    with contextlib.suppress(Exception):
+                        await audio.close()
+                _leave_soon(0)  # and if it still hangs, the hard way
                 return 0  # the always-on service relaunches us in seconds
     for background in (watcher_task, scheduler_task, courier_task, music_task, hotkey_task):
         if background is not None:
@@ -675,6 +691,12 @@ async def one_cycle(
     if audio is None:
         audio = engine._audio = AudioIO(settings, rate=REALTIME_RATE, frame_samples=FRAME_SAMPLES_24K)
     latency = engine.latency  # the turn log; its stopwatch starts at the wake
+    watch = engine.__dict__.get("_default_watch")
+    if watch is None:
+        # Windows' default speaker, asked of Windows: PortAudio's own answer
+        # is frozen at boot, so a switch from the headphones to the Echo Dot
+        # would otherwise leave her talking to the headphones.
+        watch = engine._default_watch = DefaultOutputWatch()
     trace = None
     wake_score = None
     quiet = False  # a periodic re-scan while on a fallback mic: repeat nothing unless it changed
@@ -683,6 +705,7 @@ async def one_cycle(
         quiet = getattr(engine, "_rescan", False)
         engine._rescan = False
         await audio.reopen()  # PortAudio looks at the machine again; both streams reopen, then stay
+        watch.opened()  # the default they were opened against
         tones.set_output(settings.audio_output_device)
         line = f"audio: mic {audio.mic_in_use} · speaker {audio.speaker_in_use}"
         if not quiet or line != getattr(engine, "_audio_line", ""):
@@ -727,6 +750,12 @@ async def one_cycle(
             if rescan.due():  # on a fallback mic: look again for the real one
                 engine.audio_reconfigure = True
                 engine._rescan = True
+                return True
+            if devices.is_default(settings.audio_output_device) and watch.changed():
+                # he switched Windows from the headphones to the Echo Dot (or
+                # back): the speaker follows, at the next idle moment
+                say(status, "Windows' default speaker changed — following it", "dim")
+                engine.audio_reconfigure = True
                 return True
             return False
 
@@ -875,6 +904,24 @@ async def one_cycle(
     return total_cost
 
 
+def _leave(code: int) -> None:
+    """Exit for real. The interpreter's own shutdown has hung with the Settings
+    panel's Tk thread and PortAudio's streams still up (the log said "exiting
+    for the watchdog"; the process lived on, deaf, for twenty minutes): flush
+    what was printed and go — the service relaunches us."""
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            stream.flush()
+    os._exit(code)
+
+
+def _leave_soon(code: int, grace_s: float = 5.0) -> None:
+    """A daemon timer that ends the process if the orderly exit has not."""
+    timer = threading.Timer(grace_s, _leave, args=(code,))
+    timer.daemon = True
+    timer.start()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fake", action="store_true", help="use the in-memory fake apartment")
@@ -883,9 +930,11 @@ def main() -> int:
     try:
         if args.text_probe:
             return asyncio.run(text_probe(args.fake, args.text_probe))
-        return asyncio.run(voice(args.fake))
+        code = asyncio.run(voice(args.fake))
     except KeyboardInterrupt:
-        return 130
+        code = 130
+    _leave(code)  # never hand the exit to atexit handlers that may not return
+    return code
 
 
 if __name__ == "__main__":
