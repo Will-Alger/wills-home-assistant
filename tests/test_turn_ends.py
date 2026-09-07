@@ -114,11 +114,15 @@ async def test_turns_end_semantically_at_auto_by_default_and_silence_mode_widens
     assert silences[-2:] == [2500, 800]  # patient, then back
 
 
-async def test_the_mic_still_hot_after_a_commit_drops_the_reply_from_local_frames() -> None:
+async def test_a_loud_room_after_a_commit_never_drops_the_reply_on_its_own() -> None:
+    """A guard once cancelled her reply from the local frames alone when the
+    mic was loud right after a commit. Recorded: it fired twice on a room
+    with nobody talking and a command went unanswered. Only the server
+    noticing him again inside the continuation window drops a reply now."""
     import numpy as np
 
     class LoudMic:
-        """He never stopped talking: every frame is a voice at the desk."""
+        """Loud at the desk, whatever it is: every frame is a voice or worse."""
 
         async def get_frame(self) -> bytes:
             await asyncio.sleep(0.01)
@@ -134,17 +138,47 @@ async def test_the_mic_still_hot_after_a_commit_drops_the_reply_from_local_frame
         await asyncio.sleep(0.15)
         conn.push("input_audio_buffer.speech_started")
         conn.push("input_audio_buffer.speech_stopped")
-        conn.push("input_audio_buffer.committed")  # the server thinks he is done; the mic says otherwise
+        conn.push("input_audio_buffer.committed")
         conn.push("conversation.item.input_audio_transcription.completed", transcript="Something just fine first.")
         conn.push("response.created")
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(0.4)  # loud frames the whole time: nothing is cancelled
         conn.user_says("for like cleaning my apartment.", reply="Cleaning music coming up.")
 
     turn = asyncio.create_task(owner())
     await asyncio.wait_for(engine.run_conversation(LoudMic(), InstantSpeaker(), None, ui), 6)
     await turn
-    assert conn.kinds().count("response.cancel") == 1  # once, from the frames — the server never had to notice
-    assert any("still talking after the turn ended" in n for n in ui.notes)
+    assert conn.kinds().count("response.cancel") == 1  # once, when the SERVER heard him again
+    assert any("he kept talking" in n for n in ui.notes)
+    assert not any("still talking after the turn ended" in n for n in ui.notes)
+
+
+async def test_a_confirmation_owed_after_a_tool_is_never_dropped() -> None:
+    """He said one more word while her "Done." was being generated: the tool
+    already ran, so the confirmation is owed — dropping it left him with a
+    silent command once."""
+    engine, client, _cues, ui = make(idle_timeout_s=0.8)
+    conn = client.connection
+    conn.auto_reply = False
+
+    async def owner() -> None:
+        await asyncio.sleep(0.15)
+        conn.user_says("make the lamp red", calls=[("set_lights", {"room": "living room", "color": "red"})], audio=False)
+        conn.push("input_audio_buffer.committed")
+        await asyncio.sleep(0.3)  # the tool ran; her confirmation was asked for
+        conn.push("response.created")  # ...and is being generated, nothing heard yet
+        await asyncio.sleep(0.05)
+        conn.push("input_audio_buffer.speech_started")  # "please"
+        conn.push("input_audio_buffer.speech_stopped")
+        await asyncio.sleep(0.05)
+        conn.push_response_done()
+
+    turn = asyncio.create_task(owner())
+    await asyncio.wait_for(engine.run_conversation(NeverMic(), InstantSpeaker(), None, ui), 6)
+    await turn
+    assert "set_lights" in [k for k in conn.kinds() if k == "set_lights"] or any(
+        e["type"] == "conversation.item.create" for e in conn.sent
+    )  # the tool's output went back
+    assert "response.cancel" not in conn.kinds()
 
 
 async def test_a_regurgitated_vocabulary_prompt_is_noise_not_a_turn() -> None:

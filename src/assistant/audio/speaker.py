@@ -133,18 +133,23 @@ class Speaker:
         due: list[Callable[[], None]] = []
         with self._lock:
             if self._paused:
-                return b"\x00" * need
-            chunk = bytes(self._buffer[:need])
-            del self._buffer[: len(chunk)]
-            self._consumed += len(chunk)
-            if self._marks and chunk:
-                due = [fn for pos, fn in self._marks if pos < self._consumed]
-                self._marks = [(pos, fn) for pos, fn in self._marks if pos >= self._consumed]
+                chunk = b""  # held: the device gets silence, the audio waits
+            else:
+                chunk = bytes(self._buffer[:need])
+                del self._buffer[: len(chunk)]
+                self._consumed += len(chunk)
+                if self._marks and chunk:
+                    due = [fn for pos, fn in self._marks if pos < self._consumed]
+                    self._marks = [(pos, fn) for pos, fn in self._marks if pos >= self._consumed]
         for fn in due:
             with contextlib.suppress(Exception):
                 fn()
         if len(chunk) < need:
             chunk += b"\x00" * (need - len(chunk))  # underflow = silence
+        tap = self.tap
+        if tap is not None:
+            with contextlib.suppress(Exception):
+                tap(chunk)
         return chunk
 
     def _open(self, device: int | None) -> sd.RawOutputStream:
@@ -211,7 +216,10 @@ class Speaker:
                 self._stream.close()
             self._stream = None
 
-    tap: Callable[[bytes], None] | None = None  # a session recording: everything queued, as queued
+    # A session recording: every chunk the device pulled, silence included,
+    # so the track is real time — what was heard when, not what was queued.
+    # Called on the PortAudio thread: it must only stash bytes.
+    tap: Callable[[bytes], None] | None = None
 
     def enqueue(self, pcm: bytes) -> None:
         with self._lock:
@@ -220,9 +228,6 @@ class Speaker:
             if self.current_item:
                 start, _end = self._items.get(self.current_item, (self._enqueued - len(pcm), 0))
                 self._items[self.current_item] = (start, self._enqueued)
-        if self.tap is not None:
-            with contextlib.suppress(Exception):
-                self.tap(pcm)
 
     def begin_item(self, item_id: str) -> None:
         """Audio for this assistant item starts here (idempotent for the same id)."""

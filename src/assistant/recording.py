@@ -127,6 +127,7 @@ class Recorder:
         self._folder: Path | None = None
         self._mic: Any = None
         self._spk: Any = None
+        self._spk_pending = bytearray()  # played bytes stashed by the audio thread
         self._events: Any = None
         self._t0 = 0.0
         self._started = 0.0
@@ -173,13 +174,25 @@ class Recorder:
             return
         with self._lock, contextlib.suppress(Exception):
             self._mic.write(frame)
+            self._flush_spoken()
 
     def spoke(self, pcm: bytes) -> None:
-        """Everything queued to the speaker (her voice, chimes, the "Yes?")."""
+        """Everything the speaker actually played (her voice, chimes, the
+        "Yes?", and the silence between), as it played. Called on the audio
+        thread, so it only stashes the bytes; the mic tap on the loop thread
+        writes them out a few times a second."""
         if self._folder is None or not pcm:
             return
-        with self._lock, contextlib.suppress(Exception):
-            self._spk.write(pcm)
+        with self._lock:
+            self._spk_pending += pcm
+
+    def _flush_spoken(self) -> None:
+        """Under the lock: the speaker bytes stashed since the last write."""
+        if self._spk_pending and self._spk is not None:
+            with contextlib.suppress(Exception):
+                self._spk.write(bytes(self._spk_pending))
+                self._spk.flush()  # a crash keeps what was played up to the last frame
+            self._spk_pending.clear()
 
     def event(self, kind: str, **fields: Any) -> None:
         """One timeline row. Anything, at any time: unknown fields are kept
@@ -188,6 +201,7 @@ class Recorder:
             return
         row = {"t": round(self._clock() - self._t0, 3), "kind": kind, **fields}
         with self._lock, contextlib.suppress(Exception):
+            self._flush_spoken()
             self._events.write(json.dumps(row, default=str) + "\n")
             self._events.flush()
             self._count += 1
@@ -224,6 +238,7 @@ class Recorder:
             self._events = (folder / "events.jsonl").open("a", encoding="utf-8")
             self._mic.write(preroll)
             self._spk.write(bytes(len(preroll)))  # silence: both sides share t = 0
+            self._spk_pending.clear()
             self._folder = folder
             self._t0 = self._clock() - preroll_s
             self._started = self._now()
@@ -263,6 +278,7 @@ class Recorder:
         self.event("ended", by=ended_by)
         folder = self._folder
         with self._lock:
+            self._flush_spoken()
             for handle in (self._mic, self._spk, self._events):
                 with contextlib.suppress(Exception):
                     handle.close()

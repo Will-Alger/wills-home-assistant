@@ -112,6 +112,22 @@ class WakeDetector:
         """The base threshold plus whatever recent false wakes have added."""
         return min(0.95, self.threshold + self.backoff.extra)
 
+    @property
+    def has_vad(self) -> bool:
+        return getattr(self._model, "vad", None) is not None
+
+    def speech_probability(self, frame: bytes) -> float:
+        """Silero's verdict (0..1) on one 16 kHz frame — the same model that
+        gates the wake word, fed by hand for the frames the wake path never
+        sees (the engine's speech gate, while she is not speaking). Feed each
+        frame exactly once, here or through detect(): the model keeps state.
+        0.0 when no VAD is loaded (`vad_threshold` 0)."""
+        vad = getattr(self._model, "vad", None)
+        if vad is None:
+            return 0.0
+        samples = np.frombuffer(frame, dtype=np.int16)
+        return float(vad.predict(samples, frame_size=640))  # two 40 ms windows per 80 ms frame
+
     def detect(self, frame: bytes) -> bool:
         fired = self.score(frame) >= self.effective_threshold
         if fired and (time.monotonic() - self._last_fired) >= self._cooldown_s:

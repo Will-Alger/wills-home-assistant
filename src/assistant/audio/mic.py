@@ -73,8 +73,10 @@ class Microphone:
     engine opens it at 24 kHz instead — pass matching samplerate/frame_samples.
 
     Every frame is stamped with `time.monotonic()` in the PortAudio callback,
-    at capture, so `ignore_before` can throw away the moment she spoke into
-    the room and keep everything he said after it (audio/acks.py).
+    at capture, so `suspect_before` can mark the moment she spoke into the
+    room (audio/acks.py): those frames are still delivered — the words he
+    says over her "Yes?" are usually louder to the mic than her echo — and
+    the engine drops only the ones loud enough to be her.
     """
 
     def __init__(
@@ -90,7 +92,8 @@ class Microphone:
         self._samplerate = samplerate
         self._frame_samples = frame_samples
         self._queue: asyncio.Queue[tuple[float, bytes]] = asyncio.Queue(maxsize=queue_frames)
-        self._ignore_before = 0.0  # frames captured before this stamp are dropped
+        self._suspect_before = 0.0  # frames captured before this stamp may be her own voice
+        self.last_suspect = False  # ...and the frame get_frame just returned was one of them
         self._stream: sd.RawInputStream | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self.device_note: str | None = None  # set when a fallback device was used
@@ -199,28 +202,28 @@ class Microphone:
         with contextlib.suppress(asyncio.QueueFull):
             self._queue.put_nowait((captured, data))
 
-    def ignore_before(self, deadline: float) -> None:
-        """Drop every frame captured before `deadline` (a `time.monotonic()`
-        stamp). This is how her spoken wake acknowledgment does not become his
-        turn: it comes out of the speaker and straight back in here, and
-        silence-based turn detection would hand it to the server as speech.
-        Frames captured AFTER the deadline are delivered exactly as they
-        always were — the command he gives the instant she stops must still
-        reach the session first. Only ever moves forward."""
-        self._ignore_before = max(self._ignore_before, deadline)
+    def suspect_before(self, deadline: float) -> None:
+        """Flag every frame captured before `deadline` (a `time.monotonic()`
+        stamp) as possibly her own voice: her spoken wake acknowledgment
+        comes out of the speaker and straight back in here, and silence-based
+        turn detection would hand it to the server as HIS speech. The frames
+        are delivered all the same, with `last_suspect` set, and the engine
+        drops only the ones loud enough to be her — a word he said over her
+        "Yes?" is not thrown away with it (three commands were, one evening).
+        Only ever moves forward."""
+        self._suspect_before = max(self._suspect_before, deadline)
 
     tap: Callable[[bytes], None] | None = None  # a session recording: every frame delivered, raw
 
     async def get_frame(self) -> bytes:
         if self._stream is None:
             raise AudioSourceClosed
-        while True:
-            captured, frame = await self._queue.get()
-            if captured >= self._ignore_before:
-                if self.tap is not None:
-                    with contextlib.suppress(Exception):
-                        self.tap(frame)
-                return frame
+        captured, frame = await self._queue.get()
+        self.last_suspect = captured < self._suspect_before
+        if self.tap is not None:
+            with contextlib.suppress(Exception):
+                self.tap(frame)
+        return frame
 
     def drain(self) -> None:
         while not self._queue.empty():

@@ -104,9 +104,11 @@ def acknowledge(cues, acks, speaker, mic, trace) -> float:
 
     Her voice then comes straight back in through the microphone, and a server
     that ends turns on silence would answer it as if HE had spoken, so
-    everything captured until the clip has died away is dropped — and nothing
-    after it, because the command he gives the instant she stops is the whole
-    point. Returns the seconds she spoke for (0.0 when she didn't).
+    everything captured until the clip has died away is flagged suspect: the
+    engine drops the frames loud enough to be her and keeps the rest — he
+    often says the command right over her "Yes?", and on a wired speaker her
+    echo is quieter to the mic than his voice. Returns the seconds she spoke
+    for (0.0 when she didn't).
 
     The log wants both moments — queued, and when it could be heard, which
     the speaker reports the instant its callback pulls that byte."""
@@ -118,7 +120,7 @@ def acknowledge(cues, acks, speaker, mic, trace) -> float:
     if speaker.enqueued > at:
         speaker.notify_when_played(at, trace.audible)
     if spoken:
-        mic.ignore_before(time.monotonic() + spoken + ECHO_TAIL_S)
+        mic.suspect_before(time.monotonic() + spoken + ECHO_TAIL_S)
     return spoken
 
 
@@ -804,10 +806,12 @@ async def one_cycle(
                 say(status, f"recorded → data/recordings/{summary['name']} ({summary['duration_s']:.0f} s)", "dim")
     if trigger == "wake":
         # A wake nobody followed up counts against the detector; two in three
-        # minutes (the vacuum cleaner) raise its bar for ten. A real one clears.
+        # minutes (the vacuum cleaner) raise its bar for ten. A real one
+        # clears — and a wake where SOMEONE was heard but nothing came of it
+        # (his words lost somewhere) is not the detector's fault.
         if stats.replied:
             wake.backoff.real_wake()
-        elif stats.ended_by == "nobody spoke" and wake.backoff.false_wake():
+        elif stats.ended_by == "nobody spoke" and not stats.heard_speech and wake.backoff.false_wake():
             say(
                 status,
                 f"two false wakes in three minutes — the wake word now needs "

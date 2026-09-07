@@ -154,7 +154,7 @@ class Settings(BaseSettings):
 
     # Milestone 4: voice engines
     # Primary candidate: OpenAI Realtime (speech-native; uses OPENAI_API_KEY).
-    realtime_model: str = "gpt-realtime-2.1"
+    realtime_model: str = "gpt-realtime-2.1-mini"  # fast; real thinking goes to the brain (think)
     # "sol" is Will's pick; it's org-gated today, so the engine automatically
     # falls back to marin until OpenAI unlocks it — then this just works.
     realtime_voice: str = "sol"

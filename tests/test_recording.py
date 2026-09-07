@@ -169,6 +169,23 @@ def test_a_crash_mid_session_still_leaves_readable_files(tmp_path: Path) -> None
     assert summary["ended_by"] == "crashed" and summary["duration_s"] == 2.0
 
 
+def test_speaker_bytes_stashed_from_the_audio_thread_reach_the_file(tmp_path: Path) -> None:
+    """The speaker's tap runs in the PortAudio callback: it only stashes;
+    the mic tap (loop thread) and end() write the stash out."""
+    recorder = Recorder(tmp_path / "rec")
+    recorder.arm()
+    name = recorder.begin()
+    recorder.spoke(b"\x01\x00" * 1000)
+    assert len(recorder._spk_pending) == 2000  # stashed, not written
+    recorder.mic(FRAME)
+    assert len(recorder._spk_pending) == 0
+    assert (tmp_path / "rec" / name / "speaker.pcm").stat().st_size == 2000
+    recorder.spoke(b"\x02\x00" * 500)
+    recorder.end(ended_by="x")
+    frames, _ = wav_frames(tmp_path / "rec" / name / "speaker.wav")
+    assert frames == 1500
+
+
 class FakeView:
     def __init__(self, panel: SettingsPanel) -> None:
         self.panel = panel

@@ -101,11 +101,23 @@ REALTIME_RATE = 24_000
 FRAME_SAMPLES_24K = 1920  # 80 ms
 FALLBACK_VOICE = "marin"  # used automatically when the configured voice is gated
 
-# $/1M tokens, gpt-realtime-2.1 (pricing page, 2026-08; approximate meter —
-# cached tokens all billed at the cached-audio rate for simplicity).
-_PRICE_AUDIO_IN, _PRICE_AUDIO_OUT = 32.0, 64.0
-_PRICE_TEXT_IN, _PRICE_TEXT_OUT = 4.0, 24.0
-_PRICE_CACHED = 0.40
+# $/1M tokens by model (developers.openai.com/api/docs/pricing, read
+# 2026-09-06; approximate meter — cached tokens all billed at the cached-audio
+# rate for simplicity): audio in, audio out, text in, text out, cached.
+# Longest matching prefix wins; anything unknown is metered at the full-size
+# rate, which can only over-report.
+_PRICES: dict[str, tuple[float, float, float, float, float]] = {
+    "gpt-realtime-2.1-mini": (10.0, 20.0, 0.60, 2.40, 0.30),
+    "gpt-realtime": (32.0, 64.0, 4.0, 24.0, 0.40),
+}
+
+
+def _prices_for(model: str) -> tuple[float, float, float, float, float]:
+    best = ""
+    for prefix in _PRICES:
+        if model.startswith(prefix) and len(prefix) > len(best):
+            best = prefix
+    return _PRICES[best or "gpt-realtime"]
 
 _INSTRUCTIONS = """\
 You are {name}, the voice assistant in {owner}'s home. Anyone in the room may \
@@ -629,14 +641,21 @@ _THINKING_S = 30.0  # after "let me think": no clock closes the conversation, VA
 # The server ended his turn and he spoke again within this long, before she
 # said anything: one sentence split at a pause, not two turns.
 _CONTINUATION_S = 3.0  # bounded in practice by her first audio, which ends the window
-_STILL_TALKING_FRAMES = 2  # mic frames still hot right after a commit: he was cut off
-_ECHO_TAIL_S = 1.0  # after she stops, a Bluetooth speaker keeps sounding this long at the mic (logged: 1346 at 0.6 s)
-_NO_SPEECH_S = 6.0  # a wake with no real speech by then (12 s if something sounded like speech) dies quietly
+_NO_SPEECH_S = 8.0  # a wake with nobody heard by then — by the server or the local gate — dies quietly
+# The moment of her spoken acknowledgment: a frame this loud is her coming
+# back in through a loudspeaker (the Echo Dot: ~2200); quieter frames of that
+# moment are him, talking over her "Yes?" (recorded: 500–900), and go through.
+_SUSPECT_LEVEL = 1200.0
 
 # The local speech gate: the server hears speech or clean silence, never the room.
-_GATE_OPEN_MIN = 600.0  # int16 RMS a frame must reach to open the gate…
-_GATE_OPEN_FACTOR = 3.0  # …and how far above the room floor
+# Without a VAD the level does the work. Recorded at the desk: the room floor
+# sits at 330, his ordinary voice at 500–700 — a 3x factor was deaf to three
+# commands in one evening; 1.8x hears him and stays above the fan.
+_GATE_OPEN_MIN = 450.0  # int16 RMS a frame must reach to open the gate…
+_GATE_OPEN_FACTOR = 1.8  # …and how far above the room floor
 _GATE_OPEN_FRAMES = 2  # hot frames in a row before it opens (the pre-roll carries them)
+_GATE_SPEECH_P = 0.5  # with Silero loaded (WAKE_VAD_THRESHOLD): speech at any level opens it…
+_GATE_QUIET_P = 0.3  # …and only the end of speech closes it (a vacuum after the sentence is not him)
 _GATE_CLOSE_MIN = 400.0
 _GATE_CLOSE_FACTOR = 2.0
 _GATE_HANGOVER_S = 0.8  # quiet this long before it closes (the pauses inside a sentence)
@@ -704,15 +723,25 @@ class _SpeechGate:
         self._quiet_since: float | None = None
         self._preroll: deque[bytes] = deque(maxlen=_GATE_PREROLL)
 
-    def update(self, level: float, now: float, frame: bytes) -> bool:
-        """True when this frame should go to the server."""
+    def update(self, level: float, now: float, frame: bytes, speech: float | None = None) -> bool:
+        """True when this frame should go to the server. `speech` is Silero's
+        say on the frame (0..1) when a VAD is loaded: then speech opens the
+        gate at any level and only the end of speech closes it — a room floor
+        of 330 and a voice at 550 is a real desk, and no level ratio tells
+        them apart. Without one, the level does the work."""
         # The floor follows quiet quickly, rises to steady noise (a vacuum
         # cleaner) in seconds while closed, and only creeps while open so a
         # long sentence cannot pull it up to speech level.
         rate = 0.05 if level < self.floor else (0.001 if self.open else 0.01)
         self.floor += (level - self.floor) * rate
+        if speech is None:
+            hot = level > max(self.floor * _GATE_OPEN_FACTOR, _GATE_OPEN_MIN)
+            quiet = level < max(self.floor * _GATE_CLOSE_FACTOR, _GATE_CLOSE_MIN)
+        else:
+            hot = speech >= _GATE_SPEECH_P
+            quiet = speech < _GATE_QUIET_P
         if not self.open:
-            if level > max(self.floor * _GATE_OPEN_FACTOR, _GATE_OPEN_MIN):
+            if hot:
                 self._hot += 1
                 if self._hot >= _GATE_OPEN_FRAMES:
                     self.open = True
@@ -722,7 +751,7 @@ class _SpeechGate:
                 self._hot = 0
             self._preroll.append(frame)
             return False
-        if level < max(self.floor * _GATE_CLOSE_FACTOR, _GATE_CLOSE_MIN):
+        if quiet:
             if self._quiet_since is None:
                 self._quiet_since = now
             elif now - self._quiet_since > _GATE_HANGOVER_S:
@@ -1493,6 +1522,7 @@ class SessionStats:
     transcript: list[tuple[str, str]] = field(default_factory=list)  # for reflection
     announced: list[int] = field(default_factory=list)  # notification ids she spoke
     replied: bool = False  # the owner said something in this session
+    heard_speech: bool = False  # the local gate heard SOMEONE (a lost command is not a false wake)
 
 
 def _spec_window(spec: str, now: float) -> tuple[float, float | None] | str:
@@ -1519,21 +1549,22 @@ def _spec_window(spec: str, now: float) -> tuple[float, float | None] | str:
     return start.timestamp(), (start + timedelta(days=1)).timestamp()
 
 
-def _usage_cost(usage: Any) -> float:
+def _usage_cost(usage: Any, model: str = "gpt-realtime-2.1") -> float:
     def n(obj: Any, name: str) -> int:
         return int(getattr(obj, name, 0) or 0)
 
+    audio_in_p, audio_out_p, text_in_p, text_out_p, cached_p = _prices_for(model)
     in_det = getattr(usage, "input_token_details", None)
     out_det = getattr(usage, "output_token_details", None)
     cached = n(in_det, "cached_tokens")
     audio_in = max(n(in_det, "audio_tokens") - cached, 0)
     text_in = n(in_det, "text_tokens")
     return (
-        audio_in * _PRICE_AUDIO_IN
-        + text_in * _PRICE_TEXT_IN
-        + cached * _PRICE_CACHED
-        + n(out_det, "audio_tokens") * _PRICE_AUDIO_OUT
-        + n(out_det, "text_tokens") * _PRICE_TEXT_OUT
+        audio_in * audio_in_p
+        + text_in * text_in_p
+        + cached * cached_p
+        + n(out_det, "audio_tokens") * audio_out_p
+        + n(out_det, "text_tokens") * text_out_p
     ) / 1_000_000
 
 
@@ -1928,7 +1959,7 @@ class RealtimeEngine:
         response = getattr(event, "response", None)
         usage = getattr(response, "usage", None)
         if usage is not None:
-            cost = _usage_cost(usage)
+            cost = _usage_cost(usage, self._model)
             stats.cost_usd += cost
             self._log_usage(cost, usage)
         stats.responses += 1
@@ -2916,7 +2947,8 @@ class RealtimeEngine:
             thinking_until = 0.0  # "let me think": patient until this moment
             last_commit_at = -1e9  # when the server last ended his turn (a fragment is one that ends early)
             fragment_cancelled = False  # the reply to a cut-off fragment was dropped (once per response)
-            hot_after_commit = 0  # mic frames still hot right after a commit
+            tools_this_turn = False  # a tool ran since his last turn ended: its confirmation is owed
+            heard_speech = False  # the local gate opened at least once: somebody is here
             possible_since: float | None = None  # playback held for a possible talk-over since
             levels = _Levels()  # the room's level, and her echo during each reply
             gate = _SpeechGate()  # speech or clean silence to the server, never the room
@@ -3115,15 +3147,20 @@ class RealtimeEngine:
                         note_fn("false alarm — resuming")
 
             async def pump_mic() -> None:
-                nonlocal ptt_frames, ptt_peak, fragment_cancelled, hot_after_commit
-                last_muted_at = -1e9  # the last frame taken while she was speaking
+                nonlocal ptt_frames, ptt_peak, heard_speech
                 while True:
                     frame = await mic.get_frame()
                     heard_at = time.monotonic()
                     level = _rms(frame)
+                    if getattr(mic, "last_suspect", False) and level > _SUSPECT_LEVEL:
+                        # The moment of her "Yes?", and this frame is loud
+                        # enough to be it coming back in through a loudspeaker
+                        # beside the mic: not him. The quieter frames of that
+                        # moment ARE him — the command said right over her —
+                        # and go through.
+                        self._tap("ack_echo_dropped", level=round(level))
+                        frame, level = _SILENCE_FRAME, 0.0
                     muted = speaking and not self._talk_over
-                    if muted:
-                        last_muted_at = heard_at
                     if self._cues is not None:
                         # The panel's bar, straight off the frames: it rises
                         # with his voice and falls flat about a second after
@@ -3144,35 +3181,10 @@ class RealtimeEngine:
                             # the hotkey is the only way to cut in.
                             await consider(frame, heard_at, level)
                         continue
-                    if (
-                        response_active
-                        and not speaking
-                        and not fragment_cancelled
-                        and heard_at - last_commit_at < _CONTINUATION_S
-                    ):
-                        # The server just ended his turn and is composing a
-                        # reply — but the microphone says he is STILL talking.
-                        # He was cut off. Drop that reply now, from the local
-                        # frames, without waiting for the server to notice him
-                        # again; the next reply sees the whole sentence.
-                        # Her own tail is not him: a Bluetooth speaker keeps
-                        # sounding after our buffer drained, so the first
-                        # moments after she stops never count (it cancelled
-                        # "Got it." at "Got" once).
-                        hot = level > 2 * _ABS_FLOOR and heard_at - last_muted_at > _ECHO_TAIL_S
-                        hot_after_commit = hot_after_commit + 1 if hot else 0
-                        if hot_after_commit >= _STILL_TALKING_FRAMES:
-                            fragment_cancelled = True
-                            self._tap("fragment_dropped", by="mic", level=round(level))
-                            await connection.send({"type": "response.cancel"})
-                            if self._cues is not None:
-                                self._cues.start(speaker, sound=False)  # still his turn: the window re-opens, silently
-                            note_fn = getattr(ui, "note", None)
-                            if note_fn is not None:
-                                note_fn(
-                                    f"still talking after the turn ended (mic {level:.0f}) — "
-                                    "the reply to the fragment is dropped"
-                                )
+                    # (A guard here once dropped her reply whenever the mic was
+                    # loud right after a commit. Recorded: it fired twice on a
+                    # room with nobody talking and silenced a command; the
+                    # server's own ear, in the receiver, is the only judge now.)
                     levels.quiet(level)  # the room, while he can talk freely
                     if ptt_session and not ptt_active:
                         # Push to talk with nobody holding: the buffer must
@@ -3182,10 +3194,21 @@ class RealtimeEngine:
                     if self._speech_gate and not ptt_active:
                         # The server hears speech or clean silence, never the
                         # room: a vacuum cleaner, the fridge, her own tail.
+                        speech = (
+                            wake.speech_probability(downsample_24k_to_16k(frame))
+                            if wake is not None and getattr(wake, "has_vad", False)
+                            else None
+                        )
                         was_open = gate.open
-                        passed = gate.update(level, heard_at, frame)
+                        passed = gate.update(level, heard_at, frame, speech)
                         if gate.open != was_open:
-                            self._tap("gate", open=gate.open, level=round(level), floor=round(gate.floor))
+                            self._tap(
+                                "gate", open=gate.open, level=round(level), floor=round(gate.floor),
+                                speech=None if speech is None else round(speech, 2),
+                            )
+                            if gate.open:
+                                heard_speech = True
+                                stats.heard_speech = True
                         if passed:
                             for held in gate.take_preroll():
                                 await send_audio(held)
@@ -3378,7 +3401,7 @@ class RealtimeEngine:
                 what he says while a tool runs."""
                 nonlocal tool_busy, closing, last_activity, announcing, announcing_opener
                 nonlocal command_pending, quick_close_armed, quick_close_window, quick_close_reason
-                nonlocal farewell_pending, deferred_close
+                nonlocal farewell_pending, deferred_close, tools_this_turn
 
                 def late_note() -> str:
                     if user_turns <= turn_at_start:
@@ -3400,6 +3423,8 @@ class RealtimeEngine:
                     announcing = []
                     announcing_opener = False
                 ran = self.last_response_tools
+                if ran:
+                    tools_this_turn = True  # the confirmation that follows is owed, whatever the mic hears
                 more_coming = self.last_response_followup  # a tool's answer is on its way
                 if any(t in COMMAND_TOOLS for t in ran):
                     command_pending = True
@@ -3487,7 +3512,7 @@ class RealtimeEngine:
                 nonlocal quick_close_window, quick_close_reason, announcing, announcing_opener
                 nonlocal tool_busy, interrupted, wrapup_heard, user_turns, audio_in_response
                 nonlocal thinking_until, quiet_since, working_ticks, last_commit_at
-                nonlocal fragment_cancelled, hot_after_commit
+                nonlocal fragment_cancelled, tools_this_turn
                 heard = ""  # live accumulation of the user's words
 
                 async def turn_over_ding(commit_at: float) -> None:
@@ -3551,7 +3576,6 @@ class RealtimeEngine:
                         response_active = True
                         audio_in_response = False
                         fragment_cancelled = False
-                        hot_after_commit = 0
                         if quiet_since is None:
                             # The wait starts here and is NOT restarted by the
                             # response a tool's result asks for: the ticks keep
@@ -3625,13 +3649,15 @@ class RealtimeEngine:
                             response_active
                             and not speaking
                             and not fragment_cancelled
+                            and not tools_this_turn
                             and time.monotonic() - last_commit_at < _CONTINUATION_S
                         ):
                             # The server ended his turn at a pause and he kept
                             # going before she said a word: that was one sentence.
                             # Drop the reply to the fragment; the next reply sees
                             # both pieces. (Had she started speaking, the
-                            # talk-over path owns it.)
+                            # talk-over path owns it; had a tool already run, the
+                            # confirmation is owed and is never dropped.)
                             fragment_cancelled = True
                             self._tap("fragment_dropped", by="server", since_commit_s=round(time.monotonic() - last_commit_at, 2))
                             await connection.send({"type": "response.cancel"})
@@ -3666,7 +3692,7 @@ class RealtimeEngine:
                         last_commit_at = time.monotonic()
                         self._tap("committed")
                         fragment_cancelled = False  # a new turn: the last fragment's fate is history
-                        hot_after_commit = 0
+                        tools_this_turn = False
                         # the listening flag drops now; the tone waits a beat, and
                         # only if a window was actually open to close
                         window_closed = self._cues is not None and self._cues.end(speaker, sound=False)
@@ -3684,6 +3710,10 @@ class RealtimeEngine:
                     elif kind == "error":
                         message = str(getattr(event, "error", event))
                         self._tap("error", message=message[:200])
+                        if "response_cancel_not_active" in message:
+                            # our cancel raced the response's own end (a
+                            # talk-over on her last word): nothing to hear about
+                            continue
                         if self._cues is not None and self._cues.listening:
                             # Only when he was mid-turn: a stale response.cancel
                             # after a barge-in is a protocol grumble, not a
@@ -3772,16 +3802,14 @@ class RealtimeEngine:
             async def false_wake_watch() -> None:
                 """A wake nobody followed up — the vacuum cleaner, a TV, a word
                 that sounded like her name — dies quietly: no reply to the
-                room, no listening window, no 45 s idle. Six seconds with no
-                speech at all; twelve if something sounded like speech but no
-                real transcript came of it."""
+                room, no listening window, no 45 s idle. Eight seconds with
+                nobody heard, by the server or by the local gate. The moment
+                anyone IS heard this stands down and the normal machinery
+                decides: a second stage here once killed a long first sentence
+                at twelve seconds, mid-word, twice in one evening."""
                 await asyncio.sleep(_NO_SPEECH_S)
-                if stats.replied or ended.is_set():
+                if stats.replied or ended.is_set() or speech_segments > 0 or heard_speech:
                     return
-                if speech_segments > 0:
-                    await asyncio.sleep(_NO_SPEECH_S)  # one more beat for a real transcript
-                    if stats.replied or ended.is_set():
-                        return
                 self._tap("nobody_spoke", segments=speech_segments, cancelled=response_active)
                 if response_active:
                     await connection.send({"type": "response.cancel"})

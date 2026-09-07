@@ -51,7 +51,7 @@ class FakeMic:
     def __init__(self) -> None:
         self.deadline = 0.0
 
-    def ignore_before(self, deadline: float) -> None:
+    def suspect_before(self, deadline: float) -> None:
         self.deadline = deadline
 
 
@@ -262,41 +262,43 @@ async def speak(mic: Microphone, frames: int = 1) -> None:
     await asyncio.sleep(0)  # call_soon_threadsafe lands on the loop
 
 
-async def test_frames_captured_while_she_speaks_are_dropped_and_the_next_one_is_not(
+async def test_frames_captured_while_she_speaks_are_flagged_and_the_next_one_is_not(
     monkeypatch,
 ) -> None:
+    """Nothing is thrown away any more — he says the command right over her
+    "Yes?" — but the frames of that moment carry the flag the engine uses to
+    drop the ones loud enough to be her."""
     mic = await open_mic(monkeypatch)
     try:
         await speak(mic, frames=3)  # her "Yes?" coming back in through the mic
-        mic.ignore_before(time.monotonic() + 0.05)  # the clip's end, plus its echo tail
+        mic.suspect_before(time.monotonic() + 0.05)  # the clip's end, plus its echo tail
         await asyncio.sleep(0.08)  # ...which now passes
         await speak(mic)  # his command, said the moment she stopped
 
-        async with asyncio.timeout(1):
-            frame = await mic.get_frame()
-
-        assert len(frame) == FRAME_BYTES  # the first frame captured after the window
-        with pytest.raises(TimeoutError):  # hers were dropped, not queued behind his
+        flags = []
+        for _ in range(4):
+            async with asyncio.timeout(1):
+                frame = await mic.get_frame()
+            assert len(frame) == FRAME_BYTES
+            flags.append(mic.last_suspect)
+        assert flags == [True, True, True, False]
+        with pytest.raises(TimeoutError):
             async with asyncio.timeout(0.05):
                 await mic.get_frame()
     finally:
         await mic.close()
 
 
-async def test_a_deadline_in_the_future_holds_the_microphone_shut(monkeypatch) -> None:
+async def test_a_deadline_only_ever_moves_forward(monkeypatch) -> None:
     mic = await open_mic(monkeypatch)
     try:
-        mic.ignore_before(time.monotonic() + 5.0)
+        mic.suspect_before(time.monotonic() + 5.0)
+        mic.suspect_before(time.monotonic() - 5.0)  # a stale deadline never shortens it
         await speak(mic, frames=2)
-        with pytest.raises(TimeoutError):
-            async with asyncio.timeout(0.05):
+        for _ in range(2):
+            async with asyncio.timeout(1):
                 await mic.get_frame()
-
-        mic.ignore_before(time.monotonic() - 5.0)  # a stale deadline never re-opens it
-        await speak(mic)
-        with pytest.raises(TimeoutError):
-            async with asyncio.timeout(0.05):
-                await mic.get_frame()
+            assert mic.last_suspect
     finally:
         await mic.close()
 
