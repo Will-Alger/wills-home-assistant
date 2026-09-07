@@ -142,7 +142,9 @@ async def test_the_speaker_holds_and_resumes_in_place(monkeypatch) -> None:
     spk.enqueue(b"\x01" * 4800)
     spk._consume(2400)
     spk.pause()
-    assert spk._consume(2400) == b"\x00" * 2400 and spk.played_ms("a") == 50  # silence, nothing advanced
+    held = spk._consume(2400)  # silence (one LSB of keepalive noise, inaudible), nothing advanced
+    assert len(held) == 2400 and int(np.abs(np.frombuffer(held, dtype=np.int16)).max()) <= 1
+    assert spk.played_ms("a") == 50
     spk.resume()
     assert spk._consume(2400) == b"\x01" * 2400 and spk.played_ms("a") == 100
     await spk.close()

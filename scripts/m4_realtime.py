@@ -36,7 +36,7 @@ from assistant.audio.cues import VoiceCues
 from assistant.audio.fallbacks import SpokenFallbacks
 from assistant.audio.io import AudioIO
 from assistant.audio.mic import describe_device
-from assistant.audio.windows_default import DefaultOutputWatch
+from assistant.audio.windows_default import DefaultOutputWatch, SpeakerHealth
 from assistant.brain.thinker import Thinker
 from assistant.briefing import compose_briefing
 from assistant.config import code_root, home_dir, load_settings
@@ -698,6 +698,12 @@ async def one_cycle(
         # is frozen at boot, so a switch from the headphones to the Echo Dot
         # would otherwise leave her talking to the headphones.
         watch = engine._default_watch = DefaultOutputWatch()
+    health = engine.__dict__.get("_speaker_health")
+    if health is None:
+        # ...and whether the speaker she is on is still there at all: the Echo
+        # Dot drops its Bluetooth link on its own and the stream plays into
+        # nothing (she answered a whole conversation that way once).
+        health = engine._speaker_health = SpeakerHealth()
     trace = None
     wake_score = None
     quiet = False  # a periodic re-scan while on a fallback mic: repeat nothing unless it changed
@@ -712,6 +718,12 @@ async def one_cycle(
         if not quiet or line != getattr(engine, "_audio_line", ""):
             say(status, line, "dim")
         engine._audio_line = line
+        lost = engine.__dict__.pop("_speaker_lost", "")
+        if lost and audio.speaker is not None and audio.speaker_in_use != lost:
+            # A speaker that dropped its link is only "back" once it is
+            # active again: until then the rescan clock keeps looking.
+            audio.speaker.fallback = True
+            audio.speaker.device_note = f"speaker '{lost}' dropped off — using '{audio.speaker_in_use}' until it is back"
         notes = audio.notes()
         known = getattr(engine, "_audio_notes", ())
         for note in notes:
@@ -757,6 +769,13 @@ async def one_cycle(
                 # back): the speaker follows, at the next idle moment
                 say(status, "Windows' default speaker changed — following it", "dim")
                 engine.audio_reconfigure = True
+                return True
+            if gone := health.gone(audio.speaker_in_use):
+                # the speaker she is on walked away (a Bluetooth link dropped):
+                # reopen on what is connected, and keep looking for it
+                say(status, f"speaker '{audio.speaker_in_use}' is {gone} — reopening on what's connected", "yellow")
+                engine.audio_reconfigure = True
+                engine._speaker_lost = audio.speaker_in_use
                 return True
             return False
 

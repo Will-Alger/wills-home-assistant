@@ -46,8 +46,12 @@ class AudioIO:
 
     @property
     def fallback(self) -> bool:
-        """On a stand-in microphone: the runner keeps looking for the real one."""
-        return bool(self.mic is not None and self.mic.fallback)
+        """On a stand-in microphone or speaker: the runner keeps looking for
+        the real one (the Echo Dot that dropped off Bluetooth comes back)."""
+        return bool(
+            (self.mic is not None and self.mic.fallback)
+            or (self.speaker is not None and getattr(self.speaker, "fallback", False))
+        )
 
     @property
     def stalled(self) -> bool:

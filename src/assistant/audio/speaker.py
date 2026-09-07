@@ -37,6 +37,17 @@ def not_a_speaker(name: str) -> bool:
     return any(word in name.lower() for word in _NOT_A_SPEAKER)
 
 
+_KEEPALIVE = np.random.default_rng(7).integers(-1, 2, size=48_000, dtype=np.int16).tobytes()  # 1 s of ±1 LSB
+
+
+def _keepalive(nbytes: int) -> bytes:
+    """`nbytes` of inaudible noise (a pre-rolled second, repeated)."""
+    if nbytes <= 0:
+        return b""
+    reps = nbytes // len(_KEEPALIVE) + 1
+    return (_KEEPALIVE * reps)[:nbytes]
+
+
 def default_output_name() -> str:
     """What Windows calls the default output right now ("" when there is none)."""
     with contextlib.suppress(Exception):
@@ -73,6 +84,7 @@ class Speaker:
         self._stream: sd.RawOutputStream | None = None
         self.device_note: str | None = None  # set when the chosen speaker was not used
         self.device_in_use = ""  # the speaker actually opened (the panel shows it)
+        self.fallback = False  # not the speaker asked for: the runner keeps looking for it
         self._enqueued = 0  # bytes ever enqueued (minus what clear() dropped)
         self._consumed = 0  # bytes the callback has played
         self._items: dict[str, tuple[int, int]] = {}  # item id -> (start, end) byte offsets
@@ -159,7 +171,11 @@ class Speaker:
             with contextlib.suppress(Exception):
                 fn()
         if len(chunk) < need:
-            chunk += b"\x00" * (need - len(chunk))  # underflow = silence
+            # Underflow = silence — but not digital zero: a Bluetooth speaker
+            # takes a run of zeros as "nothing playing" and dozes off, and the
+            # next word is lost while it wakes. One LSB of noise (-90 dBFS,
+            # inaudible) keeps the link busy.
+            chunk += _keepalive(need - len(chunk))
         with contextlib.suppress(Exception):
             samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
             self._played_levels.append((time.monotonic(), float(np.sqrt(np.mean(samples * samples)))))
@@ -219,11 +235,13 @@ class Speaker:
                 if index != chosen and self._try(index):
                     problems.append(f"the default output '{devices.pretty(default)}' isn't a speaker")
                     self.device_note = "; ".join(problems) + f" — using '{self.device_in_use}'"
+                    self.fallback = True
                     return self
             problems.append(f"the default output '{devices.pretty(default)}' isn't a speaker and nothing else would open")
         self._stream = self._open(None)  # the default, whatever it is; raises only if even that fails
         self.device_in_use = devices.describe("", "output")
         self.device_note = "; ".join(problems) + " — using the default" if problems else None
+        self.fallback = bool(problems)
         return self
 
     async def close(self) -> None:
