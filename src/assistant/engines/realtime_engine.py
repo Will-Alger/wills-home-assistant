@@ -679,9 +679,15 @@ _ABS_FLOOR = 400.0  # int16 RMS: below this nothing is speech at a desk mic
 _FALSE_ALARM_S = 1.0  # held this long with no server speech detection: resume (a cough held her 1.5 s)
 
 
-_CAL_FRAMES = 12  # frames of her audibly playing that teach the coupling (~1 s)
+_CAL_FRAMES = 18  # frames of her audibly playing that teach the coupling (~1.5 s: Bluetooth lags ~0.5 s)
 _PLAYING = 100.0  # played RMS above this: the speaker is audibly saying something
 _COUPLING_CAP = 2.0  # a mic beside a loud Echo Dot hears about 1x what is played; more is a glitch
+_PLAYED_WINDOW_S = 1.2  # how far back "what she is playing" reaches: past a Bluetooth speaker's lag
+# Past this the speaker is louder at the mic than he is, and the server's
+# speech detection cannot tell her echo from him (it confirmed her own
+# sentences as his, and she answered herself): talk-over stands down for
+# the reply, and the wake word is the way to cut in.
+_COUPLING_TALK_OVER_MAX = 0.4
 
 
 class _Levels:
@@ -706,8 +712,8 @@ class _Levels:
         self._playback_started: float | None = None
         self._heard = 0  # frames of her audibly playing seen this reply
         self._ratio = 0.0  # the coupling being learned
-        self._mic_sum = 0.0
-        self._played_sum = 0.0
+        self._mic_peak = 0.0
+        self._played_peak = 0.0
 
     def quiet(self, level: float) -> None:
         self.quiet_level = level if not self.quiet_level else 0.95 * self.quiet_level + 0.05 * level
@@ -717,8 +723,8 @@ class _Levels:
         self.echo_level = 0.0
         self._heard = 0
         self._ratio = 0.0
-        self._mic_sum = 0.0
-        self._played_sum = 0.0
+        self._mic_peak = 0.0
+        self._played_peak = 0.0
         self.noted = False  # the "armed" line is printed once per reply
 
     def calibrating(self, now: float, played: float | None = None) -> bool:
@@ -733,15 +739,22 @@ class _Levels:
         if played < _PLAYING:
             return  # she is not audibly playing yet: nothing to learn from this frame
         self._heard += 1
-        # Energy over the window, not the worst single frame: the mic hears
-        # the room a beat after the device plays it, so a loud mic frame over
-        # a quiet played one is alignment, not coupling (the Echo Dot logged
-        # couplings of 4 and 7 that way, and thresholds nobody could reach).
-        self._mic_sum += level
-        self._played_sum += played
-        self._ratio = self._mic_sum / self._played_sum
+        # Peak against peak over the window, not frame against frame: the
+        # mic hears the room a beat after the device plays it — half a
+        # second on Bluetooth — so any per-frame ratio is alignment, not
+        # coupling (frame maxima gave 4 and 7; energy sums gave half the
+        # truth, because the mic hears nothing during the first frames).
+        self._mic_peak = max(self._mic_peak, level)
+        self._played_peak = max(self._played_peak, played)
+        self._ratio = self._mic_peak / self._played_peak
         self.coupling = min(self._ratio, _COUPLING_CAP)
         self.echo_level = max(self.echo_level, level)
+
+    @property
+    def talk_over_ok(self) -> bool:
+        """False when the speaker is louder at the mic than he is: nothing
+        local or remote can tell her echo from him, so no holds this reply."""
+        return self.coupling <= _COUPLING_TALK_OVER_MAX
 
     def expected_echo(self, played: float | None = None) -> float:
         """How loud her voice is at the mic right now."""
@@ -1594,6 +1607,22 @@ def _spec_window(spec: str, now: float) -> tuple[float, float | None] | str:
         return "since must be today, yesterday, week, a number of hours, or an ISO date"
     start = day.replace(hour=0, minute=0, second=0, microsecond=0)
     return start.timestamp(), (start + timedelta(days=1)).timestamp()
+
+
+def _her_own_words(said: str, transcript: list[tuple[str, str]]) -> bool:
+    """Is this "user" transcript really the tail of what she just said? At
+    least two words, and four in five of them among the words of her last
+    two replies — what her own sentence looks like once a loudspeaker, the
+    microphone and the transcriber have had their way with it."""
+    words = normalise(said).split()
+    if len(words) < 2:
+        return False
+    hers: set[str] = set()
+    for role, text in [pair for pair in transcript if pair[0] == "alexa"][-2:]:
+        hers |= set(normalise(text).split())
+    if not hers:
+        return False
+    return sum(1 for w in words if w in hers) >= 0.8 * len(words)
 
 
 def _usage_cost(usage: Any, model: str = "gpt-realtime-2.1") -> float:
@@ -3006,6 +3035,7 @@ class RealtimeEngine:
             fragment_cancelled = False  # the reply to a cut-off fragment was dropped (once per response)
             tools_this_turn = False  # a tool ran since his last turn ended: its confirmation is owed
             heard_speech = False  # the local gate opened at least once: somebody is here
+            talk_over_turn = False  # the current turn began as a talk-over: its words may be hers
             possible_since: float | None = None  # playback held for a possible talk-over since
             levels = _Levels()  # the room's level, and her echo during each reply
             played_level = getattr(speaker, "played_level", None)  # what she is playing, if the speaker can say
@@ -3115,9 +3145,10 @@ class RealtimeEngine:
                 confirmed talk-over: stop her now, tell the server how much he
                 heard, take his turn."""
                 nonlocal speaking, interrupted, possible_since, quiet_since
-                nonlocal quick_close_armed, quick_close_window, quick_close_reason
+                nonlocal quick_close_armed, quick_close_window, quick_close_reason, talk_over_turn
                 interrupted = True
                 possible_since = None
+                talk_over_turn = how == "talk-over"  # the transcript of this turn may be her own echo
                 quiet_since = None  # he is talking: nothing he cut into is still awaited
                 onset.clear()
                 item = getattr(speaker, "current_item", "")
@@ -3163,8 +3194,10 @@ class RealtimeEngine:
                 exactly where she paused, the probe audio cleared."""
                 nonlocal possible_since
                 note_fn = getattr(ui, "note", None)
-                # what she is playing right now (None: a speaker that cannot say)
-                played = played_level(0.3) if played_level is not None else None
+                # what she has been playing lately (None: a speaker that cannot
+                # say) — a window past a Bluetooth speaker's lag, so a pause of
+                # hers does not read as silence while the mic still hears her
+                played = played_level(_PLAYED_WINDOW_S) if played_level is not None else None
                 if possible_since is None:
                     if levels.calibrating(heard_at, played):
                         levels.echo(level, played)
@@ -3175,11 +3208,21 @@ class RealtimeEngine:
                         # once per reply: the numbers the thresholds are tuned from
                         levels.noted = True
                         if note_fn is not None:
-                            note_fn(
-                                f"talk-over armed: echo {levels.echo_level:.0f}"
-                                + (f" (coupling {levels.coupling:.2f})" if levels.coupling else "")
-                                + f", room {levels.quiet_level:.0f}, threshold {threshold:.0f}"
-                            )
+                            if levels.talk_over_ok:
+                                note_fn(
+                                    f"talk-over armed: echo {levels.echo_level:.0f}"
+                                    + (f" (coupling {levels.coupling:.2f})" if levels.coupling else "")
+                                    + f", room {levels.quiet_level:.0f}, threshold {threshold:.0f}"
+                                )
+                            else:
+                                note_fn(
+                                    f"talk-over off for this reply: the speaker is louder at the mic "
+                                    f"than you are (coupling {levels.coupling:.2f}) — say the wake word to cut in"
+                                )
+                        self._tap("talk_over", what="armed" if levels.talk_over_ok else "off", coupling=round(levels.coupling, 2))
+                    if not levels.talk_over_ok:
+                        onset.clear()
+                        return
                     onset.append((frame, level > threshold))
                     del onset[:-_ONSET_WINDOW]
                     if sum(1 for _, hot in onset if hot) < _ONSET_FRAMES:
@@ -3575,7 +3618,7 @@ class RealtimeEngine:
                 nonlocal quick_close_window, quick_close_reason, announcing, announcing_opener
                 nonlocal tool_busy, interrupted, wrapup_heard, user_turns, audio_in_response
                 nonlocal thinking_until, quiet_since, working_ticks, last_commit_at
-                nonlocal fragment_cancelled, tools_this_turn
+                nonlocal fragment_cancelled, tools_this_turn, talk_over_turn
                 heard = ""  # live accumulation of the user's words
 
                 async def turn_over_ding(commit_at: float) -> None:
@@ -3663,6 +3706,21 @@ class RealtimeEngine:
                         self._trace.transcribed()
                         heard = ""
                         said = getattr(event, "transcript", "")
+                        from_talk_over, talk_over_turn = talk_over_turn, False
+                        if from_talk_over and _her_own_words(said, stats.transcript):
+                            # A talk-over "confirmed" by the server, whose
+                            # transcript is what SHE was saying: her echo off a
+                            # loudspeaker, not him. She answered herself in a
+                            # loop this way once ("you> The panel is closed
+                            # again."). No transcript, no reply.
+                            self._tap("own_echo", text=said, cancelled=response_active and not speaking, how="talk-over")
+                            note_fn = getattr(ui, "note", None)
+                            if note_fn is not None:
+                                note_fn(f"that was her own voice coming back (“{said.strip()[:60]}”) — ignored")
+                            if response_active and not speaking and not fragment_cancelled:
+                                fragment_cancelled = True
+                                await connection.send({"type": "response.cancel"})
+                            continue
                         if normalise(said) in self._own_lines:
                             # Her own "Yes?" or "Mm-hm." off the disk, back in
                             # through the microphone and transcribed as a turn

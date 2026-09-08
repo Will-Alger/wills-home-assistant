@@ -88,31 +88,48 @@ def test_the_expected_echo_follows_what_the_speaker_plays() -> None:
     assert levels.calibrating(0.5, 900)
     levels.echo(1, 0)  # her audio has not reached the device yet: teaches nothing
     assert levels.calibrating(0.5, 0) and levels.coupling == 0
-    for _ in range(12):
-        levels.echo(500, 1000)  # a second of her audibly playing: the mic hears half of it
-    assert not levels.calibrating(5.0, 900) and levels.coupling == 0.5
-    assert levels.threshold(900) == 720  # 0.5 x 900 x 1.6: a loud word of hers is not him
+    for _ in range(18):
+        levels.echo(300, 1000)  # a second and a half of her audibly playing: the mic hears a third of it
+    assert not levels.calibrating(5.0, 900) and levels.coupling == 0.3 and levels.talk_over_ok
+    assert levels.threshold(900) == 432  # 0.3 x 900 x 1.6: a loud word of hers is not him
     assert levels.threshold(0) == 400  # a pause of hers: only the floor stands
-    assert levels.expected_echo(2000) == 1000
+    assert levels.expected_echo(2000) == 600
     old = _Levels()
     old.new_playback(0.0)
     old.echo(300)  # a speaker that cannot say what it plays: the old rule
     assert old.calibrating(0.5) and not old.calibrating(5.0) and old.threshold() == 480
 
-    # The mic hears the room a beat after the device plays it: a loud mic
-    # frame over a quiet played one is alignment, not coupling. Energy over
-    # the window, not the worst frame — the Echo Dot logged couplings of 4
-    # and 7 the other way, and thresholds of 25,000 nobody could talk over.
+    # The mic hears the room a beat after the device plays it — half a second
+    # on Bluetooth. Peak against peak over the window: per-frame ratios gave
+    # the Echo Dot couplings of 4 and 7 (thresholds nobody could talk over),
+    # energy sums gave half the truth (the mic hears nothing at first), and
+    # she answered her own echo as if it were him.
     skewed = _Levels()
     skewed.new_playback(0.0)
-    for i in range(12):
-        skewed.echo(500, 100 if i % 2 else 2000)
-    assert abs(skewed.coupling - 6000 / 12600) < 0.01  # not 5.0
+    for i in range(18):
+        skewed.echo(500 if i >= 6 else 1, 2000 if i < 12 else 100)  # her audio, then the mic catching up
+    assert skewed.coupling == 0.25
     loud = _Levels()
     loud.new_playback(0.0)
-    for _ in range(12):
+    for _ in range(18):
         loud.echo(9000, 1000)
-    assert loud.coupling == 2.0  # capped: past this it is a glitch, and she would be deaf to him
+    assert loud.coupling == 2.0 and not loud.talk_over_ok  # capped; and no holds on a speaker this loud
+    dot = _Levels()
+    dot.new_playback(0.0)
+    for _ in range(18):
+        dot.echo(1500, 3200)  # the Echo Dot beside the Snowball, as recorded
+    assert not dot.talk_over_ok  # 0.47: her echo outweighs his voice — the wake word cuts in
+
+
+def test_her_own_sentence_coming_back_is_not_his_turn() -> None:
+    from assistant.engines.realtime_engine import _her_own_words
+
+    transcript = [("you", "close the panel"), ("alexa", "Gotcha, the panel’s closed again. Nice and tidy.")]
+    assert _her_own_words("The panel is closed again.", transcript)  # four of five words are hers
+    assert _her_own_words("Closed again.", transcript)
+    assert not _her_own_words("Again.", transcript)  # one word proves nothing
+    assert not _her_own_words("Open it back up please", transcript)
+    assert not _her_own_words("The panel is closed again.", [("you", "hello")])  # she has not spoken
 
 
 async def test_the_transcriber_is_told_the_language() -> None:

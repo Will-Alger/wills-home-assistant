@@ -89,6 +89,40 @@ async def test_a_real_talk_over_is_confirmed_by_the_server_and_takes_his_turn(mo
     assert stats.ended_by == "idle timeout"
 
 
+async def test_her_own_echo_confirmed_as_a_talk_over_is_thrown_away(monkeypatch) -> None:
+    """The Echo Dot beside the mic: her reply comes back, the guard holds,
+    the server's speech detection confirms (it IS speech), and the transcript
+    is her own sentence. She used to answer it — and herself — in a loop."""
+    quick(monkeypatch)
+    engine, client, ui = make(idle_timeout_s=1.0)
+    conn = client.connection
+    mic, speaker = LevelMic(), InstantSpeaker(played_ms=700, drain_s=2.0)
+
+    async def owner() -> None:
+        await asyncio.sleep(0.15)
+        conn.user_says("close the panel", reply="Gotcha, the panel is closed again. Nice and tidy.")
+        await asyncio.sleep(0.25)
+        mic.level = 3000  # her own voice, off the loudspeaker
+        deadline = time.monotonic() + 1.0
+        while speaker.pauses == 0 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        conn.push("input_audio_buffer.speech_started")  # "confirmed"
+        await asyncio.sleep(0.05)
+        mic.level = 30
+        conn.push("input_audio_buffer.speech_stopped")
+        conn.push("input_audio_buffer.committed")
+        conn.push("response.created")
+        conn.push("conversation.item.input_audio_transcription.completed", transcript="The panel is closed again.")
+        conn.push_response_done()
+
+    turn = asyncio.create_task(owner())
+    stats = await asyncio.wait_for(engine.run_conversation(mic, speaker, NeverWake(), ui, announce=False), 8)
+    await turn
+    assert ("you", "The panel is closed again.") not in stats.transcript
+    assert any("her own voice coming back" in n for n in ui.notes)
+    assert "response.cancel" in conn.kinds()  # the reply to her own echo never plays
+
+
 async def test_a_cough_holds_then_resumes_with_the_probe_cleared(monkeypatch) -> None:
     quick(monkeypatch)
     engine, client, ui = make(info_close_s=0.3)
