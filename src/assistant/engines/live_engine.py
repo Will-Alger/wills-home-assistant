@@ -591,20 +591,12 @@ class _LiveSession:
                 self._note("notifications kept unread — she was cut off")
         if any(t in COMMAND_TOOLS for t in ran):
             self.command_pending = True
-        if announced and self.announce and self.speech_segments == 0 and not self.interrupted:
-            if self.waits_for_reply:
-                self.quick_close_armed = True
-                self.quick_close_window = engine._info_close_s
-                self.quick_close_reason = "no reply"
-            else:
-                self._end("announcement delivered")
-                return
-        elif self.ptt_session:
+        if self.ptt_session:
             # each hold is one turn: she answered it, and closes unless he holds again
             self.quick_close_armed = True
             self.quick_close_window = engine._command_close_s
             self.quick_close_reason = "push to talk turn done"
-        elif self.speech_segments <= 1 and not self.announce:
+        elif self.speech_segments <= 1:
             # one utterance, answered (the tools it needed ran before this
             # reply): a command closes fast, a question gets the longer window
             self.quick_close_armed = True
@@ -614,6 +606,15 @@ class _LiveSession:
             else:
                 self.quick_close_window = engine._info_close_s
                 self.quick_close_reason = "question answered"
+        if announced and self.announce and self.speech_segments == 0 and not self.interrupted:
+            if self.waits_for_reply:
+                # she asked him something (or welcomed him home): the question window, then close
+                self.quick_close_armed = True
+                self.quick_close_window = engine._info_close_s
+                self.quick_close_reason = "no reply"
+            else:
+                self._end("announcement delivered")  # she said her piece; nobody replied
+                return
         if (self.closing or self.wrapup_heard) and not self.interrupted and not self.tool_busy:
             self._end("end_conversation" if self.closing else "wrap-up")
             return
@@ -1045,6 +1046,9 @@ class _LiveSession:
             if not self.announce and not self.ptt_session:
                 self._spawn(self.false_wake_watch())
             await self.ended.wait()
+            # Whatever either side was still saying counts: his open turn is
+            # his reply (an opener he answered on its last word is read).
+            self._on_segments(self.segments.close(self.session_ms()))
             if self.stats.ended_by == "unknown":
                 self.stats.ended_by = "end_conversation"
             self._tap(
@@ -1070,12 +1074,7 @@ class _LiveSession:
             receiver.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await receiver
-            segs = self.segments.close(self.session_ms())
-            for seg in segs:
-                if seg.closed and seg.speaker == "user" and seg.text.strip():
-                    self.stats.transcript.append(("you", seg.text))
-                elif seg.closed and seg.text.strip():
-                    self.stats.transcript.append(("alexa", seg.text))
+            self._on_segments(self.segments.close(self.session_ms()))  # a start that failed: nothing
             engine._log_live_usage(
                 kind="live", model=engine._model, seconds=self.stats.seconds,
                 cost_usd=round(self.stats.seconds / 60 * LIVE_PRICE_PER_MIN, 6), ended_by=self.stats.ended_by,
