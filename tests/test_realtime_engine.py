@@ -73,6 +73,30 @@ async def test_session_config_renders_jobs_and_repos(tmp_path) -> None:
     assert "develop_feature" not in tool_names
 
 
+async def test_the_pieces_both_engines_share_render_the_same_session() -> None:
+    """The Live engine renders its backend prompt and tool list through
+    `_render_instructions` and `_tools`, and runs each call through
+    `_run_call`: the realtime session must be exactly what those produce."""
+    from assistant.engines.realtime_engine import _CLOSE_NOTE, RealtimeEngine, SessionStats
+    from assistant.home.fake import FakeHome
+
+    engine = RealtimeEngine(
+        api_key="test-key", model="m", voice="v", home=FakeHome(), owner="Will", name="Alexa", wake_phrase="alexa"
+    )
+    config = await engine._session_config(None)
+    text, lights, players = await engine._render_instructions()
+    assert config["instructions"] == text and lights and players is not None
+    assert config["tools"] == engine._tools()
+    stats = SessionStats()
+    payload = await engine._run_call(
+        "get_lights", "{}", stats, lambda: "he said: never mind"
+    )
+    assert payload["status"] == "success" and payload["since"] == "he said: never mind"
+    assert stats.transcript[-1][0] == "tool get_lights" and stats.tool_calls == []  # the caller counts calls
+    done = await engine._run_call("set_lights", '{"room": "hallway", "on": false}', stats)
+    assert _CLOSE_NOTE in done["follow_up"] and "since" not in done
+
+
 async def test_session_config_renders_unread_and_no_stale_denial(tmp_path) -> None:
     from assistant.announce import Announcer
     from assistant.engines.realtime_engine import RealtimeEngine

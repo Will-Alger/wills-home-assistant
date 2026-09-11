@@ -1583,6 +1583,8 @@ class SessionStats:
     announced: list[int] = field(default_factory=list)  # notification ids she spoke
     replied: bool = False  # the owner said something in this session
     heard_speech: bool = False  # the local gate heard SOMEONE (a lost command is not a false wake)
+    seconds: float = 0.0  # a Live session's billed audio seconds (0 on the realtime engine)
+    backend_cost_usd: float = 0.0  # the Live backend model's share of cost_usd
 
 
 def _spec_window(spec: str, now: float) -> tuple[float, float | None] | str:
@@ -1835,9 +1837,12 @@ class RealtimeEngine:
         audio_in["turn_detection"] = self._turn_detection(turn_detection)
         return audio_in
 
-    async def _session_config(
-        self, transcription_model: str | None, *, turn_detection: bool = True
-    ) -> dict[str, Any]:
+    async def _render_instructions(self, template: str = _INSTRUCTIONS) -> tuple[str, list[Any], list[Any]]:
+        """Fill the instruction template with everything she knows right now
+        (devices, memory, board, calendar, unread…). Returns the text and the
+        light and media-player lists it was rendered from, which the
+        transcriber's vocabulary wants too. Both engines call this; the Live
+        engine renders the backend prompt from it."""
         extra = f"\n{self._extra_instructions}\n" if self._extra_instructions else ""
         extra_repos = self._board.extra_repo_names() if self._board else []
         other_repos = (
@@ -1870,7 +1875,7 @@ class RealtimeEngine:
             if self._context is not None
             else (),
         )
-        instructions = _INSTRUCTIONS.format(
+        instructions = template.format(
             name=self._name,
             owner=self._owner,
             wake_phrase=self._wake_phrase,
@@ -1903,6 +1908,42 @@ class RealtimeEngine:
             delivery=self._delivery.text() if self._delivery is not None else "defaults",
             extra=extra,
         )
+        return instructions, lights, players
+
+    def _tools(self) -> list[dict[str, Any]]:
+        """Every tool she may call, gated on the capabilities she was built
+        with. The Realtime and Live function-tool shapes are the same."""
+        tools = realtime_tools(calendar=self._calendar is not None) + (
+            MEMORY_TOOLS if self._memory else []
+        )
+        if self._board is not None:
+            tools += TASK_TOOLS
+        if self._announcer is not None:
+            tools += SYSTEM_TOOLS
+        if self._thinker is not None:
+            tools += BRAIN_TOOLS
+        if self._watches is not None:
+            tools += WATCH_TOOLS
+        if self._scheduler is not None:
+            tools += SCHEDULE_TOOLS
+        if self._routines is not None:
+            tools += ROUTINE_TOOLS
+        if self._journal is not None or self._sessions is not None:
+            tools += JOURNAL_TOOLS
+        if self._followups is not None:
+            tools += FOLLOWUP_TOOLS
+        if self._delivery is not None:
+            tools += DELIVERY_TOOLS
+        if self._panel is not None:
+            tools += PANEL_TOOLS
+        if self._latency is not None:
+            tools += LATENCY_TOOLS
+        return tools
+
+    async def _session_config(
+        self, transcription_model: str | None, *, turn_detection: bool = True
+    ) -> dict[str, Any]:
+        instructions, lights, players = await self._render_instructions()
         audio_in: dict[str, Any] = {
             "format": {"type": "audio/pcm", "rate": REALTIME_RATE},
             "turn_detection": self._turn_detection(turn_detection),
@@ -1939,35 +1980,10 @@ class RealtimeEngine:
         # Kept so a mid-session toggle can resend this block with only the
         # turn detection changed (audio_input_update).
         self._audio_input_sent = dict(audio_in)
-        tools = realtime_tools(calendar=self._calendar is not None) + (
-            MEMORY_TOOLS if self._memory else []
-        )
-        if self._board is not None:
-            tools += TASK_TOOLS
-        if self._announcer is not None:
-            tools += SYSTEM_TOOLS
-        if self._thinker is not None:
-            tools += BRAIN_TOOLS
-        if self._watches is not None:
-            tools += WATCH_TOOLS
-        if self._scheduler is not None:
-            tools += SCHEDULE_TOOLS
-        if self._routines is not None:
-            tools += ROUTINE_TOOLS
-        if self._journal is not None or self._sessions is not None:
-            tools += JOURNAL_TOOLS
-        if self._followups is not None:
-            tools += FOLLOWUP_TOOLS
-        if self._delivery is not None:
-            tools += DELIVERY_TOOLS
-        if self._panel is not None:
-            tools += PANEL_TOOLS
-        if self._latency is not None:
-            tools += LATENCY_TOOLS
         return {
             "type": "realtime",
             "instructions": instructions,
-            "tools": tools,
+            "tools": self._tools(),
             "tool_choice": "auto",
             "output_modalities": ["audio"],
             "audio": {
@@ -2059,51 +2075,7 @@ class RealtimeEngine:
             if call_name == "end_conversation":
                 closing = True
                 continue
-            try:
-                args = json.loads(item.arguments or "{}")
-            except json.JSONDecodeError:
-                args = {}
-            call_started = time.monotonic()
-            self._live_transcript = stats.transcript  # what think() reads the room from
-            outcome = await self._run_tool(call_name, args)
-            result_text, is_error = outcome.as_pair()
-            self._trace.tool(call_name, time.monotonic() - call_started)
-            self._tap("tool", name=call_name, seconds=round(time.monotonic() - call_started, 3), ok=not is_error)
-            self._tools_in_play.append(call_name)  # scopes the memory she gets
-            tool_hook = getattr(self, "_ui_tool_hook", None)
-            if tool_hook is not None:
-                tool_hook(call_name, result_text, is_error)
-            flag = "ERROR: " if is_error else ""
-            stats.transcript.append((f"tool {call_name}", flag + result_text[:200]))
-            if not is_error:
-                with contextlib.suppress(Exception):  # continuity never breaks a command
-                    self._note_context(call_name, args, result_text)
-            applied = getattr(self._executor, "last_routines", [])
-            if self._journal is not None and call_name not in _QUIET_TOOLS:
-                with contextlib.suppress(Exception):
-                    self._journal.write(
-                        "tool",
-                        f"{call_name}: {flag}{result_text[:160]}",
-                        source="voice",
-                        data={
-                            "args": args,
-                            "ok": not is_error,
-                            **({"routines": applied} if applied and not is_error else {}),
-                        },
-                    )
-            if applied and not is_error:
-                outcome.details["routines_applied"] = applied
-            if call_name in COMMAND_TOOLS and not is_error:
-                # Decision-time nudge beats buried instructions: the engine's
-                # quick-close timer remains the backstop if this is ignored.
-                outcome.follow_up = _also(outcome.follow_up, _CLOSE_NOTE)
-            elif call_name in _READ_TOOLS and not is_error:
-                # "Sure, today you have…", not "I have it now"
-                outcome.follow_up = _also(outcome.follow_up, _READ_NOTE)
-            payload: dict[str, Any] = outcome.payload()
-            since = late_note() if late_note is not None else ""
-            if since:
-                payload["since"] = since  # he spoke while this ran: answer THAT
+            payload = await self._run_call(call_name, item.arguments, stats, late_note)
             outputs.append(
                 {
                     "type": "conversation.item.create",
@@ -2131,6 +2103,66 @@ class RealtimeEngine:
         # another response is on its way: the listening cue must wait for it
         self.last_response_followup = bool(outputs) and not closing
         return closing
+
+    async def _run_call(
+        self,
+        call_name: str,
+        arguments: str | None,
+        stats: SessionStats,
+        late_note: Callable[[], str] | None = None,
+    ) -> dict[str, Any]:
+        """One function call from the model, run and accounted for: the tool
+        itself, the trace and the tap, the transcript row, working context,
+        the journal, the close/read nudges on the outcome, and the "since"
+        note if the owner spoke meanwhile. Returns the payload the model gets
+        back as the call's output — the caller wraps and sends it, because
+        the two engines wrap it differently."""
+        try:
+            args = json.loads(arguments or "{}")
+        except json.JSONDecodeError:
+            args = {}
+        call_started = time.monotonic()
+        self._live_transcript = stats.transcript  # what think() reads the room from
+        outcome = await self._run_tool(call_name, args)
+        result_text, is_error = outcome.as_pair()
+        self._trace.tool(call_name, time.monotonic() - call_started)
+        self._tap("tool", name=call_name, seconds=round(time.monotonic() - call_started, 3), ok=not is_error)
+        self._tools_in_play.append(call_name)  # scopes the memory she gets
+        tool_hook = getattr(self, "_ui_tool_hook", None)
+        if tool_hook is not None:
+            tool_hook(call_name, result_text, is_error)
+        flag = "ERROR: " if is_error else ""
+        stats.transcript.append((f"tool {call_name}", flag + result_text[:200]))
+        if not is_error:
+            with contextlib.suppress(Exception):  # continuity never breaks a command
+                self._note_context(call_name, args, result_text)
+        applied = getattr(self._executor, "last_routines", [])
+        if self._journal is not None and call_name not in _QUIET_TOOLS:
+            with contextlib.suppress(Exception):
+                self._journal.write(
+                    "tool",
+                    f"{call_name}: {flag}{result_text[:160]}",
+                    source="voice",
+                    data={
+                        "args": args,
+                        "ok": not is_error,
+                        **({"routines": applied} if applied and not is_error else {}),
+                    },
+                )
+        if applied and not is_error:
+            outcome.details["routines_applied"] = applied
+        if call_name in COMMAND_TOOLS and not is_error:
+            # Decision-time nudge beats buried instructions: the engine's
+            # quick-close timer remains the backstop if this is ignored.
+            outcome.follow_up = _also(outcome.follow_up, _CLOSE_NOTE)
+        elif call_name in _READ_TOOLS and not is_error:
+            # "Sure, today you have…", not "I have it now"
+            outcome.follow_up = _also(outcome.follow_up, _READ_NOTE)
+        payload: dict[str, Any] = outcome.payload()
+        since = late_note() if late_note is not None else ""
+        if since:
+            payload["since"] = since  # he spoke while this ran: answer THAT
+        return payload
 
     async def _run_tool(self, name: str, args: dict[str, Any]) -> ToolOutcome:
         """One tool call, in the one shape every tool reports (brain/
