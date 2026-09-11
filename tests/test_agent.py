@@ -357,3 +357,30 @@ async def test_capability_filtering_drops_rgb_on_white_bulbs():
     assert by_entity["light.hallway"].color_temp_kelvin == 2700
     assert by_entity["light.kitchen_strip"].rgb_color == (255, 0, 0)  # rgb-only bulb
     assert by_entity["light.kitchen_strip"].color_temp_kelvin is None
+
+
+@pytest.mark.asyncio
+async def test_a_bulb_that_takes_both_colours_gets_one():
+    """Home Assistant answers 400 to rgb_color and color_temp_kelvin in the
+    same call; the Live backend sent both ("warm color" → [255,180,100] +
+    2200 K, then [0,0,0] + 2200 K) and the whole living room 'did not
+    respond'. The kelvin is the deliberate instruction; black is no colour."""
+    home = FakeHome()
+    both = next(light for light in home.lights.values() if light.supports_rgb and light.supports_color_temp)
+    executor = ToolExecutor(home)
+    text, is_error = await executor.execute(
+        "set_lights",
+        {"changes": [{"target": both.entity_id, "turn": "on", "rgb_color": [255, 180, 100], "color_temp_kelvin": 2200}]},
+    )
+    assert not is_error, text
+    cmd = home.applied[-1]
+    assert cmd.color_temp_kelvin == 2200 and cmd.rgb_color is None
+    text, is_error = await executor.execute(
+        "set_lights", {"changes": [{"target": both.entity_id, "turn": "on", "rgb_color": [0, 0, 0]}]}
+    )
+    assert not is_error, text
+    assert home.applied[-1].rgb_color is None and home.applied[-1].color_temp_kelvin is None
+    text, is_error = await executor.execute(
+        "set_lights", {"changes": [{"target": both.entity_id, "turn": "on", "rgb_color": [0, 0, 255]}]}
+    )
+    assert not is_error and home.applied[-1].rgb_color == (0, 0, 255)  # a real colour alone still works

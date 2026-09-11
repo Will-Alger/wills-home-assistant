@@ -43,7 +43,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "A target may be an entity_id, an area name (affects every light "
             "in that area), or 'all'. Only include fields you want to change; "
             "bulbs that lack a capability (e.g. rgb on a white-only bulb) "
-            "silently skip that field."
+            "silently skip that field. Give color_temp_kelvin for warm/cool "
+            "white OR rgb_color for a colour, never both in one change (a bulb "
+            "takes one colour parameter; given both, the kelvin wins)."
         ),
         "input_schema": {
             "type": "object",
@@ -628,13 +630,23 @@ class ToolExecutor:
             for light in targets:
                 rgb = change.get("rgb_color")
                 kelvin = change.get("color_temp_kelvin")
+                if rgb and not any(rgb):
+                    rgb = None  # black is not a colour (a backend sent [0, 0, 0] with a warm kelvin)
+                use_rgb = bool(rgb) and light.supports_rgb
+                use_kelvin = bool(kelvin) and light.supports_color_temp
+                if use_rgb and use_kelvin:
+                    # Home Assistant takes ONE colour parameter per call and
+                    # answers 400 to both (the whole living room "did not
+                    # respond" that way). The temperature is the deliberate
+                    # warm/cool instruction; the rgb was its guess at the same thing.
+                    use_rgb = False
                 commands.append(
                     LightCommand(
                         entity_id=light.entity_id,
                         turn=change.get("turn", "on"),
                         brightness_pct=change.get("brightness_pct"),
-                        rgb_color=tuple(rgb) if rgb and light.supports_rgb else None,
-                        color_temp_kelvin=kelvin if kelvin and light.supports_color_temp else None,
+                        rgb_color=tuple(rgb) if use_rgb else None,
+                        color_temp_kelvin=kelvin if use_kelvin else None,
                         transition=change.get("transition_seconds"),
                     )
                 )
