@@ -43,6 +43,7 @@ from assistant.config import code_root, home_dir, load_settings
 from assistant.context import WorkingContext
 from assistant.delivery import Courier, DeliveryPolicy, DeliverySettings
 from assistant.dispatch import Dispatcher, load_extra_routines, migrate_cloud_routines
+from assistant.engines.live_engine import LiveEngine
 from assistant.engines.realtime_engine import (
     FRAME_SAMPLES_24K,
     REALTIME_RATE,
@@ -372,9 +373,27 @@ def build_engine(fake: bool):
         on_refresh_devices=rescan_audio,
         recorder=recorder,
     )
-    engine = RealtimeEngine(
+    live = settings.voice_engine.strip().lower() == "live"
+    engine_cls: type[RealtimeEngine] = LiveEngine if live else RealtimeEngine
+    live_kwargs = (
+        {
+            "backend_model": settings.live_backend_model,
+            "backend_reasoning": settings.live_backend_reasoning,
+            "backend_web_search": settings.live_backend_web_search,
+            "echo_policy": settings.live_echo_policy,
+            "duplex_max_coupling": settings.live_duplex_max_coupling,
+            "max_session_s": settings.live_max_session_s,
+            "live_idle_timeout_s": settings.live_idle_timeout_s,
+            "store": settings.live_store,
+            "live_voice": settings.live_voice,
+            "speech_gate": settings.live_speech_gate,
+        }
+        if live
+        else {}
+    )
+    engine = engine_cls(
         api_key=settings.openai_api_key,
-        model=settings.realtime_model,
+        model=settings.live_model if live else settings.realtime_model,
         voice=settings.realtime_voice,
         home=home,
         owner=settings.owner_name,
@@ -388,7 +407,6 @@ def build_engine(fake: bool):
         noise_reduction=settings.realtime_noise_reduction,
         turn_detection=settings.realtime_turn_detection,
         silence_ms=settings.realtime_silence_ms,
-        speech_gate=settings.realtime_speech_gate,
         transcribe_language=settings.realtime_transcribe_language,
         eagerness=settings.realtime_eagerness,
         extra_instructions=settings.assistant_extra_instructions,
@@ -418,6 +436,8 @@ def build_engine(fake: bool):
         panel=panel,
         latency=latency,
         fallbacks=fallbacks,
+        **({} if live else {"speech_gate": settings.realtime_speech_gate}),
+        **live_kwargs,
     )
     scheduler._executor = engine._executor  # scheduled actions run through her tools
     scheduler.briefing = compose_briefing(calendar, board, scheduler, announcer, settings.owner_name)
@@ -611,14 +631,21 @@ async def voice(fake: bool) -> int:
     if status is not None:
         status.configure(
             mic=mic_name, speaker=speaker_name,
-            voice=settings.realtime_voice, wake_word=settings.wake_phrase,
+            voice=engine.voice, wake_word=settings.wake_phrase,
         )
         status.set_state("idle")
     hold = f" · or hold {hotkey.label} and speak" if hotkey is not None else ""
+    if isinstance(engine, LiveEngine):
+        engine_line = (
+            f"engine: GPT-Live ({settings.live_model}, full duplex, backend {settings.live_backend_model}"
+            f"{' + web search' if settings.live_backend_web_search else ''}, echo {settings.live_echo_policy})"
+        )
+    else:
+        engine_line = f"engine: realtime ({settings.realtime_model})"
     say(
         status,
         f"Voice online. “{settings.wake_phrase}” to talk to {settings.assistant_name}"
-        f"{hold} · voice: {settings.realtime_voice} · mic: {mic_name} · "
+        f"{hold} · {engine_line} · voice: {engine.voice} · mic: {mic_name} · "
         f"speaker: {speaker_name} · "
         f"home: {'fake apartment' if fake else settings.ha_url} · Ctrl+C quits.",
     )
@@ -888,6 +915,12 @@ async def one_cycle(
         "interrupted announcement": "you cut in — closed after quiet",
         "push to talk turn done": "answered — hold the key again to carry on",
         "nothing said": "nothing was said — back to sleep",
+        "command complete": "command done — closed after quiet",
+        "stop command": "you said stop",
+        "session cap": "the session hit its time cap — say the wake word to carry on",
+        "session expired": "the service ended the session (its maximum length)",
+        "closed by policy": "the service ended the session (content policy)",
+        "remote hangup": "the service hung up",
     }.get(stats.ended_by, stats.ended_by)
     with contextlib.suppress(Exception):  # the log is an instrument, never a blocker
         trace.finish(stats.ended_by, session=getattr(row, "id", None))
@@ -897,6 +930,7 @@ async def one_cycle(
         f"conversation closed ({reason}) · {stats.responses} replies · "
         f"tools: {stats.tool_calls or 'none'} · "
         + (f"{timed} · " if timed else "")
+        + (f"{stats.seconds:.0f} s live · " if stats.seconds else "")
         + f"${stats.cost_usd:.4f} (${total_cost:.4f} session)",
     )
     await record_session(

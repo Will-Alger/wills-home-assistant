@@ -1,0 +1,346 @@
+"""The GPT-Live engine, offline: the session she starts with, the prompt
+split, the backend bridge, the endings that are the engine's to decide, and
+the money."""
+
+from __future__ import annotations
+
+import asyncio
+
+import numpy as np
+
+from assistant.engines import live_engine as mod
+from assistant.engines.live_engine import LiveEngine, backend_cost, voice_for_live
+from assistant.home.fake import FakeHome
+from tests.fake_live import FakeLiveClient, LevelSpeaker
+from tests.fake_realtime import InstantSpeaker, NeverMic, QuietUi
+
+HALLWAY_OFF = {"changes": [{"target": "Hallway", "turn": "off"}]}
+
+
+def make(**kw) -> tuple[LiveEngine, FakeLiveClient, QuietUi]:
+    engine = LiveEngine(
+        api_key="k", model="gpt-live-1", voice="sol", home=FakeHome(), owner="Will", name="Alexa",
+        wake_phrase="alexa", **kw,
+    )
+    client = FakeLiveClient()
+    engine._client = client
+    return engine, client, QuietUi()
+
+
+def quick(monkeypatch) -> None:
+    monkeypatch.setattr(mod, "_OUTPUT_QUIET_S", 0.2)
+    monkeypatch.setattr(mod, "_SETTLE_S", 0.15)
+    monkeypatch.setattr(mod, "_WRAPUP_GRACE_S", 0.3)
+    monkeypatch.setattr(mod, "_FAREWELL_MAX_S", 0.25)
+
+
+class SteadyMic:
+    """Frames at one level, one every 10 ms."""
+
+    def __init__(self, level: int = 300) -> None:
+        self.level = level
+
+    async def get_frame(self) -> bytes:
+        await asyncio.sleep(0.01)
+        return np.full(1920, self.level, dtype=np.int16).tobytes()
+
+    def drain(self) -> None: ...
+
+
+class WakeOnDemand:
+    def __init__(self) -> None:
+        self.fire = False
+
+    def detect(self, frame: bytes) -> bool:
+        fired, self.fire = self.fire, False
+        return fired
+
+    def reset(self) -> None: ...
+
+
+# ── the session she starts with ─────────────────────────────────────────────
+
+
+async def test_the_session_she_starts_with() -> None:
+    engine, _client, _ui = make()
+    assert engine.voice == "marin" and "not a Live voice" in (engine.voice_note or "")  # sol does not exist on Live
+    assert voice_for_live("cedar") == "cedar" and voice_for_live("") == "marin"
+    cedar, _c, _u = make(live_voice="cedar")
+    assert cedar.voice == "cedar" and cedar.voice_note is None
+    cfg = await engine._live_session_config()
+    assert cfg["model"] == "gpt-live-1" and cfg["store"] is False
+    assert cfg["audio"] == {"format": {"type": "audio/pcm", "rate": 24000}, "output": {"voice": "marin"}}
+    backend = cfg["delegation"]
+    assert backend["type"] == "responses" and backend["responses"]["model"] == "gpt-5.6-luna"
+    assert backend["responses"]["reasoning"] == {"effort": "minimal"} and backend["responses"]["tool_choice"] == "auto"
+    tools = backend["responses"]["tools"]
+    names = [t.get("name") for t in tools]
+    assert {"type": "web_search"} in tools and "web_search" not in names  # the backend's own search
+    assert "set_lights" in names and "end_conversation" in names
+    live, back = cfg["instructions"], backend["responses"]["instructions"]
+    assert "stop mid-word" in live and 'Never say the word "alexa"' in live and "backend" in live
+    assert "Hallway" not in live  # the voice knows no devices: that is the backend's world
+    assert back.startswith("You are the reasoning and tool backend of Alexa") and "Hallway" in back
+    assert "the function call comes FIRST" in back  # today's tool rules, unchanged, on the backend
+
+
+async def test_backend_web_search_can_stay_ours() -> None:
+    engine, _c, _u = make(backend_web_search=False)
+    tools = engine._backend_tools()
+    assert {"type": "web_search"} not in tools and "web_search" in [t.get("name") for t in tools]
+
+
+def test_the_backend_share_of_the_bill() -> None:
+    usage = {"input_tokens": 1000, "output_tokens": 50, "input_tokens_details": {"cached_tokens": 800}}
+    assert abs(backend_cost(usage, "gpt-5.6-luna") - 0.000116) < 1e-9
+    assert abs(backend_cost(usage, "gpt-5.6-terra") - 0.00116) < 1e-9
+    assert backend_cost(usage, "something-else") == 0.0 and backend_cost(None, "gpt-5.6-luna") == 0.0
+
+
+# ── conversations ───────────────────────────────────────────────────────────
+
+
+async def test_a_question_is_answered_and_the_window_closes(monkeypatch) -> None:
+    quick(monkeypatch)
+    engine, client, ui = make(info_close_s=0.4, command_close_s=0.2)
+    conn = client.connection
+
+    async def owner() -> None:
+        await asyncio.sleep(0.1)
+        conn.owner_says("what time is it")
+        await asyncio.sleep(0.1)
+        conn.she_speaks(300, "It is nine o'clock.")  # her first word closes his turn
+        conn.usage(12.0, 0.01)
+
+    turn = asyncio.create_task(owner())
+    stats = await asyncio.wait_for(engine.run_conversation(NeverMic(), InstantSpeaker(), None, ui), 8)
+    await turn
+    assert ("you", "what time is it") in stats.transcript
+    assert ("alexa", "It is nine o'clock.") in stats.transcript  # flushed at the close
+    assert stats.ended_by == "question answered" and stats.replied
+    assert stats.seconds == 12.0 and abs(stats.cost_usd - 0.01) < 1e-9  # 12 s at $0.05 a minute
+    kinds = conn.kinds()
+    assert kinds[0] == "session.start" and kinds[-1] == "session.close" and not conn.tool_outputs()
+
+
+async def test_the_backend_asks_for_a_tool_and_the_command_closes(monkeypatch) -> None:
+    quick(monkeypatch)
+    engine, client, ui = make(command_close_s=0.25, info_close_s=2.0)
+    conn = client.connection
+    conn.on_response_create = lambda c: c.backend("d1", created=False, text="Done.", response_id="resp_2")
+
+    async def owner() -> None:
+        await asyncio.sleep(0.1)
+        conn.owner_says("turn off the hallway")
+        await asyncio.sleep(0.05)
+        conn.backend("d1", calls=[("call_1", "set_lights", HALLWAY_OFF)])
+        await asyncio.sleep(0.3)
+        conn.she_speaks(200, "Done, the hallway is off.")
+
+    turn = asyncio.create_task(owner())
+    stats = await asyncio.wait_for(engine.run_conversation(NeverMic(), InstantSpeaker(), None, ui), 8)
+    await turn
+    outputs = conn.tool_outputs()
+    assert len(outputs) == 1 and outputs[0]["status"] == "success" and "end_conversation" in outputs[0]["follow_up"]
+    kinds = conn.kinds()
+    assert kinds[kinds.index("response.item.create") + 1] == "response.create"  # outputs, then continue
+    assert stats.tool_calls == ["set_lights"] and stats.responses == 2
+    assert stats.backend_cost_usd > 0 and stats.ended_by == "command complete"
+    assert any(r == "tool set_lights" for r, _ in stats.transcript)
+
+
+async def test_the_end_tool_closes_after_her_goodbye(monkeypatch) -> None:
+    quick(monkeypatch)
+    engine, client, ui = make()
+    conn = client.connection
+    conn.on_response_create = lambda c: c.backend("d1", created=False, text="Bye!", response_id="resp_2")
+
+    async def owner() -> None:
+        await asyncio.sleep(0.1)
+        conn.owner_says("hallway off and that's it")
+        await asyncio.sleep(0.05)
+        conn.backend("d1", calls=[("c1", "set_lights", HALLWAY_OFF), ("c2", "end_conversation", {})])
+        await asyncio.sleep(0.3)
+        conn.she_speaks(200, "Hallway off. Bye!")
+
+    turn = asyncio.create_task(owner())
+    stats = await asyncio.wait_for(engine.run_conversation(NeverMic(), InstantSpeaker(), None, ui), 8)
+    await turn
+    assert stats.ended_by == "end_conversation"
+    assert [o["summary"] for o in conn.tool_outputs()][-1] == "closing after your last words"
+    assert stats.tool_calls == ["set_lights", "end_conversation"]
+
+
+async def test_an_end_tool_with_no_goodbye_gets_asked_for_one_then_closes_anyway(monkeypatch) -> None:
+    quick(monkeypatch)
+    engine, client, ui = make()
+    conn = client.connection
+    conn.on_response_create = lambda c: c.backend("d1", created=False, response_id="resp_2")
+
+    async def owner() -> None:
+        await asyncio.sleep(0.1)
+        conn.owner_says("that will be all")
+        await asyncio.sleep(0.05)
+        conn.backend("d1", calls=[("c1", "end_conversation", {})])
+
+    turn = asyncio.create_task(owner())
+    stats = await asyncio.wait_for(engine.run_conversation(NeverMic(), InstantSpeaker(), None, ui), 8)
+    await turn
+    assert stats.ended_by == "end_conversation"
+    assert mod._GOODBYE_LINE in conn.commentary()  # she was asked; the close did not wait forever
+
+
+async def test_thats_all_closes_after_her_closing_word(monkeypatch) -> None:
+    quick(monkeypatch)
+    engine, client, ui = make()
+    conn = client.connection
+
+    async def owner() -> None:
+        await asyncio.sleep(0.1)
+        conn.owner_says("okay that's all thanks")
+        await asyncio.sleep(0.05)
+        conn.she_speaks(200, "Bye for now.")
+
+    turn = asyncio.create_task(owner())
+    stats = await asyncio.wait_for(engine.run_conversation(NeverMic(), InstantSpeaker(), None, ui), 8)
+    await turn
+    assert stats.ended_by == "wrap-up" and "response.create" not in conn.kinds()
+
+
+async def test_a_wrap_up_she_never_answers_closes_after_the_grace(monkeypatch) -> None:
+    quick(monkeypatch)
+    engine, client, ui = make()
+    conn = client.connection
+
+    async def owner() -> None:
+        await asyncio.sleep(0.1)
+        conn.owner_says("never mind")  # settles: nobody answers it
+
+    turn = asyncio.create_task(owner())
+    stats = await asyncio.wait_for(engine.run_conversation(NeverMic(), InstantSpeaker(), None, ui), 8)
+    await turn
+    assert stats.ended_by == "wrap-up" and ("you", "never mind") in stats.transcript
+
+
+async def test_stop_is_instant_and_local(monkeypatch) -> None:
+    quick(monkeypatch)
+    engine, client, ui = make()
+    conn = client.connection
+    speaker = InstantSpeaker()
+
+    async def owner() -> None:
+        await asyncio.sleep(0.1)
+        conn.she_speaks(600, "Once upon a time in a land far away")
+        await asyncio.sleep(0.05)
+        conn.owner_says("alexa stop")
+
+    turn = asyncio.create_task(owner())
+    stats = await asyncio.wait_for(engine.run_conversation(NeverMic(), speaker, None, ui), 8)
+    await turn
+    assert stats.ended_by == "stop command" and speaker.chunks == []  # the tail never played
+
+
+async def test_idle_money_stops_and_a_session_has_a_cap(monkeypatch) -> None:
+    quick(monkeypatch)
+    engine, _client, ui = make(live_idle_timeout_s=0.3)
+    stats = await asyncio.wait_for(engine.run_conversation(NeverMic(), InstantSpeaker(), None, ui), 8)
+    assert stats.ended_by == "idle timeout"
+    engine, _client, ui = make(live_idle_timeout_s=5.0, max_session_s=0.3)
+    stats = await asyncio.wait_for(engine.run_conversation(NeverMic(), InstantSpeaker(), None, ui), 8)
+    assert stats.ended_by == "session cap"
+
+
+async def test_the_server_closing_the_session_is_reported(monkeypatch) -> None:
+    quick(monkeypatch)
+    engine, client, ui = make()
+    conn = client.connection
+
+    async def server() -> None:
+        await asyncio.sleep(0.1)
+        conn.seconds = 42.0
+        conn.close("expired")
+
+    task = asyncio.create_task(server())
+    stats = await asyncio.wait_for(engine.run_conversation(NeverMic(), InstantSpeaker(), None, ui), 8)
+    await task
+    assert stats.ended_by == "session expired" and stats.seconds == 42.0
+    assert "session.close" not in conn.kinds()  # nothing to close any more
+
+
+async def test_a_backend_that_rejects_reasoning_gets_one_retry_without(monkeypatch) -> None:
+    quick(monkeypatch)
+    engine, client, ui = make(live_idle_timeout_s=0.2)
+    client.connection.reject_start = {
+        "message": "Unknown parameter", "code": "unknown_parameter", "param": "session.delegation.responses.reasoning",
+    }
+    stats = await asyncio.wait_for(engine.run_conversation(NeverMic(), InstantSpeaker(), None, ui), 8)
+    assert client.connects == 2 and stats.ended_by == "idle timeout"
+    starts = [e["session"] for e in client.connection.sent if e["type"] == "session.start"]
+    assert "reasoning" in starts[0]["delegation"]["responses"] and "reasoning" not in starts[1]["delegation"]["responses"]
+    assert any("rejected reasoning" in n for n in ui.notes)
+
+
+async def test_a_dead_socket_ends_the_session_through_one_path(monkeypatch) -> None:
+    quick(monkeypatch)
+    engine, client, ui = make()
+    conn = client.connection
+
+    async def die() -> None:
+        await asyncio.sleep(0.1)
+        conn.fail_now()
+
+    task = asyncio.create_task(die())
+    stats = await asyncio.wait_for(engine.run_conversation(NeverMic(), InstantSpeaker(), None, ui), 8)
+    await task
+    assert stats.ended_by.startswith("session error")
+
+
+# ── the room ────────────────────────────────────────────────────────────────
+
+
+async def test_a_loud_speaker_is_gated_and_the_wake_word_cuts_in(monkeypatch) -> None:
+    quick(monkeypatch)
+    engine, client, ui = make(echo_policy="gated", live_idle_timeout_s=5.0)
+    conn = client.connection
+    mic, speaker, wake = SteadyMic(400), InstantSpeaker(), WakeOnDemand()
+
+    async def owner() -> None:
+        await asyncio.sleep(0.1)
+        conn.owner_says("tell me a story")
+        for _ in range(6):  # she talks for a while
+            conn.she_speaks(100, "Once" if _ == 0 else "")
+            await asyncio.sleep(0.05)
+        wake.fire = True  # "alexa" over her
+        await asyncio.sleep(0.15)
+        conn.owner_says("stop it")
+
+    turn = asyncio.create_task(owner())
+    stats = await asyncio.wait_for(engine.run_conversation(mic, speaker, wake, ui), 8)
+    await turn
+    frames = conn.audio_frames()
+    silent = [f for f in frames if not any(f)]
+    assert silent and len(silent) < len(frames)  # gated while she spoke, raw before and after the barge-in
+    assert mod._STOP_LINE in conn.instructions() and ui.interruptions == 1
+    assert speaker.chunks == [] and stats.ended_by == "stop command"
+
+
+async def test_a_quiet_speaker_means_full_duplex(monkeypatch) -> None:
+    quick(monkeypatch)
+    engine, client, ui = make(live_idle_timeout_s=0.6)
+    conn = client.connection
+    mic, speaker = SteadyMic(150), LevelSpeaker(level=1000)  # she plays at 1000, the mic hears 150: coupling 0.15
+
+    async def owner() -> None:
+        await asyncio.sleep(0.05)
+        conn.she_speaks(300, "Hello there")
+
+    turn = asyncio.create_task(owner())
+    stats = await asyncio.wait_for(engine.run_conversation(mic, speaker, None, ui), 8)
+    await turn
+    assert any("full duplex" in n for n in ui.notes)
+    frames = conn.audio_frames()
+    assert frames and not any(f for f in frames[-10:] if not any(f))  # the last frames went up raw
+    assert stats.ended_by == "idle timeout"
+    loud, _client2, ui2 = make(live_idle_timeout_s=0.6)
+    stats = await asyncio.wait_for(loud.run_conversation(SteadyMic(600), LevelSpeaker(level=1000), None, ui2), 8)
+    assert any("gated" in n for n in ui2.notes)  # 0.6: the speaker is louder at the mic than he is

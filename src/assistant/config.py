@@ -202,6 +202,37 @@ class Settings(BaseSettings):
     # a one-word turn came back as "Oh ja." and "Tamam,". "" = let it guess.
     realtime_transcribe_language: str = "en"
 
+    # Which engine runs a conversation. "live" is GPT-Live (gpt-live-1): full
+    # duplex — she listens while she speaks and stops when you talk over her —
+    # with reasoning and tools delegated to a backend model; billed $0.05 a
+    # minute of open session, by the second. "realtime" is the turn-based
+    # Realtime engine above. The wake word gates both.
+    voice_engine: str = "realtime"
+    live_model: str = "gpt-live-1"
+    # "" = REALTIME_VOICE mapped onto the Live voice list (sol → marin). Live
+    # has 22 built-in voices and no sol; marin is the voice her cue clips use.
+    live_voice: str = ""
+    # The backend that reasons and runs the tools when she delegates. luna is
+    # 10× cheaper than terra; switch if tool choice or answers get worse.
+    live_backend_model: str = "gpt-5.6-luna"
+    live_backend_reasoning: str = "minimal"  # none|minimal|low|medium|high|xhigh
+    live_backend_web_search: bool = True  # the Responses backend's native web search instead of ours
+    # How her own voice at the microphone is handled. auto: learn the coupling
+    # during her first reply and go full duplex when her echo is small
+    # (headphones, wired speakers) or feed silence while she plays when the
+    # speaker is louder at the mic than you are (the Echo Dot) — the wake
+    # word cuts in either way. duplex|gated force one.
+    live_echo_policy: str = "auto"
+    live_duplex_max_coupling: float = 0.4
+    # An open Live session bills per second, so idle time is money: shorter
+    # than the realtime idle timeout, and a hard cap on any one session.
+    live_idle_timeout_s: float = 30.0
+    live_max_session_s: float = 600.0
+    # The local Silero gate while she is silent (speech or clean silence to
+    # the server, never the room). Off while she talks in duplex mode.
+    live_speech_gate: bool = True
+    live_store: bool = False  # keep the recording on OpenAI's side for 30 days (forking); off
+
     # What the wake word (and a push-to-talk press) is answered with, before
     # the session exists: "voice" plays one of the short clips rendered in her
     # own voice under assets/voice/ack (scripts/render_acks.py) — "Yes?",
