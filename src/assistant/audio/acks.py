@@ -142,11 +142,20 @@ class WakeAcks:
         rate: int = RATE,
         clock: Callable[[], datetime] = datetime.now,
         rng: random.Random | None = None,
+        beat_s: float = 0.0,
+        beat_jitter_s: float = 0.15,
     ) -> None:
         self._dir = directory if directory is not None else ack_dir()
         self._rate = rate
         self._clock = clock
         self._rng = rng if rng is not None else random.Random()
+        # A person answers their name a beat after it is said; the clip is
+        # ready 30 ms after the wake, which sounded eager (Will: "so fast
+        # it's almost a little unnatural"). Silence queued ahead of the clip
+        # is that beat, a little different each time; 0 = at once.
+        self._beat_s = max(0.0, float(beat_s))
+        self._beat_jitter_s = max(0.0, float(beat_jitter_s))
+        self.last_beat_s = 0.0  # the pause before the clip that answered the last wake
         self._clips: dict[str, bytes] = {}
         self._gone: list[str] = []  # file names that would not load
         self._mode = (mode or "").strip().lower() or "voice"  # WAKE_ACK= is the default
@@ -224,11 +233,16 @@ class WakeAcks:
         if not slug:
             return 0.0
         pcm = self._clips[slug]
+        beat_s = self._beat_s + (self._rng.random() * self._beat_jitter_s if self._beat_s else 0.0)
+        beat = b"\x00\x00" * int(beat_s * self._rate)
         try:
+            if beat:
+                speaker.enqueue(beat)  # the beat, on the same stream, so nothing can race it
             speaker.enqueue(pcm)
         except Exception:  # noqa: BLE001 — a speaker that won't take it falls back to the ding
             return 0.0
         self.last = slug
+        self.last_beat_s = len(beat) / 2 / self._rate
         self.played.append(slug)
         del self.played[:-20]  # a days-long process keeps a window, not a history
-        return len(pcm) / 2 / self._rate
+        return (len(beat) + len(pcm)) / 2 / self._rate

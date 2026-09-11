@@ -121,6 +121,8 @@ def acknowledge(cues, acks, speaker, mic, trace) -> float:
     silent = acks is not None and acks.silent
     cues.start(speaker, sound=not spoken and not silent)
     trace.stamp("chime_enqueued")
+    if spoken and acks is not None:
+        at += int(acks.last_beat_s * REALTIME_RATE) * 2  # the words, not the beat before them
     if speaker.enqueued > at:
         speaker.notify_when_played(at, trace.audible)
     if spoken:
@@ -337,7 +339,7 @@ def build_engine(fake: bool):
     # Her answer to the wake word, read off the disk now so the wake itself
     # only has to queue it (audio/acks.py) — and, in the same voice, the
     # cues that used to be dings (WAKE_ACK=voice covers both).
-    acks = WakeAcks(mode=settings.wake_ack, rate=REALTIME_RATE)
+    acks = WakeAcks(mode=settings.wake_ack, rate=REALTIME_RATE, beat_s=settings.wake_ack_beat_s)
     voices, missing_cues = load_cues(rate=REALTIME_RATE) if acks.mode == "voice" else ({}, [])
     cues = VoiceCues(rate=REALTIME_RATE, status=status, voices=voices)
     cues.missing = missing_cues  # said once at boot (below)

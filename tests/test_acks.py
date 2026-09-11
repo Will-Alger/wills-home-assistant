@@ -123,6 +123,31 @@ def test_a_wake_answers_with_exactly_one_clip_and_opens_the_listening_window() -
     assert before + spoken + ECHO_TAIL_S <= mic.deadline <= time.monotonic() + spoken + ECHO_TAIL_S
 
 
+def test_she_takes_a_beat_before_answering_her_name() -> None:
+    """The clip alone came 30 ms after the wake — "so fast it's almost a
+    little unnatural" (Will). A beat of silence goes ahead of it on the same
+    stream, a little different each time; the log marks the words, not the
+    pause, and the microphone stays shut for both."""
+    import scripts.m4_realtime as runner
+
+    cues, acks, speaker, mic, trace = rig(beat_s=0.3)
+    before = time.monotonic()
+    spoken = runner.acknowledge(cues, acks, speaker, mic, trace)
+    assert len(speaker.queued) == 2  # the beat, then her voice
+    beat, clip = speaker.queued
+    assert not any(beat) and 0.3 <= len(beat) / 2 / RATE <= 0.45 and any(clip)
+    assert abs(spoken - (len(beat) + len(clip)) / 2 / RATE) < 1e-9
+    assert acks.last_beat_s == len(beat) / 2 / RATE
+    assert speaker.marks == [(len(beat), trace.audible)]
+    assert before + spoken + ECHO_TAIL_S <= mic.deadline <= time.monotonic() + spoken + ECHO_TAIL_S
+    beats = set()
+    for _ in range(4):
+        speaker.queued.clear()
+        runner.acknowledge(cues, acks, speaker, mic, trace)
+        beats.add(len(speaker.queued[0]))
+    assert len(beats) > 1  # never the same pause twice running
+
+
 def test_two_wakes_in_a_row_never_get_the_same_answer() -> None:
     import scripts.m4_realtime as runner
 

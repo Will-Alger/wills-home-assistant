@@ -243,6 +243,10 @@ class Settings(BaseSettings):
     # "Go ahead.", "Morning." — "ding" is the rising chime, "off" is silence.
     # A missing clip falls back to the ding with a boot note.
     wake_ack: str = "voice"
+    # The beat before she answers her name: the clip is ready 30 ms after the
+    # wake, which sounds eager; a person takes about a third of a second (a
+    # little different each time). 0 = at once.
+    wake_ack_beat_s: float = 0.35
 
     # Push to talk: hold this system-wide hotkey and speak; letting go ends
     # the turn (turn detection is off while it is held, so a pause can never
