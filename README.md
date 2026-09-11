@@ -296,6 +296,20 @@ tail) are dropped — and everything after it is not, so "alexa, turn off the
 hallway" in one breath still lands. `WAKE_ACK=ding` brings back the rising
 chime, `off` is silence.
 
+**GPT-Live** (`VOICE_ENGINE=live`, the default since 2026-09-11 — see
+`docs/LIVE-2026-09-11.md`) replaces the turn-based contract above with full
+duplex: she listens while she speaks, decides herself when to talk, and stops
+when you talk over her — no wake phrase needed to cut in, no dings, no turn
+detection to tune. Reasoning and every tool go to a backend model she
+delegates to (`LIVE_BACKEND_MODEL`, `gpt-5.6-luna`); the session bills $0.05 a
+minute by the second, idle included, so the wake word still gates it and
+`LIVE_IDLE_TIMEOUT_S` / `LIVE_MAX_SESSION_S` close it. Her own voice at the
+microphone is learned during her first reply: small (headphones, wired) and
+it is true full duplex; loud (the Echo Dot beside the mic) and she feeds
+silence while she plays, with the wake word as the interrupt (`LIVE_ECHO_POLICY`).
+`scripts/live_probe.py` is a 25-second bare session for checking the room.
+`VOICE_ENGINE=realtime` brings the engine above back.
+
 **Push to talk** (`PTT_HOTKEY`, default `ctrl+alt`) is the second way in:
 hold the hotkey anywhere on the desktop and speak. Your hold IS the turn —
 turn detection is switched off while the key is down, so a three-second pause

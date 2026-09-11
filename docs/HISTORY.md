@@ -50,6 +50,22 @@ Her first self-commission ran in 30 seconds and wrote `docs/BIRTH.md`:
 *"requested by the assistant, written by an agent, reviewed by a human.
 Small note, big day."*
 
+## The day GPT-Live landed (Sep 11)
+
+OpenAI put `gpt-live-1` in the API on the 10th; Will opened the 11th with
+"big day today". A week of fighting a turn-based model behind a microphone
+that also hears the speaker — tentative talk-over, dings, fragment guards,
+"she's talking to herself" on the Echo Dot — became a different contract in
+one morning: the model listens while it speaks and stops when he talks over
+it; reasoning and every tool go to a backend it delegates to; the session
+bills by the second, so the wake word stays the gate and the engine owns the
+endings. A bare probe on the real microphone taught the two things no doc
+said — her audio is a continuous stream, silence included, so "she is
+talking" is energy, and only commentary makes her speak first — before the
+engine was written as a subclass of the one that already knew the house.
+Same day she was running on it (`docs/LIVE-2026-09-11.md`); Will's ear
+decides the rest.
+
 ## Standing truths from the journey
 
 - Will's field reports drove a dozen fixes; testing-in-the-room beats
