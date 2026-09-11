@@ -110,6 +110,7 @@ _TICK_S = 0.05
 _STOP_LINE = (
     "The speaker just interrupted you: stop talking now, do not finish the sentence, and listen."
 )
+_NO_SEARCH_EFFORTS = ("none", "minimal")  # the backend's web_search refuses these
 _GOODBYE_LINE = "A goodbye of two or three words, then stop."
 
 LIVE_INSTRUCTIONS = """You are {name}, the voice of {owner}'s home. Calm, warm and natural, at an unhurried \
@@ -553,6 +554,7 @@ class _LiveSession:
             if not self.speaking_out:
                 self.speaking_out = True
                 self.reply_run += 1
+                self.stats.responses = self.reply_run  # what the close line calls replies: times she spoke
                 self.interrupted = False  # a barge-in belongs to the reply it cut
                 self.quiet_since = None
                 self.levels.new_playback(now)
@@ -748,7 +750,6 @@ class _LiveSession:
             cost = backend_cost(usage, self.engine._backend_model)
             self.stats.backend_cost_usd += cost
             self.stats.cost_usd = self.stats.seconds / 60 * LIVE_PRICE_PER_MIN + self.stats.backend_cost_usd
-            self.stats.responses += 1
             self.engine._log_live_usage(
                 kind="backend", model=self.engine._backend_model, cost_usd=round(cost, 6),
                 input_tokens=usage.get("input_tokens", 0),
@@ -884,6 +885,8 @@ class _LiveSession:
                     self.start_error = LiveStartError(message, code=code, param=param)
                     self.started.set()
                     continue
+                if await self._heal_backend(message):
+                    self._note("the backend refused that request — settings adjusted, say it again")
                 if engine._cues is not None and engine._cues.listening and not self.speaking_out:
                     spoken = engine._cues.error(message, self.speaker)
                     if spoken:
@@ -913,6 +916,31 @@ class _LiveSession:
                 "session.thinking.appended", "session.input_audio.muted", "session.input_audio.unmuted", "info",
             ):
                 self._tap(kind)
+
+    async def _heal_backend(self, message: str) -> bool:
+        """The server refused a delegation because of the backend settings:
+        change them for the rest of this session (delegation settings are
+        the one thing Live lets us update) so the next request goes through.
+        The request that failed is lost — he is told to say it again."""
+        engine = self.engine
+        text = message.lower()
+        if "reasoning" not in text and "web_search" not in text:
+            return False
+        responses: dict[str, Any] = {}
+        if "web_search" in text and engine._backend_web_search and engine._backend_reasoning in _NO_SEARCH_EFFORTS:
+            engine._backend_reasoning = "low"
+            responses["reasoning"] = {"effort": "low"}
+        elif "web_search" in text and engine._backend_web_search:
+            engine._backend_web_search = False  # the backend's search is out: ours is back in the list
+            responses["tools"] = engine._backend_tools()
+        elif "reasoning" in text and engine._backend_reasoning:
+            engine._backend_reasoning = ""
+            responses["reasoning"] = {"effort": None}
+        else:
+            return False
+        self._tap("backend_healed", **{k: v for k, v in responses.items() if k != "tools"})
+        await self._send({"type": "session.update", "session": {"delegation": {"type": "responses", "responses": responses}}})
+        return True
 
     # ── the clocks ─────────────────────────────────────────────────────────
 
@@ -1029,6 +1057,9 @@ class _LiveSession:
             if engine.voice_note:
                 self._note(engine.voice_note)
                 engine.voice_note = None
+            if engine.backend_note:
+                self._note(engine.backend_note)
+                engine.backend_note = None
             if engine._cues is not None:
                 engine._cues.start(self.speaker, sound=False)  # always listening: the flag stays up
             if items:
@@ -1107,6 +1138,14 @@ class LiveEngine(RealtimeEngine):
         self._backend_model = backend_model
         self._backend_reasoning = (backend_reasoning or "").strip().lower()
         self._backend_web_search = backend_web_search
+        self.backend_note: str | None = None
+        if backend_web_search and self._backend_reasoning in _NO_SEARCH_EFFORTS:
+            # the backend refuses its native web search at these efforts —
+            # every tool request failed with it on day one
+            self.backend_note = (
+                f"backend reasoning '{self._backend_reasoning}' cannot run the native web search — using low"
+            )
+            self._backend_reasoning = "low"
         self._echo_policy = (echo_policy or "auto").strip().lower()
         self._duplex_max_coupling = float(duplex_max_coupling)
         self._max_session_s = float(max_session_s)

@@ -72,7 +72,7 @@ async def test_the_session_she_starts_with() -> None:
     assert cfg["audio"] == {"format": {"type": "audio/pcm", "rate": 24000}, "output": {"voice": "marin"}}
     backend = cfg["delegation"]
     assert backend["type"] == "responses" and backend["responses"]["model"] == "gpt-5.6-luna"
-    assert backend["responses"]["reasoning"] == {"effort": "minimal"} and backend["responses"]["tool_choice"] == "auto"
+    assert backend["responses"]["reasoning"] == {"effort": "low"} and backend["responses"]["tool_choice"] == "auto"
     tools = backend["responses"]["tools"]
     names = [t.get("name") for t in tools]
     assert {"type": "web_search"} in tools and "web_search" not in names  # the backend's own search
@@ -88,6 +88,49 @@ async def test_backend_web_search_can_stay_ours() -> None:
     engine, _c, _u = make(backend_web_search=False)
     tools = engine._backend_tools()
     assert {"type": "web_search"} not in tools and "web_search" in [t.get("name") for t in tools]
+
+
+async def test_the_native_search_refuses_minimal_reasoning_so_low_is_the_floor() -> None:
+    """Day one: every tool request failed with "The following tools cannot be
+    used with reasoning.effort 'minimal': web_search." and she said sorry."""
+    engine, _c, _u = make(backend_reasoning="minimal")
+    assert engine._backend_reasoning == "low" and "using low" in (engine.backend_note or "")
+    ours, _c, _u = make(backend_reasoning="minimal", backend_web_search=False)
+    assert ours._backend_reasoning == "minimal" and ours.backend_note is None
+
+
+async def test_a_backend_refusal_mid_session_is_healed_for_the_next_request(monkeypatch) -> None:
+    quick(monkeypatch)
+    engine, client, ui = make(live_idle_timeout_s=0.6)
+    engine._backend_reasoning = "minimal"  # as if the guard were not there
+    conn = client.connection
+
+    async def server() -> None:
+        await asyncio.sleep(0.1)
+        conn.push(
+            "error",
+            error=type("E", (), {
+                "message": "The following tools cannot be used with reasoning.effort 'minimal': web_search.",
+                "code": "invalid_value", "param": "reasoning.effort", "type": "invalid_request_error",
+            })(),
+        )
+        await asyncio.sleep(0.05)
+        conn.push(
+            "error",
+            error=type("E", (), {
+                "message": "Unsupported tool: web_search.", "code": "invalid_value", "param": "tools",
+                "type": "invalid_request_error",
+            })(),
+        )
+
+    task = asyncio.create_task(server())
+    await asyncio.wait_for(engine.run_conversation(NeverMic(), InstantSpeaker(), None, ui), 8)
+    await task
+    updates = [e["session"]["delegation"]["responses"] for e in conn.sent if e["type"] == "session.update"]
+    assert updates[0] == {"reasoning": {"effort": "low"}}
+    assert {"type": "web_search"} not in updates[1]["tools"] and "web_search" in [t.get("name") for t in updates[1]["tools"]]
+    assert engine._backend_reasoning == "low" and not engine._backend_web_search
+    assert sum("say it again" in n for n in ui.notes) == 2
 
 
 def test_the_backend_share_of_the_bill() -> None:
@@ -144,7 +187,7 @@ async def test_the_backend_asks_for_a_tool_and_the_command_closes(monkeypatch) -
     assert len(outputs) == 1 and outputs[0]["status"] == "success" and "end_conversation" in outputs[0]["follow_up"]
     kinds = conn.kinds()
     assert kinds[kinds.index("response.item.create") + 1] == "response.create"  # outputs, then continue
-    assert stats.tool_calls == ["set_lights"] and stats.responses == 2
+    assert stats.tool_calls == ["set_lights"] and stats.responses == 1  # she spoke once
     assert stats.backend_cost_usd > 0 and stats.ended_by == "command complete"
     assert any(r == "tool set_lights" for r, _ in stats.transcript)
 

@@ -215,7 +215,11 @@ class Settings(BaseSettings):
     # The backend that reasons and runs the tools when she delegates. luna is
     # 10× cheaper than terra; switch if tool choice or answers get worse.
     live_backend_model: str = "gpt-5.6-luna"
-    live_backend_reasoning: str = "minimal"  # none|minimal|low|medium|high|xhigh
+    # none|minimal|low|medium|high|xhigh. The backend's native web search
+    # refuses none and minimal ("cannot be used with reasoning.effort
+    # 'minimal': web_search" — every tool request failed that way on day one),
+    # so with web search on the engine raises either to low.
+    live_backend_reasoning: str = "low"
     live_backend_web_search: bool = True  # the Responses backend's native web search instead of ours
     # How her own voice at the microphone is handled. auto: learn the coupling
     # during her first reply and go full duplex when her echo is small
