@@ -274,6 +274,7 @@ class _LiveSession:
         self.working_ticks = 0
         # endings
         self.closing = False
+        self.closing_ms = 0  # the session clock when the end tool ran: words after it are his
         self.farewell_deadline = 0.0
         self.farewell_pending = False
         self.wrapup_heard = False
@@ -336,6 +337,13 @@ class _LiveSession:
         if flag is not None:
             with contextlib.suppress(Exception):
                 flag(time.monotonic() + seconds + 0.5)
+
+    @property
+    def his_turn_live(self) -> bool:
+        """His words are still arriving: an open user segment that grew
+        within the settle window. (An open segment that stopped growing is
+        a turn nobody has closed yet, not a sentence in progress.)"""
+        return bool(self.user_seg_id) and time.monotonic() - self.user_grew_at < _SETTLE_S
 
     def session_ms(self) -> float:
         """Where the session timeline is now, from the last fragment's stamp
@@ -623,7 +631,8 @@ class _LiveSession:
             else:
                 self._end("announcement delivered")  # she said her piece; nobody replied
                 return
-        if (self.closing or self.wrapup_heard) and not self.interrupted and not self.tool_busy:
+        if (self.closing or self.wrapup_heard) and not self.interrupted and not self.tool_busy and not self.his_turn_live:
+            # never on the beat after her last word while his next sentence is still arriving
             self._end("end_conversation" if self.closing else "wrap-up")
             return
         if not self.ptt_session:
@@ -656,9 +665,15 @@ class _LiveSession:
             if self.wrapup_heard and self.speaking_out:
                 self.wrapup_heard = False  # "wait —" during the goodbye
                 self._tap("wrapup_withdrawn")
+            if self.closing and seg.start_ms > self.closing_ms:
+                self._withdraw_close()  # the backend closed a one-shot command; he has more
             with contextlib.suppress(Exception):
                 self.ui.user_speaking()
         self.last_activity = now
+        if seg.text != self.user_seg_text:
+            # it grew: whatever the settled judgement was, it is stale — "make
+            # the living room warm… okay that's all" in one breath is a wrap-up
+            self.user_judged.discard("settled")
         self.user_seg_text = seg.text
         self.user_grew_at = now
         if not seg.closed:
@@ -668,6 +683,25 @@ class _LiveSession:
             return
         self.user_seg_id = ""
         self._finish_user_turn(seg.text)
+
+    def _withdraw_close(self) -> None:
+        """The end tool ran on a one-shot command, and then he started talking
+        again ("…also make the living room…"): the close is his to overrule.
+        Nothing ends while his words are still arriving, and the model is told
+        to stay rather than say goodbye. (Will's 18:48 session closed on the
+        beat after "Volume's at one hundred percent" with his next sentence
+        half-transcribed — talking over her never set `interrupted`.)"""
+        self.closing = False
+        self.farewell_deadline = 0.0
+        self.farewell_pending = False
+        self.quick_close_armed = False
+        self._tap("close_withdrawn")
+        self._note("he has more — the close is off")
+        self._spawn(self._send({
+            "type": "session.instructions.append", "delegation_id": None,
+            "content": "He has more to say: the conversation is NOT over. Answer him; do not say goodbye "
+                       "or wrap up unless he does.",
+        }))
 
     def _maybe_prewake(self, partial: str) -> None:
         """"…play…" heard mid-sentence: wake the TV now, while he finishes.
@@ -863,6 +897,7 @@ class _LiveSession:
                 engine.last_response_tools.append(name)
                 if name == "end_conversation":
                     self.closing = True
+                    self.closing_ms = self.session_ms()
                     self._tap("end_tool")
                     payload: dict[str, Any] = {
                         "status": "success",
@@ -1056,8 +1091,8 @@ class _LiveSession:
                 return
             if now < self.thinking_until:
                 continue
-            if self.speaking_out or busy:
-                continue
+            if self.speaking_out or busy or self.his_turn_live:
+                continue  # her voice, a tool, or his sentence still arriving: no clock closes anything
             if self.closing:
                 if self.farewell_deadline and now > self.farewell_deadline:
                     if not self.farewell_pending:

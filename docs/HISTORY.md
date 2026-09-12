@@ -88,7 +88,10 @@ dropped as her echo, and his command went with them. Now the wake waits a
 beat and answers only if he stopped — the microphone keeps a ring of the
 room's last seconds and can say whether he kept talking past her name — and
 the lines themselves are the two words Jarvis would use ("Yes, sir?", "Sir?",
-"Mm-hm?"), rendered without the accent she had been trying on.
+"Mm-hm?"), rendered without the accent she had been trying on. And the end
+tool learned its place: a one-shot command closes the conversation only if he
+has nothing more to say — his next sentence, even over her last word,
+withdraws the close.
 
 ## Standing truths from the journey
 

@@ -277,6 +277,56 @@ async def test_the_end_tool_closes_after_her_goodbye(monkeypatch) -> None:
     assert stats.tool_calls == ["set_lights", "end_conversation"]
 
 
+async def test_his_next_sentence_overrules_the_end_tool(monkeypatch) -> None:
+    """Will, 18:48: "Make the volume one hundred percent" → the backend
+    answered and called the end tool → "Alexa, let's also make the living
+    room…" was cut off on the beat after her last word. Talking over her in
+    full duplex sets no interrupted flag, so the close must yield to an open
+    sentence of his, and be withdrawn once one starts after the end tool."""
+    quick(monkeypatch)
+    engine, client, ui = make()
+    conn = client.connection
+    conn.on_response_create = lambda c: c.backend("d1", created=False, text="Sure.", response_id="resp_2")
+
+    async def owner() -> None:
+        await asyncio.sleep(0.1)
+        conn.owner_says("make the volume one hundred percent")
+        await asyncio.sleep(0.05)
+        conn.backend("d1", calls=[("c1", "media_control", {"action": "volume_set", "volume_pct": 100}),
+                                  ("c2", "end_conversation", {})])
+        await asyncio.sleep(0.2)
+        conn.she_speaks(200, "Volume's at one hundred percent.")
+        conn.owner_says("Alexa, let's also make the living room warm", start_ms=5000)  # over her last word
+        await asyncio.sleep(0.6)  # long past the beat that used to close it
+        assert not engine._live_session_ended  # type: ignore[attr-defined]
+        conn.she_speaks(100, "Sure, warmer.")  # she answers; his turn closes on the speaker change
+        await asyncio.sleep(0.3)
+        conn.owner_says("okay that's all", start_ms=conn._stamp + 600)
+
+    monkeypatch.setattr(mod._LiveSession, "_end", _ending(engine), raising=True)
+    turn = asyncio.create_task(owner())
+    stats = await asyncio.wait_for(engine.run_conversation(NeverMic(), InstantSpeaker(), None, ui), 8)
+    await turn
+    assert stats.ended_by == "wrap-up"  # his own wrap-up, not the backend's end tool
+    said = [e["content"] for e in conn.sent if e["type"] == "session.instructions.append"]
+    assert any("NOT over" in s for s in said)
+    assert ("you", "Alexa, let's also make the living room warm") in stats.transcript or any(
+        "make the living" in text for who, text in stats.transcript if who == "you"
+    )
+
+
+def _ending(engine):
+    """Wrap _end so a test can watch for it without the session's own state."""
+    original = mod._LiveSession._end
+    engine._live_session_ended = False
+
+    def _end(self, reason: str) -> None:
+        engine._live_session_ended = True
+        original(self, reason)
+
+    return _end
+
+
 async def test_an_end_tool_with_no_goodbye_gets_asked_for_one_then_closes_anyway(monkeypatch) -> None:
     quick(monkeypatch)
     engine, client, ui = make()
