@@ -17,6 +17,40 @@ from tests.fake_realtime import InstantSpeaker, NeverMic, QuietUi
 HALLWAY_OFF = {"changes": [{"target": "Hallway", "turn": "off"}]}
 
 
+async def test_slow_music_feedback_is_suppressed_after_user_changes_or_cancellation(monkeypatch):
+    monkeypatch.setattr(mod, "_MUSIC_ACK_S", 0)
+    engine, client, ui = make()
+    session = mod._LiveSession(engine, client.connection, NeverMic(), InstantSpeaker(), None, ui,
+                               mod.SessionStats(), announce=False, ptt=None, ptt_session=False)
+    d = session._delegation("music")
+    engine._executor.music.begin()
+    await session._music_ack(d)
+    events = [e for e in client.connection.sent if e["type"] == "session.commentary.append"]
+    assert len(events) == 1
+    assert "Do not claim it is playing" in events[0]["content"]
+    session.user_turns += 1
+    await session._music_ack(d)
+    session.user_turns -= 1
+    engine._executor.music.cancel_pending()
+    await session._music_ack(d)
+    assert len([e for e in client.connection.sent if e["type"] == "session.commentary.append"]) == 1
+
+
+async def test_live_cancel_phrase_cancels_music_preparation():
+    engine, client, ui = make()
+    session = mod._LiveSession(engine, client.connection, NeverMic(), InstantSpeaker(), None, ui,
+                               mod.SessionStats(), announce=False, ptt=None, ptt_session=False)
+    request = engine._executor.music.begin()
+    session._judge("cancel the music")
+    assert request.cancelled.is_set()
+
+
+async def test_live_backend_exposes_one_call_music_selection():
+    engine, _client, _ui = make()
+    tool = next(t for t in engine._backend_tools() if t.get("name") == "play_music")
+    assert tool["parameters"]["properties"]["selection"]["enum"] == ["exact", "discover"]
+
+
 def make(**kw) -> tuple[LiveEngine, FakeLiveClient, QuietUi]:
     engine = LiveEngine(
         api_key="k", model="gpt-live-1", voice="sol", home=FakeHome(), owner="Will", name="Alexa",

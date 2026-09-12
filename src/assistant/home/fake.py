@@ -133,6 +133,9 @@ class FakeHome:
         self, entity_id: str, command: str, volume_pct: int | None = None
     ) -> None:
         self.media_commands.append((entity_id, command))
+        if command in ("turn_on", "turn_off"):
+            self.players = [replace(p, state="idle" if command == "turn_on" else "off")
+                            if p.entity_id == entity_id else p for p in self.players]
 
     async def launch_app(self, entity_id: str, app: str) -> None:
         self.launched.append((entity_id, app))

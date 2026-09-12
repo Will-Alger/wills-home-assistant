@@ -248,17 +248,19 @@ async def test_pause_with_nothing_playing_is_honest_not_an_error():
 
 
 @pytest.mark.asyncio
-async def test_failed_play_suggests_real_library_names():
+async def test_failed_play_does_not_guess_a_name_error_or_retry():
     class BrokenPlayHome(FakeHome):
         async def play_music(self, *a, **kw):
             raise RuntimeError("HA API error 500 on /api/services/music_assistant/play_media")
 
     executor = ToolExecutor(BrokenPlayHome())
-    text, is_error = await executor.execute(
+    result = await executor.run(
         "play_music", {"media_id": "cleveland running mix", "media_type": "playlist"}
     )
-    assert is_error
-    assert "Cleveland 10K" in text and "retry play_music" in text
+    assert result.is_error
+    assert "500" in result.summary
+    assert "retry play_music" not in result.summary
+    assert "do not retry blindly" in result.follow_up
 
 
 @pytest.mark.asyncio

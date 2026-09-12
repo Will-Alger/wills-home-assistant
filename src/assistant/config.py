@@ -65,6 +65,9 @@ class Settings(BaseSettings):
     # Milestone 1: Home Assistant
     ha_url: str = "http://localhost:8123"
     ha_token: str = ""
+    # Optional aliases -> MA playback entity and its TV power entity. Empty
+    # automatically pairs only a house with exactly one music player and one TV.
+    music_destinations: dict[str, dict[str, str]] = {}
 
     # Background Claude jobs (reflection, later dispatch) run through the
     # Claude Code CLI = billed to the Max SUBSCRIPTION, not API tokens.
