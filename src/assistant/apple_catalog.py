@@ -211,3 +211,11 @@ class AppleCatalog:
         results = await self._get(LOOKUP_URL, {"id": track_id, "entity": "song"})
         rows = [r for r in results if r.get("wrapperType") == "track"]
         return _track(rows[0]) if rows else None
+
+    async def album_tracks(self, album_id: str) -> list[AppleItem]:
+        """Every track of an album with its row number: how a start that
+        landed one row off is put back on the right track."""
+        if not str(album_id).isdigit():
+            return []
+        results = await self._get(LOOKUP_URL, {"id": album_id, "entity": "song", "limit": 200})
+        return [_track(r) for r in results if r.get("wrapperType") == "track"]

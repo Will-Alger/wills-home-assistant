@@ -77,7 +77,7 @@ def test_without_voices_every_cue_is_a_tone_that_runs_for_nothing() -> None:
 
 def test_her_lines_are_known_normalised() -> None:
     lines = spoken_lines("Will")
-    assert normalise("Yes, Will?") in lines and normalise("  mm-hm. ") in lines and "one moment" in lines
+    assert normalise("Yes, sir?") in lines and normalise("  mm-hm. ") in lines and "one moment" in lines
     assert normalise("Turn off the hallway light") not in lines
     assert set(CUE_PHRASES) & set(PHRASES) == set()  # two tables, no slug twice
 

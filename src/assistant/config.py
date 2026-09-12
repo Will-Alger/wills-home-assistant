@@ -256,7 +256,7 @@ class Settings(BaseSettings):
     # The beat before she answers her name: the clip is ready 30 ms after the
     # wake, which sounds eager; a person takes about a third of a second (a
     # little different each time). 0 = at once.
-    wake_ack_beat_s: float = 0.35
+    wake_ack_beat_s: float = 0.45  # the beat before "Yes?" — on GPT-Live, the window in which his own next words cancel it
 
     # Push to talk: hold this system-wide hotkey and speak; letting go ends
     # the turn (turn detection is off while it is held, so a pause can never

@@ -46,17 +46,17 @@ MODES = ("voice", "ding", "off")
 # script speaks exactly these; {owner} is filled in at render time.
 PHRASES: dict[str, str] = {
     "yes": "Yes?",
-    "yes-owner": "Yes, {owner}?",
-    "go-ahead": "Go ahead.",
-    "listening": "Listening.",
+    "yes-sir": "Yes, sir?",
+    "sir": "Sir?",
     "mm-hm": "Mm-hm?",
-    "im-here": "I'm here.",
-    "morning": "Morning.",
-    "evening": "Evening.",
+    "go-ahead": "Go ahead.",
 }
+# Retired 2026-09-12 (Will: "'I'm here' feels fake and less Jarvis-like than
+# 'Yes, sir?'"): "Yes, {owner}?", "Listening.", "I'm here.", "Morning.", "Evening.".
 
-# The two that are only true at their hour: slug -> [from, until) local hour.
-GREETINGS: dict[str, tuple[int, int]] = {"morning": (0, 11), "evening": (18, 24)}
+# Lines that are only true at their hour: slug -> [from, until) local hour.
+# None at the moment; the machinery stays for the day one earns its place.
+GREETINGS: dict[str, tuple[int, int]] = {}
 NEUTRAL: tuple[str, ...] = tuple(slug for slug in PHRASES if slug not in GREETINGS)
 GREETING_WEIGHT = 3  # how much likelier the right greeting is than any one neutral line
 
@@ -221,19 +221,25 @@ class WakeAcks:
         choices = fresh or pool  # one clip left on disk is better than silence
         return self._rng.choice(choices) if choices else ""
 
-    def acknowledge(self, speaker: Any) -> float:
+    @property
+    def beat_s(self) -> float:
+        return self._beat_s
+
+    def acknowledge(self, speaker: Any, *, beat_s: float | None = None) -> float:
         """Answer the wake through `speaker`, and say how long the answer runs.
 
         Returns the clip's length in seconds — what the runner holds the
         microphone shut for — or 0.0 when nothing was said, which means the
-        caller still owes the ding (unless `silent`)."""
+        caller still owes the ding (unless `silent`). `beat_s` overrides the
+        pause queued ahead of the clip: 0 when the caller already waited it."""
         if self._mode != "voice" or speaker is None:
             return 0.0
         slug = self.pick()
         if not slug:
             return 0.0
         pcm = self._clips[slug]
-        beat_s = self._beat_s + (self._rng.random() * self._beat_jitter_s if self._beat_s else 0.0)
+        beat_s = self._beat_s if beat_s is None else max(0.0, float(beat_s))
+        beat_s = beat_s + (self._rng.random() * self._beat_jitter_s if beat_s else 0.0)
         beat = b"\x00\x00" * int(beat_s * self._rate)
         try:
             if beat:

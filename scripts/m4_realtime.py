@@ -130,6 +130,46 @@ def acknowledge(cues, acks, speaker, mic, trace) -> float:
     return spoken
 
 
+_WAKE_TAIL_S = 0.1  # the last of "Alexa" itself may still be sounding when the detector fires
+
+
+async def acknowledge_later(
+    cues, acks, speaker, mic, trace, *, wake_at: float, window_s: float, recorder=None
+) -> float:
+    """Answer the wake only if he stopped after it.
+
+    Full duplex changed what the answer is for. "Alexa, play AC/DC" in one
+    breath needs no "Yes?" at all — the model hears the command and answers
+    that — and a "Yes?" landing on top of his words is worse than nothing,
+    because its echo off the loudspeaker is dropped from the microphone along
+    with whatever he was saying (Will: "Alexa play AC/DC" → "Mm-hm?" → silence).
+    So the wake gets `window_s` of quiet first. The listening flag goes up at
+    once; if the room carried his voice after the wake word, the clip stands
+    down; if not, he paused for an answer and gets one, the window itself
+    being the beat before it. A microphone that cannot answer the question
+    (a fake, a replay) gets the clip as before."""
+    cues.start(speaker, sound=False)  # the flag, the panel and the meter: at once
+    await asyncio.sleep(max(0.0, wake_at + window_s - time.monotonic()))
+    heard = getattr(mic, "heard_since", None)
+    if heard is not None and heard(wake_at + _WAKE_TAIL_S, before=wake_at):
+        trace.stamp("chime_enqueued")  # the moment the answer was decided, not spoken
+        if recorder is not None:
+            recorder.event("ack_skipped", reason="he kept talking")
+        return 0.0
+    at = speaker.enqueued
+    spoken = acks.acknowledge(speaker, beat_s=0.0) if acks is not None else 0.0
+    trace.stamp("chime_enqueued")
+    if spoken:
+        if speaker.enqueued > at:
+            speaker.notify_when_played(at, trace.audible)
+        mic.suspect_before(time.monotonic() + spoken + ECHO_TAIL_S)
+    elif not (acks is not None and acks.silent):
+        cues.wake_sound(speaker)  # no clip would load: the ding stands in
+    if recorder is not None:
+        recorder.event("acknowledged", seconds=round(spoken, 2))
+    return spoken
+
+
 def say(status, text: str, style: str = "") -> None:
     """Print a line AND put it in the panel's live feed (plain, no markup)."""
     console.print(f"[{style}]{text}[/{style}]" if style else text, highlight=False)
@@ -856,10 +896,21 @@ async def one_cycle(
         # "Yes?" in her own voice (or the ding) through the stream already
         # open. Push to talk gets it the moment he presses, and the same
         # microphone keeps running, so the words he says while the socket is
-        # still connecting are already queued for this session.
-        spoken = acknowledge(cues, getattr(engine, "acks", None), speaker, mic, trace)
-        if recording:
-            recorder.event("acknowledged", seconds=round(spoken, 2))
+        # still connecting are already queued for this session. A wake on the
+        # full-duplex engine waits a beat first, and answers only if he did
+        # not just keep talking (acknowledge_later).
+        acks = getattr(engine, "acks", None)
+        if trigger == "wake" and getattr(engine, "defers_ack", False):
+            window = acks.beat_s if acks is not None else settings.wake_ack_beat_s
+            asyncio.create_task(acknowledge_later(
+                cues, acks, speaker, mic, trace,
+                wake_at=getattr(trace, "t0", time.monotonic()), window_s=window,
+                recorder=recorder if recording else None,
+            ))
+        else:
+            spoken = acknowledge(cues, acks, speaker, mic, trace)
+            if recording:
+                recorder.event("acknowledged", seconds=round(spoken, 2))
     trace.stamp("mic_ready")  # both streams were open before the wake word
     session_wake.reset()
     if announcing:

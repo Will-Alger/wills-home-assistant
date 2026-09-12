@@ -139,7 +139,7 @@ _PLAY_RE = re.compile(
     r"^(?:(?:hey|ok|okay)\s+)?(?:alexa[\s,!.]+)?"
     r"(?:(?:can|could|would|will)\s+you\s+|please\s+|go\s+ahead\s+and\s+|just\s+)*"
     r"(?:play|put\s+on|start)\s+(?P<title>.+?)"
-    r"\s+by\s+(?P<artist>.+?)"
+    r"[\s,]+by[\s,]+(?P<artist>.+?)"
     r"(?:\s+(?:on|in|at|through|to)\s+(?:the\s+|my\s+)?(?P<dest>[\w\s]+?))?"
     r"[\s.?!,]*$",
     re.IGNORECASE,
@@ -151,18 +151,33 @@ _QUOTES = " \"'“”‘’"
 PLAY_WORD = re.compile(r"\b(?:play|put on)\b", re.IGNORECASE)
 
 
+_FILLER = re.compile(r"^(?:(?:uh+|um+|erm?|hmm?|like|the song|the track|that song)[\s,]+)+", re.IGNORECASE)
+
+
 def parse_play_request(text: str) -> PlayIntent | None:
     match = _PLAY_RE.match(str(text or "").strip())
     if match is None:
         return None
-    title = match.group("title").strip(_QUOTES)
-    artist = match.group("artist").strip(_QUOTES).rstrip(",")
+    # "play uh American Girls by Harry Styles": the hesitation is not the title.
+    title = _FILLER.sub("", match.group("title").strip(_QUOTES)).strip(_QUOTES)
+    artist = _FILLER.sub("", match.group("artist").strip(_QUOTES)).strip(_QUOTES).rstrip(",")
     if not title or not artist or len(title) > 80 or len(artist) > 60:
         return None
     lowered = title.casefold()
     if lowered in _VAGUE_TITLES or lowered.startswith(tuple(v for v in _VAGUE_TITLES if v.endswith(" "))):
         return None
     return PlayIntent(title, artist, (match.group("dest") or "").strip())
+
+
+def trace_line(trace: dict[str, Any]) -> str:
+    """One console line per music request: the stages and their milliseconds,
+    so the log itself says where the seconds went and which route ran."""
+    stages = trace.get("stages_ms") or {}
+    steps = " → ".join(f"{name} {int(ms)}" for name, ms in stages.items())
+    route = ("native ✓" if trace.get("playing_verified") else
+             "native → MA" if "native_fallback" in stages else
+             "MA" if trace.get("submitted") else "no playback")
+    return f"music {trace.get('origin', 'tool')}: {steps} ms · {route}"
 
 
 def _request_key(args: dict[str, Any]) -> tuple[str, str] | None:
@@ -322,8 +337,7 @@ class MusicCoordinator:
         return (self.native and str(args.get("media_type") or "playlist") in ("track", "album", "playlist")
                 and args.get("enqueue") not in ("next", "add") and not args.get("radio_mode"))
 
-    async def _apple(self, work: Coroutine[Any, Any, AppleItem | None], request: MusicRequest,
-                     stage: str) -> AppleItem | None:
+    async def _apple(self, work: Coroutine[Any, Any, Any], request: MusicRequest, stage: str) -> Any:
         """Apple's catalog is the fast path, never the only one: a miss or a
         network failure just hands the question to Music Assistant."""
         try:
@@ -442,7 +456,16 @@ class MusicCoordinator:
             assert power.remote_entity is not None
             await self.home.remote_commands(power.remote_entity, item.keys(), delay_s=self.key_delay_s)
             request.stamp("native_keys_sent")
+        return await self._confirm(item, power, request, before)
+
+    async def _confirm(self, item: AppleItem, power: MediaPlayer, request: MusicRequest,
+                       before: tuple[str, str]) -> tuple[bool, str]:
+        """Poll the TV until it reports the item playing in its Music app. A
+        track from the same album instead of the one asked for means the page
+        opened with its focus one row off (it does, from the Now Playing
+        screen): skip along the album to the right row, once, and look again."""
         deadline = time.monotonic() + self.native_verify_s
+        corrected = False
         while True:
             entity = await self.home.get_entity(power.entity_id)
             attrs = entity.get("attributes") or {}
@@ -450,6 +473,12 @@ class MusicCoordinator:
             playing = entity.get("state") == "playing" and attrs.get("app_id") == MUSIC_APP
             if item.kind == "track":
                 confirmed = playing and normalise(seen) == normalise(item.title)
+                if (playing and not confirmed and not corrected and seen
+                        and normalise(seen) != normalise(before[1])):
+                    corrected = True
+                    if await self._skip_along_album(item, power, request, seen):
+                        deadline = time.monotonic() + self.native_verify_s
+                        continue
             else:
                 confirmed = playing and (before[0] != "playing" or seen != before[1])
             if confirmed:
@@ -460,6 +489,20 @@ class MusicCoordinator:
                 request.stamp("native_unconfirmed")
                 return False, seen
             await asyncio.sleep(self.poll_s)
+
+    async def _skip_along_album(self, item: AppleItem, power: MediaPlayer, request: MusicRequest,
+                                seen: str) -> bool:
+        """The wrong row of the right album is playing: next/previous the
+        difference (the album's rows come from one catalog lookup)."""
+        tracks = await self._apple(self.apple.album_tracks(item.album_id), request, "album_rows") or []
+        current = next((t for t in tracks if normalise(t.title) == normalise(seen)), None)
+        if current is None or current.track_number == item.track_number:
+            return False
+        delta = item.track_number - current.track_number
+        for _ in range(min(abs(delta), 12)):
+            await self.home.media_command(power.entity_id, "next" if delta > 0 else "previous")
+        request.stamp("native_corrected")
+        return True
 
     async def play(self, args: dict, request: MusicRequest) -> dict:
         if request.runner is not None and asyncio.current_task() is not request.runner:

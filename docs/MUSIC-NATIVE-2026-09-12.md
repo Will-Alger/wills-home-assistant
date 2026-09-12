@@ -108,6 +108,25 @@ ordinary way; anything with a destination it cannot place is left to the model.
 - Volume through the Apple TV entity returned OK but Music Assistant's mirror
   did not move; whether the receiver heard it is for Will's ears.
 
+## The evening's corrections
+
+- **One row off from the Now Playing screen.** Will's "Play American Girls
+  by Harry Styles" fell through to Music Assistant twice while my probe of the
+  same song landed in 2.2 s. The difference was his earlier "pause": from the
+  Music app's Now Playing screen the album page opens with its focus one row
+  off (Kiwi, track 7, played track 6). The coordinator now believes the TV and
+  corrects: when a *different track of the same album* starts, one catalog
+  lookup gives the album's rows and next/previous presses walk to the right
+  one, then the title is verified again (`_skip_along_album`, stage
+  `native_corrected`).
+- **"uh" is not part of the title.** The fast-start parser strips hesitations
+  ("play uh American Girls by, um, Harry Styles").
+- **Every music request now logs its route**: `music tool: destination_resolved
+  16 → … → native_playing 2891 ms · native ✓` on the console, so the log itself
+  says where the seconds went.
+- **Keys spaced under 0.1 s are dropped by tvOS** (0.05 s landed on the wrong
+  track), so the measured 0.1 s stays.
+
 ## Voice acceptance
 
 1. "Alexa, play Back in Black by AC/DC." Count from the end of the sentence

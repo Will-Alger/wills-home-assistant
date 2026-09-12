@@ -46,13 +46,26 @@ class FakeSpeaker:
 
 
 class FakeMic:
-    """Only the one method the acknowledgment needs from a microphone."""
+    """Only the two things the acknowledgment needs from a microphone: a
+    flag for her echo, and whether the room carried his voice after the wake."""
 
     def __init__(self) -> None:
         self.deadline = 0.0
+        self.heard = False
+        self.asked: list[tuple[float, float | None]] = []
 
     def suspect_before(self, deadline: float) -> None:
         self.deadline = deadline
+
+    def heard_since(self, since: float, until: float | None = None, *, before: float | None = None) -> bool:
+        self.asked.append((since, before))
+        return self.heard
+
+
+class MuteMic(FakeMic):
+    """A microphone that cannot say (a replay, a fake): the clip plays as before."""
+
+    heard_since = None  # type: ignore[assignment]
 
 
 class FakeTrace:
@@ -87,7 +100,7 @@ def rig(**kw) -> tuple[VoiceCues, WakeAcks, FakeSpeaker, FakeMic, FakeTrace]:
 
 def test_every_acknowledgment_is_committed_and_short_enough_to_be_one() -> None:
     acks = WakeAcks(ack_dir())
-    assert acks.missing() == []  # all eight WAVs are in the repo
+    assert acks.missing() == []  # every line's WAV is in the repo
     assert acks.note() == ""
     for slug in PHRASES:
         pcm = read_wav(ack_dir() / f"{slug}.wav", RATE)
@@ -96,9 +109,13 @@ def test_every_acknowledgment_is_committed_and_short_enough_to_be_one() -> None:
         assert len(pcm) % 2 == 0
 
 
-def test_the_owner_is_named_in_the_one_line_that_names_him() -> None:
-    assert phrase("yes-owner", "Will") == "Yes, Will?"
-    assert phrase("yes") == "Yes?"
+def test_the_lines_are_the_short_ones_he_asked_for() -> None:
+    """Will, 2026-09-12: "'I'm here' feels fake and less Jarvis-like than
+    'Yes, sir?'" — so the lines are a word or two, none of them a greeting."""
+    assert phrase("yes") == "Yes?" and phrase("yes-sir") == "Yes, sir?" and phrase("sir") == "Sir?"
+    assert set(PHRASES) == {"yes", "yes-sir", "sir", "mm-hm", "go-ahead"}
+    assert GREETINGS == {}
+    assert all(len(text.split()) <= 2 for text in PHRASES.values())
 
 
 # ── one wake, one answer ──────────────────────────────────────────────────
@@ -237,20 +254,104 @@ def picks_at(hour: int, wakes: int = 60) -> set[str]:
     return {acks.pick() for _ in range(wakes)}
 
 
-def test_a_greeting_is_only_ever_spoken_when_it_is_true() -> None:
-    morning = picks_at(9)
-    assert "morning" in morning and "evening" not in morning
-    evening = picks_at(20)
-    assert "evening" in evening and "morning" not in evening
-    afternoon = picks_at(14)
-    assert not {"morning", "evening"} & afternoon
-    assert len(afternoon) > 1  # the neutral lines still vary
+def test_no_line_depends_on_the_hour() -> None:
+    """The greetings are retired: morning, noon and night draw from the same
+    short lines, and they still vary."""
+    assert picks_at(9) == picks_at(14) == picks_at(20)
+    assert len(picks_at(9)) > 2
 
 
-def test_the_greeting_windows_are_the_ones_the_spec_asked_for() -> None:
-    assert GREETINGS == {"morning": (0, 11), "evening": (18, 24)}
-    assert "morning" in picks_at(10) and "morning" not in picks_at(11)
-    assert "evening" in picks_at(18) and "evening" not in picks_at(17)
+# ── full duplex: the answer waits for him to stop ─────────────────────────
+
+
+async def test_the_answer_stands_down_when_he_keeps_talking_past_her_name() -> None:
+    """"Alexa, play AC/DC" in one breath: no "Yes?" lands on his words, the
+    listening flag is up at once, and the log still marks the decision."""
+    import scripts.m4_realtime as runner
+
+    cues, acks, speaker, mic, trace = rig()
+    mic.heard = True
+    wake_at = time.monotonic()
+    spoken = await runner.acknowledge_later(cues, acks, speaker, mic, trace, wake_at=wake_at, window_s=0.02)
+    assert spoken == 0.0
+    assert speaker.queued == [] and acks.played == [] and cues.played == []
+    assert cues.listening is True
+    assert trace.stamps == ["chime_enqueued"]
+    assert mic.deadline == 0.0  # nothing of hers to ignore
+    since, before = mic.asked[0]
+    assert since > wake_at and before == wake_at  # the room's level is read from before her name
+
+
+async def test_a_pause_after_her_name_gets_the_answer_with_the_window_as_its_beat() -> None:
+    import scripts.m4_realtime as runner
+
+    cues, acks, speaker, mic, trace = rig(beat_s=0.3)
+    start = time.monotonic()
+    spoken = await runner.acknowledge_later(cues, acks, speaker, mic, trace, wake_at=start, window_s=0.08)
+    assert time.monotonic() - start >= 0.06  # Windows' clock ticks in 16 ms steps
+    assert len(speaker.queued) == 1 and any(speaker.queued[0])  # the clip alone: the window was the beat
+    assert 0.0 < spoken <= MAX_S and acks.played == [acks.last]
+    assert speaker.marks == [(0, trace.audible)]
+    assert trace.stamps == ["chime_enqueued"] and cues.played == []
+    assert start + 0.06 + spoken + ECHO_TAIL_S <= mic.deadline <= time.monotonic() + spoken + ECHO_TAIL_S
+
+
+async def test_a_microphone_that_cannot_say_gets_the_clip_as_before() -> None:
+    import scripts.m4_realtime as runner
+
+    cues, acks, speaker, _mic, trace = rig()
+    spoken = await runner.acknowledge_later(cues, acks, speaker, MuteMic(), trace, wake_at=time.monotonic(), window_s=0.0)
+    assert spoken > 0.0 and len(speaker.queued) == 1
+
+
+async def test_no_clip_on_disk_still_rings_the_ding_after_the_window(tmp_path) -> None:
+    import scripts.m4_realtime as runner
+
+    cues, acks, speaker, mic, trace = rig(directory=tmp_path)
+    spoken = await runner.acknowledge_later(cues, acks, speaker, mic, trace, wake_at=time.monotonic(), window_s=0.0)
+    assert spoken == 0.0 and speaker.queued == [b"wake"] and cues.listening is True
+
+
+def test_recent_levels_hear_speech_only_above_the_room() -> None:
+    from assistant.audio.level import RecentLevels
+
+    t = 100.0
+    quiet = RecentLevels()
+    for i in range(25):  # two seconds of room tone before the wake word
+        quiet.push(t + i * 0.08, 120.0)
+    wake = t + 2.0
+    assert not quiet.heard(wake + 0.1, before=wake)
+    for i in range(2):
+        quiet.push(wake + 0.2 + i * 0.08, 900.0)  # two frames of him
+    assert quiet.heard(wake + 0.1, before=wake)
+
+    music = RecentLevels()  # a television in the room raises the bar
+    for i in range(25):
+        music.push(t + i * 0.08, 600.0)
+    for i in range(2):
+        music.push(wake + 0.2 + i * 0.08, 900.0)  # not clearly him over it
+    assert not music.heard(wake + 0.1, before=wake)
+    for i in range(2):
+        music.push(wake + 0.4 + i * 0.08, 2000.0)
+    assert music.heard(wake + 0.1, before=wake)
+
+    early = RecentLevels()  # his "Alexa" itself, before the stamp, does not count
+    early.push(wake - 0.5, 3000.0)
+    early.push(wake - 0.4, 3000.0)
+    assert not early.heard(wake + 0.1, before=wake)
+
+
+async def test_the_real_microphone_answers_from_its_own_ring(monkeypatch) -> None:
+    mic = await open_mic(monkeypatch)
+    try:
+        before = time.monotonic()
+        await speak(mic, frames=3)  # loud frames, none of them taken from the queue
+        assert mic.heard_since(before - 0.01, before=before)
+        assert not mic.heard_since(time.monotonic() + 1.0)
+        async with asyncio.timeout(1):
+            assert len(await mic.get_frame()) == FRAME_BYTES  # still every frame delivered
+    finally:
+        await mic.close()
 
 
 # ── the catch: her own voice must not become his turn ─────────────────────

@@ -135,7 +135,9 @@ cough, music, a television or a nearby conversation is not a request.
 What you know and what you do: you know nothing about the home, the lights, the music, the \
 calendar, timers, reminders, his memory, his projects or the web, and you act on none of it \
 yourself. Anything that needs a fact, a lookup or an action goes to your backend AT ONCE, \
-before you speak — at most one short word while it works. Say its answer once, in one breath, \
+before you speak — at most one short word while it works. When his command came in the same \
+breath as your name, a brief "Sure thing" or "On it" is the whole acknowledgment; when he says \
+only your name and waits, answer "Yes?" and wait. Say its answer once, in one breath, \
 in your own words, never the mechanics ("done", not "I've called the tool"). Never claim \
 something is done, set or found before the backend says so; if it says pending, say it is \
 underway and carry on. A bit of chat, or a question the conversation itself answers, needs \
@@ -1182,6 +1184,10 @@ class LiveEngine(RealtimeEngine):
     """The realtime engine's tools, prompts, memory and accounting on a
     GPT-Live session. Everything conversational is `_LiveSession`."""
 
+    # The runner answers a wake only after a beat of quiet: on full duplex a
+    # command in the same breath as her name needs no "Yes?" (m4_realtime.acknowledge_later).
+    defers_ack = True
+
     def __init__(
         self,
         *,
@@ -1289,6 +1295,7 @@ class LiveEngine(RealtimeEngine):
         self._raised_followups = []
         self._deferred_reads = []
         self._ui_tool_hook = getattr(ui, "tool", None)
+        self._ui_note_hook = getattr(ui, "note", None)  # the music trace line, per request
         items: list[Any] = []
         if announce:
             items = self._announcer.take_due() if self._announcer is not None else []

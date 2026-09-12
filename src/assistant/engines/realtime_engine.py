@@ -2138,6 +2138,12 @@ class RealtimeEngine:
         self._tap("tool", name=call_name, seconds=round(time.monotonic() - call_started, 3), ok=not is_error)
         if "music_trace" in outcome.details:
             self._tap("music", **outcome.details["music_trace"])
+            note_hook = getattr(self, "_ui_note_hook", None)
+            if note_hook is not None:
+                from assistant.music import trace_line  # the tools import this module's stats
+
+                with contextlib.suppress(Exception):
+                    note_hook(trace_line(outcome.details["music_trace"]))
         self._tools_in_play.append(call_name)  # scopes the memory she gets
         tool_hook = getattr(self, "_ui_tool_hook", None)
         if tool_hook is not None:
@@ -3054,6 +3060,7 @@ class RealtimeEngine:
                     flag(time.monotonic() + seconds + ECHO_TAIL_S)
 
         self._ui_tool_hook = getattr(ui, "tool", None)  # observability: show tool outcomes
+        self._ui_note_hook = getattr(ui, "note", None)  # the music trace line, per request
         if not announce and self._presence is not None:
             with contextlib.suppress(Exception):
                 self._presence.observe("home", source="voice")  # he said the wake word: he is here

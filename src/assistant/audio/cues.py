@@ -151,6 +151,11 @@ class VoiceCues:
         self._state("working")
         return True
 
+    def wake_sound(self, speaker: Any | None = None) -> float:
+        """The wake chime on its own: the window is already open (a deferred
+        acknowledgment raised the flag at once) and no clip would load."""
+        return self._sound("wake", speaker)
+
     def turn_over(self, speaker: Any | None = None) -> float:
         """The falling tone — or her "Mm-hm." — on its own, after the flag
         already dropped. Returns the seconds her voice runs (0.0 for a tone)."""

@@ -63,6 +63,7 @@ class FakeHome:
     remote_keys: list[tuple[str, list[str]]] = field(default_factory=list)
     native_tracks: dict[str, list[str]] = field(default_factory=dict)
     native_broken: bool = False  # keys land on nothing: the page never opened
+    native_focus_offset: int = 0  # -1: the page opened with its focus one row off
     _page: str | None = None
     extra_entities: list[dict] = field(
         default_factory=lambda: [
@@ -144,6 +145,14 @@ class FakeHome:
         if command in ("turn_on", "turn_off"):
             self.players = [replace(p, state="idle" if command == "turn_on" else "off")
                             if p.entity_id == entity_id else p for p in self.players]
+        if command in ("next", "previous") and self._page is not None:
+            # the fake Music app steps along the rows of the page it opened
+            rows = self.native_tracks.get(self._page) or []
+            for p in self.players:
+                if p.entity_id == entity_id and p.app_id == "com.apple.TVMusic" and p.now_playing in rows:
+                    i = rows.index(p.now_playing) + (1 if command == "next" else -1)
+                    if 0 <= i < len(rows):
+                        self.players = [replace(q, now_playing=rows[i]) if q is p else q for q in self.players]
 
     async def launch_app(self, entity_id: str, app: str) -> None:
         self.launched.append((entity_id, app))
@@ -159,8 +168,8 @@ class FakeHome:
         if self._page is None or "select" not in commands:
             return
         rows = self.native_tracks.get(self._page) or [self._page.rsplit("/", 1)[-1]]
-        downs = commands.count("down")
-        title = rows[min(downs, len(rows)) - 1] if downs else rows[0]
+        row = commands.count("down") + self.native_focus_offset
+        title = rows[min(row, len(rows)) - 1] if row > 0 else rows[0]
         self.players = [
             replace(p, state="playing", now_playing=title, app_id="com.apple.TVMusic")
             if p.remote_entity == remote_entity_id else p

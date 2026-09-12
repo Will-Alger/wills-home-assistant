@@ -12,6 +12,7 @@ import sounddevice as sd
 
 from assistant.audio import devices
 from assistant.audio.base import FRAME_SAMPLES, SAMPLE_RATE, AudioSourceClosed
+from assistant.audio.level import RecentLevels, rms
 
 
 def resolve_device(spec: str) -> int | None:
@@ -94,6 +95,7 @@ class Microphone:
         self._queue: asyncio.Queue[tuple[float, bytes]] = asyncio.Queue(maxsize=queue_frames)
         self._suspect_before = 0.0  # frames captured before this stamp may be her own voice
         self.last_suspect = False  # ...and the frame get_frame just returned was one of them
+        self.levels = RecentLevels()  # the last seconds of the room, for questions about them
         self._stream: sd.RawInputStream | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self.device_note: str | None = None  # set when a fallback device was used
@@ -199,8 +201,15 @@ class Microphone:
             self._stream = None
 
     def _offer(self, captured: float, data: bytes) -> None:
+        self.levels.push(captured, rms(data))
         with contextlib.suppress(asyncio.QueueFull):
             self._queue.put_nowait((captured, data))
+
+    def heard_since(self, since: float, until: float | None = None, *, before: float | None = None) -> bool:
+        """Did the room carry speech after `since` (a `time.monotonic()`
+        stamp)? The wake's deferred answer asks this — did he keep talking
+        past her name? — without taking a frame from whoever is listening."""
+        return self.levels.heard(since, until, before=before)
 
     def suspect_before(self, deadline: float) -> None:
         """Flag every frame captured before `deadline` (a `time.monotonic()`

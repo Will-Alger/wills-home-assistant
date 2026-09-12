@@ -13,7 +13,13 @@ from assistant.apple_catalog import MUSIC_APP, AppleItem, parse_uri
 from assistant.brain.tools import ToolExecutor
 from assistant.home.base import MediaPlayer
 from assistant.home.fake import FakeHome
-from assistant.music import MusicCoordinator, PlayIntent, catalog_for, parse_play_request
+from assistant.music import (
+    MusicCoordinator,
+    PlayIntent,
+    catalog_for,
+    parse_play_request,
+    trace_line,
+)
 
 BACK_IN_BLACK = AppleItem("track", "574050602", "Back In Black", "AC/DC", "Back In Black", "574050396", 6)
 TIME_OUT = AppleItem("album", "157427923", "Time Out", "The Dave Brubeck Quartet")
@@ -25,9 +31,15 @@ class FakeApple:
 
     def __init__(self, *items: AppleItem) -> None:
         self.items = list(items)
+        self.albums: dict[str, list[str]] = {}  # album id -> its rows, for album_tracks
         self.calls: list[tuple[str, str]] = []
         self.release = asyncio.Event()
         self.release.set()
+
+    async def album_tracks(self, album_id):
+        self.calls.append(("album", album_id))
+        return [AppleItem("track", f"{album_id}-{i + 1}", title, "AC/DC", "Back In Black", album_id, i + 1)
+                for i, title in enumerate(self.albums.get(album_id, []))]
 
     async def song(self, title, artist="", album=""):
         self.calls.append(("song", title))
@@ -95,9 +107,19 @@ def test_apple_items_know_their_page_and_keys() -> None:
     assert AppleItem.from_item(BACK_IN_BLACK.as_item()) == BACK_IN_BLACK
 
 
+def test_the_trace_line_names_the_route() -> None:
+    native = {"origin": "fast_start", "stages_ms": {"resolved": 407.0, "native_playing": 2891.0}, "playing_verified": True}
+    assert trace_line(native) == "music fast_start: resolved 407 → native_playing 2891 ms · native ✓"
+    fallen = {"origin": "tool", "stages_ms": {"native_fallback": 4000.0, "service_returned": 24000.0}, "submitted": True}
+    assert trace_line(fallen).endswith("· native → MA")
+    assert trace_line({"stages_ms": {}, "submitted": False}).endswith("· no playback")
+
+
 @pytest.mark.parametrize("text, expected", [
     ("Alexa, can you play Back in Black by AC/DC at my living room TV?",
      PlayIntent("Back in Black", "AC/DC", "living room TV")),
+    ("Can you play uh American Girls by Harry Styles", PlayIntent("American Girls", "Harry Styles")),
+    ("play um, the song Kiwi by, uh, Harry Styles", PlayIntent("Kiwi", "Harry Styles")),
     ("play take five by dave brubeck", PlayIntent("take five", "dave brubeck")),
     ("Put on “Hotel California” by the Eagles.", PlayIntent("Hotel California", "the Eagles")),
     ("play some jazz", None),
@@ -154,6 +176,19 @@ async def test_a_track_from_music_assistant_gets_its_page_looked_up() -> None:
     assert not result.is_error, result
     assert ("track", "574050602") in ex.music.apple.calls  # …so the id from MA is looked up
     assert home.launched_urls[-1][1] == BACK_IN_BLACK.url()
+
+
+async def test_a_page_that_opens_one_row_off_is_put_right_from_the_album() -> None:
+    home = NativeHome()
+    home.native_focus_offset = -1  # the Now Playing screen was up: the first Down was swallowed
+    ex = executor(home)
+    ex.music.apple.albums = {BACK_IN_BLACK.album_id: home.native_tracks[BACK_IN_BLACK.url()]}
+    result = await ex.run("play_music", {"media_id": "Back in Black", "artist": "AC/DC", "media_type": "track"})
+    assert not result.is_error, result
+    assert "Playing Back In Black on Apple TV" in result.summary and result.details["native"]
+    assert home.media_commands == [("media_player.living_room_tv", "next")]
+    assert "native_corrected" in result.details["music_trace"]["stages_ms"]
+    assert home.played == []
 
 
 async def test_an_unconfirmed_native_start_falls_back_to_music_assistant() -> None:
