@@ -67,6 +67,8 @@ class MediaPlayer:
     kind: str  # "music" (Music Assistant / speakers) or "tv" (has a remote, launches apps)
     apps: tuple[str, ...] = ()  # launchable sources for kind="tv"
     now_playing: str | None = None
+    remote_entity: str | None = None  # the TV's remote.* entity: key presses go here
+    app_id: str | None = None  # the app playing on a TV (com.apple.TVMusic, com.apple.TVAirPlay…)
 
 
 class HomeApi(Protocol):
@@ -111,6 +113,17 @@ class HomeApi(Protocol):
     ) -> None: ...
 
     async def launch_app(self, entity_id: str, app: str) -> None: ...
+
+    async def launch_url(self, entity_id: str, url: str) -> None:
+        """Open a link on a TV (an Apple TV opens music.apple.com pages in its
+        own Music app). Returns as soon as the TV accepted it."""
+        ...
+
+    async def remote_commands(
+        self, remote_entity_id: str, commands: list[str], delay_s: float = 0.1
+    ) -> None:
+        """Press remote keys in order ("down", "select", "play"…), `delay_s` apart."""
+        ...
 
     async def music_library(
         self, media_type: str = "playlist", search: str | None = None, limit: int = 50

@@ -51,6 +51,35 @@ async def test_live_backend_exposes_one_call_music_selection():
     assert tool["parameters"]["properties"]["selection"]["enum"] == ["exact", "discover"]
 
 
+async def test_an_unmistakable_play_request_starts_before_the_backend(monkeypatch):
+    engine, client, ui = make()
+    started: list = []
+    woken: list = []
+
+    async def fast_start(intent):
+        started.append(intent)
+        return {"title": "Back In Black", "verified": True}
+
+    async def prewake():
+        woken.append(True)
+        return True
+
+    monkeypatch.setattr(engine._executor.music, "fast_start", fast_start)
+    monkeypatch.setattr(engine._executor.music, "prewake", prewake)
+    session = mod._LiveSession(engine, client.connection, NeverMic(), InstantSpeaker(), None, ui,
+                               mod.SessionStats(), announce=False, ptt=None, ptt_session=False)
+    session._maybe_prewake("Can you")  # nothing to wake for yet
+    session._maybe_prewake("Can you play")  # the TV is woken mid-sentence, once
+    session._maybe_prewake("Can you play back in")
+    session._finish_user_turn("Can you play back in black by AC/DC")
+    await asyncio.sleep(0.02)
+    assert woken == [True]
+    assert [(i.title, i.artist) for i in started] == [("back in black", "AC/DC")]
+    session._finish_user_turn("play some jazz")  # the model's call
+    await asyncio.sleep(0.02)
+    assert len(started) == 1
+
+
 def make(**kw) -> tuple[LiveEngine, FakeLiveClient, QuietUi]:
     engine = LiveEngine(
         api_key="k", model="gpt-live-1", voice="sol", home=FakeHome(), owner="Will", name="Alexa",

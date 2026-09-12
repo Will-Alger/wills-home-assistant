@@ -38,7 +38,7 @@ _MISS_SETTLE_S = 1.0  # scores wobble: one utterance is one row, at its peak
 
 # Set on the first turn of a conversation only.
 _ACTIVATION = ("wake_score", "chime_enqueued", "chime_audible", "mic_ready", "connected")
-_TURN = ("first_speech", "speech_end", "transcript_at", "first_audio", "playback_end")
+_TURN = ("first_speech", "speech_end", "transcript_at", "first_call", "first_audio", "playback_end")
 
 
 class TurnTrace:
@@ -114,6 +114,11 @@ class TurnTrace:
 
     def audio_delta(self) -> None:
         self.stamp("first_audio")
+
+    def first_call(self) -> None:
+        """The backend's first tool call of the turn arrived — how long the
+        model took to decide, before any tool ran."""
+        self.stamp("first_call")
 
     def playback_done(self) -> None:
         # Last one wins: a tool turn drains the speaker several times and it

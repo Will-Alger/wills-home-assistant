@@ -68,6 +68,13 @@ class Settings(BaseSettings):
     # Optional aliases -> MA playback entity and its TV power entity. Empty
     # automatically pairs only a house with exactly one music player and one TV.
     music_destinations: dict[str, dict[str, str]] = {}
+    # The Apple TV plays Apple Music itself: its Music app opened by link, a
+    # remote press, the title confirmed from its state (~2 s warm). Needs the
+    # TV's remote entity; Music Assistant stays the fallback and the route for
+    # library playlists.
+    music_native: bool = True
+    apple_storefront: str = "us"  # the music.apple.com storefront the links open
+    music_native_ready_s: float = 0.9  # page opened → first key press (twice that after a wake)
 
     # Background Claude jobs (reflection, later dispatch) run through the
     # Claude Code CLI = billed to the Max SUBSCRIPTION, not API tokens.

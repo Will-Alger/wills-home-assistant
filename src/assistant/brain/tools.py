@@ -15,6 +15,7 @@ from typing import Any
 
 import httpx
 
+from assistant.apple_catalog import MUSIC_APP
 from assistant.brain.outcome import NeedsClarification, ToolOutcome, ok, unavailable
 from assistant.calendar.base import (
     CalendarApi,
@@ -411,6 +412,9 @@ class ToolExecutor:
         routines: Any | None = None,
         receipts: ReceiptBook | None = None,
         music_destinations: dict[str, dict[str, str]] | None = None,
+        music_native: bool = True,
+        apple_storefront: str = "us",
+        music_native_ready_s: float = 0.9,
     ) -> None:
         self._web = web  # WebSearch, or None when no key is configured
         self._routines = routines  # RoutineStore: deterministic defaults/overrides
@@ -422,7 +426,10 @@ class ToolExecutor:
         # working context binds "it" and "that" to these (context.py).
         self.last_entities: list[tuple[str, str]] = []
         self._home = home
-        self.music = MusicCoordinator(home, destinations=music_destinations)
+        self.music = MusicCoordinator(
+            home, destinations=music_destinations, native=music_native,
+            storefront=apple_storefront, native_ready_s=music_native_ready_s,
+        )
         self._calendar = calendar
 
     async def run(self, name: str, tool_input: dict[str, Any]) -> ToolOutcome:
@@ -610,17 +617,32 @@ class ToolExecutor:
             return unavailable("Name the music you want to play.")
         if args.get("selection", "exact") not in ("exact", "discover"):
             return unavailable("Music selection must be exact or discover.")
-        request = self.music.begin()
+        request = self.music.begin(args)
         try:
             result = await self.music.play(args, request)
             player = result["player"]
             self.last_entities = [(player.entity_id, player.name)]
             prefix = "Woke the TV first. " if result["woke"] else ""
-            outcome = ok(
-                f"{prefix}Playback requested for {result['title']} on {player.name}.",
-                details={"player": player.name, "media_id": result["media_id"]},
-                follow_up="The service accepted the request; audible playback is not verified. Do not submit it again.",
-            )
+            details = {"player": player.name, "media_id": result["media_id"], "native": result["native"]}
+            if result.get("already"):
+                outcome = ok(
+                    f"{result['title']} is already playing on {player.name}.",
+                    details=details,
+                    follow_up="Nothing changed; say it was already on, in a few words.",
+                )
+            elif result["verified"]:
+                # The TV itself reported the title playing in its Music app.
+                outcome = ok(
+                    f"{prefix}Playing {result['title']} on {player.name}.",
+                    details=details,
+                    follow_up="It is playing now: confirm in a few words and stop. Do not submit it again.",
+                )
+            else:
+                outcome = ok(
+                    f"{prefix}Playback requested for {result['title']} on {player.name}.",
+                    details=details,
+                    follow_up="The service accepted the request; audible playback is not verified. Do not submit it again.",
+                )
         except MusicClarification as err:
             outcome = ToolOutcome("needs_clarification", str(err), is_error=True)
         except MusicSuperseded:
@@ -954,6 +976,11 @@ class ToolExecutor:
                 return tvs[0]
             return await self._resolve_player(spec, kind=None)
         active = [p for p in players if p.state in ("playing", "paused", "buffering")]
+        # The TV's own Music app playing (the native route): pause, skip and
+        # volume belong to the TV, even though Music Assistant mirrors its state.
+        native = [p for p in active if p.kind == "tv" and p.app_id == MUSIC_APP]
+        if native:
+            return native[0]
         music_active = [p for p in active if p.kind == "music"]
         if music_active:
             return music_active[0]

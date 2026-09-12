@@ -56,6 +56,14 @@ class FakeHome:
     played: list[dict] = field(default_factory=list)
     media_commands: list[tuple[str, str]] = field(default_factory=list)
     launched: list[tuple[str, str]] = field(default_factory=list)
+    # The native Apple TV route: pages opened and keys pressed, and what the
+    # fake Music app then plays — `native_tracks` maps a page url to its rows
+    # (select alone plays the first; Down x n then select plays the nth).
+    launched_urls: list[tuple[str, str]] = field(default_factory=list)
+    remote_keys: list[tuple[str, list[str]]] = field(default_factory=list)
+    native_tracks: dict[str, list[str]] = field(default_factory=dict)
+    native_broken: bool = False  # keys land on nothing: the page never opened
+    _page: str | None = None
     extra_entities: list[dict] = field(
         default_factory=lambda: [
             {"entity_id": "climate.bedroom", "name": "Bedroom Thermostat", "state": "heat",
@@ -140,6 +148,25 @@ class FakeHome:
     async def launch_app(self, entity_id: str, app: str) -> None:
         self.launched.append((entity_id, app))
 
+    async def launch_url(self, entity_id: str, url: str) -> None:
+        self.launched_urls.append((entity_id, url))
+        self._page = None if self.native_broken else url
+
+    async def remote_commands(
+        self, remote_entity_id: str, commands: list[str], delay_s: float = 0.1
+    ) -> None:
+        self.remote_keys.append((remote_entity_id, list(commands)))
+        if self._page is None or "select" not in commands:
+            return
+        rows = self.native_tracks.get(self._page) or [self._page.rsplit("/", 1)[-1]]
+        downs = commands.count("down")
+        title = rows[min(downs, len(rows)) - 1] if downs else rows[0]
+        self.players = [
+            replace(p, state="playing", now_playing=title, app_id="com.apple.TVMusic")
+            if p.remote_entity == remote_entity_id else p
+            for p in self.players
+        ]
+
     async def music_library(
         self, media_type: str = "playlist", search: str | None = None, limit: int = 50
     ) -> list[dict]:
@@ -193,7 +220,8 @@ class FakeHome:
         ]
         rows += [
             {"entity_id": p.entity_id, "name": p.name, "state": p.state,
-             "domain": "media_player", "attributes": {}}
+             "domain": "media_player",
+             "attributes": {k: v for k, v in (("app_id", p.app_id), ("media_title", p.now_playing)) if v}}
             for p in self.players
         ]
         rows += self.extra_entities

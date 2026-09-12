@@ -183,9 +183,34 @@ class HomeAssistantClient:
                     kind="tv" if is_tv else "music",
                     apps=tuple(attrs.get("source_list") or ()),
                     now_playing=attrs.get("media_title"),
+                    remote_entity=f"remote.{suffix}" if is_tv else None,
+                    app_id=attrs.get("app_id") or None,
                 )
             )
         return sorted(players, key=lambda p: p.entity_id)
+
+    async def launch_url(self, entity_id: str, url: str) -> None:
+        """HomeApi: the Apple TV integration hands a url media type to pyatv's
+        launch_app, which the Companion protocol opens (verified live
+        2026-09-12: a music.apple.com page opens in the Music app in ~40 ms)."""
+        await self.call_service(
+            "media_player",
+            "play_media",
+            {"entity_id": entity_id, "media_content_id": url, "media_content_type": "url"},
+            timeout=10.0,
+        )
+
+    async def remote_commands(
+        self, remote_entity_id: str, commands: list[str], delay_s: float = 0.1
+    ) -> None:
+        """HomeApi: one remote.send_command call carries the whole key
+        sequence; Home Assistant spaces the presses by delay_secs."""
+        await self.call_service(
+            "remote",
+            "send_command",
+            {"entity_id": remote_entity_id, "command": list(commands), "delay_secs": delay_s},
+            timeout=10.0,
+        )
 
     async def play_music(
         self,

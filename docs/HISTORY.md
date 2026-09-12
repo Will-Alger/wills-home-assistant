@@ -66,6 +66,21 @@ engine was written as a subclass of the one that already knew the house.
 Same day she was running on it (`docs/LIVE-2026-09-11.md`); Will's ear
 decides the rest.
 
+## Music the way Siri does it (Sep 12)
+
+Will stopped choosing and started grading: "when Tony Stark says 'daddy's
+home', music starts in two or three seconds — the technical decisions are
+yours, the criteria are mine." The twenty-eight seconds were traced to the
+minute in Home Assistant's history and Music Assistant's own log: not the
+network, not AirPlay (a second), but MA's Apple Music provider getting audio
+out at all. So the route changed to the one Siri uses: Apple's public catalog
+resolves the title in 300 ms, the Apple TV opens the music.apple.com page in
+its own Music app, one remote command presses the keys (Down × track number,
+then select), and only the TV's reported title counts as "playing". Warm,
+under three seconds; "play *title* by *artist*" starts the moment the
+sentence ends, before the backend has spoken, and the backend's own call
+joins it (`docs/MUSIC-NATIVE-2026-09-12.md`).
+
 ## Standing truths from the journey
 
 - Will's field reports drove a dozen fixes; testing-in-the-room beats

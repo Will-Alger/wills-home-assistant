@@ -1700,6 +1700,9 @@ class RealtimeEngine:
         receipts: Any | None = None,
         fallbacks: SpokenFallbacks | None = None,
         music_destinations: dict[str, dict[str, str]] | None = None,
+        music_native: bool = True,
+        apple_storefront: str = "us",
+        music_native_ready_s: float = 0.9,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
         self._journal = journal  # what she did and saw, by day
@@ -1724,7 +1727,11 @@ class RealtimeEngine:
         # Proper names for the transcriber, warmed off the critical path.
         self.music_names = MusicNames(home)
         self._calendar = calendar
-        self._executor = ToolExecutor(home, calendar, web, routines, receipts, music_destinations)
+        self._executor = ToolExecutor(
+            home, calendar, web, routines, receipts, music_destinations,
+            music_native=music_native, apple_storefront=apple_storefront,
+            music_native_ready_s=music_native_ready_s,
+        )
         self._scheduler = scheduler  # timers/alarms/scheduled actions
         self._routines = routines  # deterministic defaults on tool calls
         self._thinker = thinker  # slow reasoning; answers arrive as events

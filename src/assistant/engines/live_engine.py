@@ -67,6 +67,8 @@ from assistant.engines.realtime_engine import (
 )
 from assistant.engines.transcripts import Segment, Segmenter
 from assistant.latency import TurnTrace
+from assistant.music import PLAY_WORD as _PLAY_WORD
+from assistant.music import parse_play_request
 
 LIVE_PRICE_PER_MIN = 0.05  # gpt-live-1, billed per second
 # per 1M tokens: input, cached input, output — the backend's share
@@ -258,6 +260,7 @@ class _LiveSession:
         self.user_seg_text = ""
         self.user_grew_at = 0.0
         self.user_judged: set[str] = set()
+        self.prewoke = False  # the TV was woken on a mid-sentence "play"
         self.speech_segments = 0
         self.user_turns = 0
         self.heard_speech = False
@@ -659,9 +662,48 @@ class _LiveSession:
         if not seg.closed:
             with contextlib.suppress(Exception):
                 self.ui.user_partial(seg.text)
+            self._maybe_prewake(seg.text)
             return
         self.user_seg_id = ""
         self._finish_user_turn(seg.text)
+
+    def _maybe_prewake(self, partial: str) -> None:
+        """"…play…" heard mid-sentence: wake the TV now, while he finishes.
+        The Apple TV needs about five seconds; the rest of his sentence and
+        the backend's decision cover most of it."""
+        if self.prewoke or not _PLAY_WORD.search(partial):
+            return
+        self.prewoke = True
+
+        async def wake() -> None:
+            with contextlib.suppress(Exception):
+                if await self.engine._executor.music.prewake():
+                    self._tap("prewake")
+                    self._note("woke the TV on “play”")
+
+        self._spawn(wake())
+
+    def _maybe_fast_start(self, text: str) -> None:
+        """"Play <title> by <artist>" is unmistakable: start it the moment his
+        sentence ends, before the backend has decided anything. The backend's
+        own play_music call for the same title joins the start already under
+        way (MusicCoordinator.begin), so nothing plays twice."""
+        intent = parse_play_request(text)
+        if intent is None or self.closing:
+            return
+        self._tap("fast_start", title=intent.title, artist=intent.artist, destination=intent.destination)
+
+        async def start() -> None:
+            try:
+                result = await self.engine._executor.music.fast_start(intent)
+            except Exception as err:  # noqa: BLE001 — the backend's own call is still coming
+                self._tap("fast_start_failed", error=str(err)[:120])
+                return
+            if result is not None:
+                self._tap("fast_started", title=result.get("title"), verified=result.get("verified"))
+                self._note(f"started {result.get('title')} before the backend answered")
+
+        self._spawn(start())
 
     def _judge_open_user(self) -> None:
         """His turn stopped growing for a beat: the phrases that need acting
@@ -693,6 +735,7 @@ class _LiveSession:
         if "settled" not in self.user_judged:
             self.user_judged.add("settled")
             self._judge(text)
+        self._maybe_fast_start(text)
 
     def _judge(self, text: str) -> None:
         now = time.monotonic()
@@ -748,6 +791,7 @@ class _LiveSession:
         elif kind == "response.output_item.done":
             item = inner.get("item") or {}
             if item.get("type") == "function_call":
+                self.engine._trace.first_call()
                 d.calls.append((str(item.get("call_id") or ""), str(item.get("name") or ""), str(item.get("arguments") or "")))
         elif kind == "response.completed":
             usage = (inner.get("response") or {}).get("usage") or {}

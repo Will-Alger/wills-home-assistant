@@ -266,6 +266,6 @@ def test_rows_stay_small_and_content_light(tmp_path: Path) -> None:
     assert set(row) <= {
         "kind", "turn", "ts", "session", "ended_by", "wake_score", "chime_enqueued",
         "chime_audible", "mic_ready", "connected", "first_speech", "speech_end",
-        "transcript_at", "first_audio", "playback_end", "tools", "interruptions",
+        "transcript_at", "first_call", "first_audio", "playback_end", "tools", "interruptions",
         "interrupt_gaps",
     }
