@@ -94,6 +94,7 @@ async def record_session(
     reflector: Any,
     timings: dict[str, Any] | None = None,
     context: Any = None,
+    unit: str = "",
 ) -> Any | None:
     """Close the session's row, journal it, then let reflection add the
     one-line summary (its fallback is the first thing the owner said).
@@ -114,6 +115,8 @@ async def record_session(
                 responses=stats.responses,
                 cost_usd=stats.cost_usd,
                 timings=timings or {},
+                transcript=list(stats.transcript),
+                unit=unit,
             )
     if journal is not None:
         with contextlib.suppress(Exception):

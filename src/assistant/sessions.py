@@ -36,6 +36,10 @@ class SessionRow:
     # The last turn's latency row (see latency.py), seconds from the wake:
     # kept here so "how fast were you?" can be answered off this row alone.
     timings: dict[str, Any] = field(default_factory=dict)
+    # What was said, [role, text] per line (you / alexa / event): the dashboard
+    # shows a conversation from this row alone, and feedback points at it.
+    transcript: list[list[str]] = field(default_factory=list)
+    unit: str = ""  # which set of ears heard it (the desktop today; the pucks later)
 
     @property
     def about(self) -> str:
@@ -56,7 +60,7 @@ def when_label(ts: float, now: float) -> str:
 
 
 class SessionLog:
-    def __init__(self, path: Path, *, keep: int = 50, now: Callable[[], float] = time.time) -> None:
+    def __init__(self, path: Path, *, keep: int = 400, now: Callable[[], float] = time.time) -> None:
         self._path = path
         self._keep = max(1, keep)
         self._now = now
@@ -108,6 +112,8 @@ class SessionLog:
         responses: int = 0,
         cost_usd: float = 0.0,
         timings: dict[str, Any] | None = None,
+        transcript: Iterable[tuple[str, str] | list[str]] = (),
+        unit: str = "",
     ) -> SessionRow | None:
         row = self.get(row_id)
         if row is None:
@@ -120,6 +126,9 @@ class SessionLog:
         row.responses = int(responses)
         row.cost_usd = float(cost_usd)
         row.timings = dict(timings or {})
+        row.transcript = [[str(role), " ".join(str(text).split())[:2000]] for role, text in transcript][:400]
+        if unit:
+            row.unit = str(unit)
         self._save()
         return row
 

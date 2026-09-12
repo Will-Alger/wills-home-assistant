@@ -1556,6 +1556,34 @@ LATENCY_TOOLS: list[dict[str, Any]] = [
 ]
 _LATENCY_TOOL_NAMES = {tool["name"] for tool in LATENCY_TOOLS}
 
+FEEDBACK_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "flag_conversation",
+        "description": (
+            "Record the owner's feedback about how a conversation went, in his "
+            "words, for the dashboard — 'flag that: she cut me off', 'note that "
+            "I wish you'd waited until I was done', 'that was perfect'. It "
+            "attaches to this conversation (or the previous one when he says "
+            "so). Never argue with the feedback; record it and say it's noted."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "what he said felt wrong or right, as he put it"},
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "any of: cut-off, no-reply, too-eager, too-slow, wrong-action, misheard, music, wake, style, praise, other",
+                },
+                "previous": {"type": "boolean", "description": "true when he means the conversation before this one"},
+            },
+            "required": ["text"],
+        },
+    },
+]
+_FEEDBACK_TOOL_NAMES = {tool["name"] for tool in FEEDBACK_TOOLS}
+
 
 def realtime_tools(*, calendar: bool = False) -> list[dict[str, Any]]:
     """Our Anthropic-shaped tool defs, converted to Realtime's function shape."""
@@ -1697,6 +1725,8 @@ class RealtimeEngine:
         cues: Any | None = None,
         panel: Any | None = None,
         latency: LatencyLog | None = None,
+        feedback: Any | None = None,
+        timeline: Any | None = None,
         receipts: Any | None = None,
         fallbacks: SpokenFallbacks | None = None,
         music_destinations: dict[str, dict[str, str]] | None = None,
@@ -1779,6 +1809,8 @@ class RealtimeEngine:
         self._latency = latency  # logs/turns.jsonl: how long each step took
         self._trace = TurnTrace()  # replaced per conversation; this one writes nothing
         self._panel = panel  # the desktop Settings panel she opens by voice
+        self._feedback = feedback  # what felt wrong, by voice ("flag that") or from the dashboard
+        self._timeline = timeline  # the always-on timeline: knows which session this is
         # A session recording (recording.py): the runner points `tap` at it,
         # and every decision below lands on its timeline while one runs.
         # None costs one attribute read per decision.
@@ -1947,6 +1979,8 @@ class RealtimeEngine:
             tools += PANEL_TOOLS
         if self._latency is not None:
             tools += LATENCY_TOOLS
+        if self._feedback is not None:
+            tools += FEEDBACK_TOOLS
         return tools
 
     async def _session_config(
@@ -2221,6 +2255,8 @@ class RealtimeEngine:
             pair = self._execute_panel_tool(name, args)
         elif name in _LATENCY_TOOL_NAMES:
             pair = self._execute_latency_tool(args)
+        elif name in _FEEDBACK_TOOL_NAMES:
+            pair = self._execute_feedback_tool(args)
         elif name in _BRAIN_TOOL_NAMES:
             pair = await self._execute_brain_tool(name, args)
         else:
@@ -2820,6 +2856,27 @@ class RealtimeEngine:
         except Exception as err:  # noqa: BLE001 — a window that won't open is a spoken sentence
             verb = "open" if name == "open_settings_panel" else "close"
             return f"couldn't {verb} the settings panel: {err}", True
+
+    def _execute_feedback_tool(self, args: dict[str, Any]) -> tuple[str, bool]:
+        """'Flag that: she cut me off' — his words, tagged, tied to this
+        conversation (or the one before), for the dashboard's feedback board."""
+        if self._feedback is None:
+            return "I'm not keeping feedback right now", True
+        text = str(args.get("text") or "").strip()
+        if not text:
+            return "say what felt wrong, or right", True
+        sessions: list[int] = []
+        current = getattr(self._timeline, "session", None) if self._timeline is not None else None
+        if isinstance(current, int):
+            sessions.append(current - 1 if args.get("previous") else current)
+        try:
+            item = self._feedback.add(text, tags=args.get("tags") or [], sessions=sessions, source="voice")
+        except Exception as err:  # noqa: BLE001 — feedback must never fail a turn
+            return f"couldn't save that: {err}", True
+        if item is None:
+            return "say what felt wrong, or right", True
+        where = f"conversation {sessions[0]}" if sessions else "no particular conversation"
+        return f"noted as feedback #{item.id} ({', '.join(item.tags) or 'untagged'}) on {where}", False
 
     def _execute_latency_tool(self, args: dict[str, Any]) -> tuple[str, bool]:
         """'How fast were you today?' — medians straight out of the turn log."""

@@ -93,6 +93,17 @@ tool learned its place: a one-shot command closes the conversation only if he
 has nothing more to say — his next sentence, even over her last word,
 withdraws the close.
 
+Late that night Will stopped and asked the harder question: *"how do I get
+to a point where the conversation feels seamless? I feel like I just keep
+churning on little things."* The honest answer (`docs/MEASURABLE-2026-09-12.md`)
+was that the churn was real and so was the progress, and that the way out was
+to measure instead of remember: the engine's decisions now land on an
+always-on timeline, every session keeps its words, anything that felt wrong
+becomes a tagged item ("flag that: she cut me off") that groups into a need,
+and a dashboard on localhost shows the five numbers that decide whether a
+week was better than the last — cut-offs, silences, wake misses, acks, music
+start. Next: fewer clocks, judged by those numbers; then the pucks.
+
 ## Standing truths from the journey
 
 - Will's field reports drove a dozen fixes; testing-in-the-room beats

@@ -41,6 +41,7 @@ from assistant.brain.thinker import Thinker
 from assistant.briefing import compose_briefing
 from assistant.config import code_root, home_dir, load_settings
 from assistant.context import WorkingContext
+from assistant.dashboard import Dashboard
 from assistant.delivery import Courier, DeliveryPolicy, DeliverySettings
 from assistant.dispatch import Dispatcher, load_extra_routines, migrate_cloud_routines
 from assistant.engines.live_engine import LiveEngine
@@ -51,6 +52,7 @@ from assistant.engines.realtime_engine import (
     downsample_24k_to_16k,
 )
 from assistant.events import EventWatcher, WatchStore
+from assistant.feedback import FeedbackStore
 from assistant.followups import FollowUpStore
 from assistant.home import HomeAssistantClient
 from assistant.home.fake import FakeHome
@@ -71,6 +73,7 @@ from assistant.sessions import SessionLog
 from assistant.status import AssistantStatus
 from assistant.tasks import TaskBoard
 from assistant.thoughts import ThoughtBook
+from assistant.timeline import Timeline
 from assistant.wake.detector import WakeDetector
 from assistant.web import WebSearch
 
@@ -134,7 +137,7 @@ _WAKE_TAIL_S = 0.1  # the last of "Alexa" itself may still be sounding when the 
 
 
 async def acknowledge_later(
-    cues, acks, speaker, mic, trace, *, wake_at: float, window_s: float, recorder=None
+    cues, acks, speaker, mic, trace, *, wake_at: float, window_s: float, tap=None
 ) -> float:
     """Answer the wake only if he stopped after it.
 
@@ -153,8 +156,8 @@ async def acknowledge_later(
     heard = getattr(mic, "heard_since", None)
     if heard is not None and heard(wake_at + _WAKE_TAIL_S, before=wake_at):
         trace.stamp("chime_enqueued")  # the moment the answer was decided, not spoken
-        if recorder is not None:
-            recorder.event("ack_skipped", reason="he kept talking")
+        if tap is not None:
+            tap("ack_skipped", reason="he kept talking")
         return 0.0
     at = speaker.enqueued
     spoken = acks.acknowledge(speaker, beat_s=0.0) if acks is not None else 0.0
@@ -165,8 +168,8 @@ async def acknowledge_later(
         mic.suspect_before(time.monotonic() + spoken + ECHO_TAIL_S)
     elif not (acks is not None and acks.silent):
         cues.wake_sound(speaker)  # no clip would load: the ding stands in
-    if recorder is not None:
-        recorder.event("acknowledged", seconds=round(spoken, 2))
+    if tap is not None:
+        tap("acknowledged", seconds=round(spoken, 2))
     return spoken
 
 
@@ -295,6 +298,11 @@ def build_engine(fake: bool):
         )
     delivery = DeliverySettings(root / "data" / "delivery.json")
     latency = LatencyLog(root / "logs" / "turns.jsonl")  # one row per turn, timings only
+    # Always on: every decision, line and tool with its session and unit
+    # (timeline.py); what felt wrong, by voice or from the dashboard (feedback.py).
+    timeline = Timeline(root / "logs" / "timeline.jsonl", unit=settings.unit_name)
+    feedback = FeedbackStore(root / "data" / "feedback.json")
+    dashboard_url = f"http://127.0.0.1:{settings.dashboard_port}/" if settings.dashboard_enabled else ""
     announcer.policy = DeliveryPolicy(
         quiet=announcer.is_quiet,
         presence=presence,
@@ -410,6 +418,7 @@ def build_engine(fake: bool):
         overrides,
         restart=request_restart,
         models_dir=code_root() / "models",
+        dashboard_url=dashboard_url,
         log=lambda m: console.print(f"[dim]{m}[/dim]"),
         on_audio_change=apply_audio,
         on_refresh_devices=rescan_audio,
@@ -481,6 +490,8 @@ def build_engine(fake: bool):
         cues=cues,
         panel=panel,
         latency=latency,
+        feedback=feedback,
+        timeline=timeline,
         fallbacks=fallbacks,
         **({} if live else {"speech_gate": settings.realtime_speech_gate}),
         **live_kwargs,
@@ -502,6 +513,16 @@ def build_engine(fake: bool):
     engine.panel = panel
     engine.recorder = recorder  # the runner taps the streams and the engine into it
     engine.latency = latency
+    engine.timeline = timeline
+    engine.feedback = feedback
+    engine.dashboard = (
+        Dashboard(
+            status=status, sessions_path=root / "data" / "sessions.json", turns_path=root / "logs" / "turns.jsonl",
+            timeline=timeline, feedback=feedback, unit=settings.unit_name, port=settings.dashboard_port,
+        )
+        if dashboard_url
+        else None
+    )
     engine.overrides = overrides
     engine.audio_reconfigure = False  # set when the mic/speaker choice changes
     pusher = None
@@ -656,6 +677,12 @@ async def voice(fake: bool) -> int:
         with contextlib.suppress(Exception):  # HA down at boot: keep what we knew
             await presence.sync(engine.home, boot=True)
         say(status, f"presence: {presence.describe()}", "dim")
+    dashboard = getattr(engine, "dashboard", None)
+    if dashboard is not None:
+        try:
+            say(status, f"dashboard: {dashboard.start()}", "dim")
+        except OSError as err:  # the port is taken (a staged build beside main): no dashboard, no crash
+            say(status, f"dashboard not started: {err}", "yellow")
     watcher = getattr(engine, "event_watcher", None)
     watcher_task = asyncio.create_task(watcher.run()) if watcher is not None else None
     scheduler = getattr(engine, "scheduler", None)
@@ -815,6 +842,12 @@ async def one_cycle(
         # every conversation, and every decision, on one timeline.
         mic.tap = recorder.mic
         speaker.tap = recorder.spoke
+    # The engine's decisions always land on the timeline; a running recording
+    # gets the same rows beside its audio.
+    timeline = getattr(engine, "timeline", None)
+    if timeline is not None:
+        engine.tap = timeline.tap(recorder.event if recorder is not None else None)
+    elif recorder is not None:
         engine.tap = recorder.event
     # Something to say already? Skip the wait and speak. Otherwise IDLE:
     # wake-gate on the open mic (local, free, private) while watching the
@@ -884,11 +917,11 @@ async def one_cycle(
     push = trigger == "ptt"
     if trace is None:
         trace = latency.wake(None)  # she opened this one: no wake word, no score
-    recording = recorder is not None and recorder.session_started(
-        "announce" if announcing else "ptt" if push else "wake"
-    )
-    if recording and trigger == "wake":
-        recorder.event(
+    if recorder is not None:  # a running recording lists this conversation in its summary
+        recorder.session_started("announce" if announcing else "ptt" if push else "wake")
+    tap = getattr(engine, "tap", None)
+    if trigger == "wake" and tap is not None:
+        tap(
             "wake", score=wake_score, threshold=settings.wake_threshold,
             effective=getattr(wake, "effective_threshold", None),
         )
@@ -904,13 +937,12 @@ async def one_cycle(
             window = acks.beat_s if acks is not None else settings.wake_ack_beat_s
             asyncio.create_task(acknowledge_later(
                 cues, acks, speaker, mic, trace,
-                wake_at=getattr(trace, "t0", time.monotonic()), window_s=window,
-                recorder=recorder if recording else None,
+                wake_at=getattr(trace, "t0", time.monotonic()), window_s=window, tap=tap,
             ))
         else:
             spoken = acknowledge(cues, acks, speaker, mic, trace)
-            if recording:
-                recorder.event("acknowledged", seconds=round(spoken, 2))
+            if tap is not None:
+                tap("acknowledged", seconds=round(spoken, 2))
     trace.stamp("mic_ready")  # both streams were open before the wake word
     session_wake.reset()
     if announcing:
@@ -926,6 +958,9 @@ async def one_cycle(
     if sessions is not None:
         with contextlib.suppress(Exception):
             row = sessions.start("announce" if announcing else "ptt" if push else "wake")
+    timeline = getattr(engine, "timeline", None)
+    if timeline is not None:
+        timeline.session_started(getattr(row, "id", None), "announce" if announcing else "ptt" if push else "wake")
     stats = await engine.run_conversation(
         mic, speaker, session_wake,
         ConsoleUi(settings.assistant_name, status), announce=announcing,
@@ -990,9 +1025,11 @@ async def one_cycle(
         + (f"{stats.seconds:.0f} s live · " if stats.seconds else "")
         + f"${stats.cost_usd:.4f} (${total_cost:.4f} session)",
     )
+    if timeline is not None:
+        timeline.session_ended(stats.ended_by, cost_usd=stats.cost_usd, replied=stats.replied)
     await record_session(
         sessions, getattr(engine, "journal", None), stats, row, None,
-        timings=trace.compact(), context=getattr(engine, "context", None),
+        timings=trace.compact(), context=getattr(engine, "context", None), unit=settings.unit_name,
     )
     if reflector is not None and stats.transcript:
         # Reflection is a Claude CLI call (seconds). It used to run here, in

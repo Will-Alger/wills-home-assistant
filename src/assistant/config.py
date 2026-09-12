@@ -76,6 +76,13 @@ class Settings(BaseSettings):
     apple_storefront: str = "us"  # the music.apple.com storefront the links open
     music_native_ready_s: float = 0.9  # page opened → first key press (twice that after a wake)
 
+    # The dashboard: sessions, one conversation's timeline, feedback and needs,
+    # the live log and the day's numbers, served on localhost by the runner.
+    # `unit_name` stamps every session and timeline row (the pucks come later).
+    dashboard_enabled: bool = True
+    dashboard_port: int = 8765
+    unit_name: str = "desktop"
+
     # Background Claude jobs (reflection, later dispatch) run through the
     # Claude Code CLI = billed to the Max SUBSCRIPTION, not API tokens.
     # Set false to fall back to the API key below.

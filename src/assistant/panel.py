@@ -147,9 +147,11 @@ class SettingsPanel:
         recorder: Any | None = None,
         player: Callable[[bytes, int], None] | None = None,
         stopper: Callable[[], None] | None = None,
+        dashboard_url: str = "",
     ) -> None:
         self._status = status
         self._overrides = overrides
+        self.dashboard_url = dashboard_url  # the web dashboard, when the runner serves one
         self._restart = restart
         self._models_dir = Path(models_dir) if models_dir else None
         self._view_factory = view_factory or _tk_view
@@ -636,6 +638,8 @@ class _TkPanel:
         self._record_button.pack(side="left")
         ttk.Button(debug, text="Recordings…", command=self._open_recordings).pack(side="left", padx=6)
         ttk.Button(debug, text="Test script…", command=self._open_script).pack(side="left")
+        if self._panel.dashboard_url:
+            ttk.Button(debug, text="Dashboard…", command=self._open_dashboard).pack(side="left", padx=6)
         self._rec_win: Any = None
         self._script_win: Any = None
 
@@ -648,7 +652,7 @@ class _TkPanel:
         self._message.grid(row=11, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
         ttk.Label(frame, text="Live log").grid(row=12, column=0, sticky="w")
-        self._feed = tk.Text(frame, height=14, width=64, wrap="none", state="disabled")
+        self._feed = tk.Text(frame, height=14, width=64, wrap="word", state="disabled")
         self._feed.grid(row=13, column=0, columnspan=3, sticky="nsew")
         scroll = ttk.Scrollbar(frame, orient="vertical", command=self._feed.yview)
         scroll.grid(row=13, column=3, sticky="ns")
@@ -660,6 +664,12 @@ class _TkPanel:
         self._tick_level()
 
     # recordings (Tk thread)
+
+    def _open_dashboard(self) -> None:
+        import webbrowser
+
+        with contextlib.suppress(Exception):
+            webbrowser.open(self._panel.dashboard_url)
 
     def _on_record(self) -> None:
         self._message.configure(text=self._panel.set_recording(not self._panel.recording))
