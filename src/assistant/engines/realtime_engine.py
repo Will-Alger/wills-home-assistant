@@ -159,17 +159,18 @@ steps. A tool that takes seconds (web_search, think, a merge) may get \
 
 You control the home through tools. No canned routines: interpret intent and \
 decide. Prefer area targets, and batch every lighting change into ONE \
-set_lights call. Music: browse_music finds music — scope 'library' for the \
-owner's own playlists, scope 'catalog' to search ALL of Apple Music ("find \
-me a jazz playlist" → catalog search "jazz" → play the returned uri). \
-Always play a uri from browse results when you have one — exact, never \
-mis-resolves. play_music also takes plain names \
-— for open-ended asks ("something chill") pick a fitting artist or track and \
-set radio_mode; starting can take a few seconds, so don't declare failure \
-hastily. If the speakers' TV is off, media_control turn_on the TV first, \
-then retry once. But if play_music TIMES OUT, never retry — the music \
-provider is rate-limited or busy and retries make it worse; relay the \
-error's advice instead. The TV can open apps via launch_app. The home holds \
+set_lights call. Music: act with ONE play_music call. For a named song, use \
+selection='exact' and pass the title, plus artist/album when given; use a \
+known URI if already available, never invent one. For 'find and play a jazz \
+playlist', use media_id='jazz', media_type='playlist', selection='discover'. \
+The tool finds music and prepares the selected TV concurrently: no preliminary \
+browse_music or turn_on call. Set fresh=true for 'something new'. Use browse_music \
+only when he wants options or library information, or has constraints too complex \
+for a simple search. Do not use radio_mode unless he requests similar-track radio. \
+A slow music request may receive ONE brief acknowledgment; this never means it \
+has started playing. If playback times out, check state before any retry; do not \
+guess the cause or repeat the play. 'Cancel the music' during preparation goes to \
+media_control action='stop'. The TV can open apps via launch_app. The home holds \
 MORE than the lights and media listed below — thermostats, switches, scenes, \
 sensors, weather: discover with search_entities, read with get_entity, act \
 via ha_call_service (the escape hatch — prefer the dedicated tools whenever \
@@ -1698,6 +1699,7 @@ class RealtimeEngine:
         latency: LatencyLog | None = None,
         receipts: Any | None = None,
         fallbacks: SpokenFallbacks | None = None,
+        music_destinations: dict[str, dict[str, str]] | None = None,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
         self._journal = journal  # what she did and saw, by day
@@ -1722,7 +1724,7 @@ class RealtimeEngine:
         # Proper names for the transcriber, warmed off the critical path.
         self.music_names = MusicNames(home)
         self._calendar = calendar
-        self._executor = ToolExecutor(home, calendar, web, routines, receipts)
+        self._executor = ToolExecutor(home, calendar, web, routines, receipts, music_destinations)
         self._scheduler = scheduler  # timers/alarms/scheduled actions
         self._routines = routines  # deterministic defaults on tool calls
         self._thinker = thinker  # slow reasoning; answers arrive as events
@@ -2127,6 +2129,8 @@ class RealtimeEngine:
         result_text, is_error = outcome.as_pair()
         self._trace.tool(call_name, time.monotonic() - call_started)
         self._tap("tool", name=call_name, seconds=round(time.monotonic() - call_started, 3), ok=not is_error)
+        if "music_trace" in outcome.details:
+            self._tap("music", **outcome.details["music_trace"])
         self._tools_in_play.append(call_name)  # scopes the memory she gets
         tool_hook = getattr(self, "_ui_tool_hook", None)
         if tool_hook is not None:
@@ -2146,6 +2150,7 @@ class RealtimeEngine:
                     data={
                         "args": args,
                         "ok": not is_error,
+                        **({"music_trace": outcome.details["music_trace"]} if "music_trace" in outcome.details else {}),
                         **({"routines": applied} if applied and not is_error else {}),
                     },
                 )

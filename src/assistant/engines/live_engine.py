@@ -105,6 +105,7 @@ _SETTLE_S = 0.8
 _DELEGATION_MAX_S = 90.0
 _START_TIMEOUT_S = 8.0
 _CLOSE_TIMEOUT_S = 2.0
+_MUSIC_ACK_S = 1.2
 _TICK_S = 0.05
 
 _STOP_LINE = (
@@ -695,6 +696,8 @@ class _LiveSession:
 
     def _judge(self, text: str) -> None:
         now = time.monotonic()
+        if normalise(text) in {"cancel the music", "cancel music", "stop the music", "never mind", "nevermind"}:
+            self.engine._executor.music.cancel_pending()
         if is_thinking(text):
             self.thinking_until = now + _THINKING_S
             self._tap("thinking", text=text, seconds=_THINKING_S)
@@ -705,6 +708,7 @@ class _LiveSession:
             self.wrapup_heard = True
             self._tap("wrapup", text=text)
         if is_stop_command(text):
+            self.engine._executor.music.cancel_pending()
             self._tap("stop_command", text=text)
             self.speaker.clear()
             self._end("stop command")
@@ -775,6 +779,18 @@ class _LiveSession:
             # the end tool ran; she may already have said goodbye, or be about to
             self.farewell_deadline = time.monotonic() + _FAREWELL_MAX_S
 
+    async def _music_ack(self, d: _Delegation) -> None:
+        """One acknowledgment for a slow music tool, never a claim of playback."""
+        await asyncio.sleep(_MUSIC_ACK_S)
+        request = self.engine._executor.music.active
+        if (request is None or request.cancelled.is_set() or self.user_turns != d.turn_at_start
+                or self.speaking_out or self.closing or self.wrapup_heard):
+            return
+        await self._send({
+            "type": "session.commentary.append", "delegation_id": None,
+            "content": "Music is still preparing. If you have not acknowledged this request, say only 'One moment.' Do not claim it is playing.",
+        })
+
     async def _run_calls(self, d: _Delegation) -> None:
         """The backend asked for tools: run them, hand back every output,
         then let it continue — as its own task, so the receiver keeps reading."""
@@ -810,7 +826,13 @@ class _LiveSession:
                         "follow_up": "Return a goodbye of a few words, nothing more; the conversation closes on its own.",
                     }
                 else:
-                    payload = await engine._run_call(name, arguments, stats, late_note)
+                    progress = asyncio.create_task(self._music_ack(d)) if name == "play_music" else None
+                    try:
+                        payload = await engine._run_call(name, arguments, stats, late_note)
+                    finally:
+                        if progress is not None:
+                            progress.cancel()
+                            await asyncio.gather(progress, return_exceptions=True)
                 await self._send(
                     {
                         "type": "response.item.create",

@@ -29,6 +29,7 @@ from assistant.calendar.base import (
 from assistant.config import code_root, home_dir
 from assistant.dispatch import NO_WINDOW
 from assistant.home.base import RGB_CAPABLE_MODES, HomeApi, Light, LightCommand
+from assistant.music import MusicClarification, MusicCoordinator, MusicSuperseded
 from assistant.receipts import ActionReceipt, EntityOutcome, ReceiptBook
 
 # Her own codebase: the checkout this code runs from (main or a staged
@@ -108,8 +109,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "Find music. scope='library' (default) lists the owner's own "
             "playlists/artists/albums — use for 'what playlists do I have'. "
             "scope='catalog' searches the ENTIRE streaming catalog (Apple "
-            "Music) — use for discovery like 'find me a jazz playlist' or "
-            "anything not in the library; it requires a search term. Results "
+            "Music) — use when the owner asks for options without playback; "
+            "it requires a search term. For find-AND-play use play_music with "
+            "selection='discover' in one call instead. Results "
             "include a uri: pass it as play_music's media_id for an exact "
             "match, no name guessing."
         ),
@@ -130,11 +132,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "play_music",
         "description": (
             "Play music via Music Assistant (Apple Music behind it). media_id "
-            "is a name OR — better — a uri from browse_music results (exact, "
-            "never mis-resolves). Use radio_mode for open-ended vibes ('play "
-            "something relaxing' → a fitting artist/track + radio_mode). Omit "
-            "player to use the default music player. Unsure what exists? "
-            "browse_music first (library or catalog scope)."
+            "is an exact title or a known URI. For 'find and play a jazz playlist', "
+            "call THIS tool once with media_id='jazz', media_type='playlist', "
+            "selection='discover': it searches, picks a relevant result and plays. "
+            "No preliminary browse or TV power call is needed. For a named song use "
+            "selection='exact', with artist/album when given. Never invent a URI. "
+            "Use fresh=true when asked for something new. Reserve radio_mode for "
+            "an explicit request for similar-track radio. Omit player for the default."
         ),
         "input_schema": {
             "type": "object",
@@ -148,6 +152,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "album": {"type": "string"},
                 "enqueue": {"type": "string", "enum": ["play", "replace", "next", "add"]},
                 "radio_mode": {"type": "boolean", "description": "auto-continue with similar music"},
+                "selection": {"type": "string", "enum": ["exact", "discover"],
+                              "description": "exact title (default), or choose from a catalog search"},
+                "fresh": {"type": "boolean", "description": "bypass a previous discovery choice"},
                 "player": {"type": "string", "description": "player name or entity_id"},
             },
             "required": ["media_id", "media_type"],
@@ -403,6 +410,7 @@ class ToolExecutor:
         web: Any | None = None,
         routines: Any | None = None,
         receipts: ReceiptBook | None = None,
+        music_destinations: dict[str, dict[str, str]] | None = None,
     ) -> None:
         self._web = web  # WebSearch, or None when no key is configured
         self._routines = routines  # RoutineStore: deterministic defaults/overrides
@@ -414,6 +422,7 @@ class ToolExecutor:
         # working context binds "it" and "that" to these (context.py).
         self.last_entities: list[tuple[str, str]] = []
         self._home = home
+        self.music = MusicCoordinator(home, destinations=music_destinations)
         self._calendar = calendar
 
     async def run(self, name: str, tool_input: dict[str, Any]) -> ToolOutcome:
@@ -454,33 +463,7 @@ class ToolExecutor:
             if name == "undo_last":
                 return await self._undo_last()
             if name == "play_music":
-                player = await self._resolve_player(tool_input.get("player"), kind="music")
-                woke = await self._wake_tv_if_off()
-                media_id = str(tool_input["media_id"])
-                media_type = str(tool_input.get("media_type", "playlist"))
-                try:
-                    await self._home.play_music(
-                        player.entity_id,
-                        media_id,
-                        media_type,
-                        artist=tool_input.get("artist"),
-                        album=tool_input.get("album"),
-                        enqueue=tool_input.get("enqueue"),
-                        radio_mode=bool(tool_input.get("radio_mode", False)),
-                    )
-                except Exception as err:  # noqa: BLE001 — enrich with real names
-                    # A failed play is usually a name the library can't resolve.
-                    # Hand back what actually exists so the retry can succeed.
-                    detail = str(err) or type(err).__name__
-                    return unavailable(
-                        f"play failed: {detail}.{await self._media_hint(media_id, media_type)}"
-                    )
-                self.last_entities = [(player.entity_id, player.name)]
-                note = "Woke the TV first. " if woke else ""
-                return ok(
-                    f"{note}Started on {player.name} (audio may take a few seconds to begin).",
-                    details={"player": player.name, "media_id": media_id},
-                )
+                return await self._play_music(tool_input)
             if name == "browse_music":
                 media_type = str(tool_input.get("media_type", "playlist"))
                 search = tool_input.get("search")
@@ -498,6 +481,7 @@ class ToolExecutor:
                             "the catalog found nothing for that — try different words",
                             is_error=False,
                         )
+                    self.music.catalog.observe(items)
                     return ok(json.dumps(items)[:2500])
                 items = await self._home.music_library(
                     media_type=media_type,
@@ -511,11 +495,15 @@ class ToolExecutor:
                         "Apple Music instead",
                         is_error=False,
                     )
+                self.music.catalog.observe(items)
                 return ok(json.dumps(items)[:2500])
             if name == "media_control":
                 action = str(tool_input["action"])
+                cancelled = self.music.cancel_pending() if action in ("stop", "pause") else False
                 player = await self._media_target(tool_input.get("player"), action)
                 if player is None:
+                    if cancelled:
+                        return ok("Cancelled the music that was still preparing.")
                     # A refusal she simply says — never a tool failure.
                     return unavailable(
                         "nothing is playing right now — say what to play instead",
@@ -616,6 +604,36 @@ class ToolExecutor:
                 # than leaving dead air while the model reads "Tool failed".
                 return unavailable(detail, details={"home_unreachable": True})
             return unavailable(detail)
+
+    async def _play_music(self, args: dict[str, Any]) -> ToolOutcome:
+        if not str(args.get("media_id") or "").strip():
+            return unavailable("Name the music you want to play.")
+        if args.get("selection", "exact") not in ("exact", "discover"):
+            return unavailable("Music selection must be exact or discover.")
+        request = self.music.begin()
+        try:
+            result = await self.music.play(args, request)
+            player = result["player"]
+            self.last_entities = [(player.entity_id, player.name)]
+            prefix = "Woke the TV first. " if result["woke"] else ""
+            outcome = ok(
+                f"{prefix}Playback requested for {result['title']} on {player.name}.",
+                details={"player": player.name, "media_id": result["media_id"]},
+                follow_up="The service accepted the request; audible playback is not verified. Do not submit it again.",
+            )
+        except MusicClarification as err:
+            outcome = ToolOutcome("needs_clarification", str(err), is_error=True)
+        except MusicSuperseded:
+            outcome = unavailable("The pending music request was cancelled or replaced; it was not played.", is_error=False)
+        except Exception as err:  # noqa: BLE001 — never retry an uncertain mutation
+            outcome = unavailable(
+                f"Music request failed: {str(err) or type(err).__name__}",
+                follow_up=("Playback may still start. Check the queue/player before another play call; do not retry blindly."
+                           if request.submitted else "No playback was submitted. Explain the issue briefly."),
+            )
+        request.stamp("finished")
+        outcome.details["music_trace"] = request.details()
+        return outcome
 
     async def _set_lights(self, tool_input: dict[str, Any]) -> ToolOutcome:
         lights = await self._home.get_lights()
@@ -948,23 +966,6 @@ class ToolExecutor:
         if spec:
             return await self._resolve_player(spec, kind=None)
         return None
-
-    async def _media_hint(self, media_id: str, media_type: str) -> str:
-        """Closest real names from the library, for retrying a failed play."""
-        import difflib
-
-        try:
-            items = await self._home.music_library(media_type=media_type, limit=100)
-        except Exception:  # noqa: BLE001 — a hint must never mask the real error
-            return ""
-        names = [i.get("name", "") for i in items if i.get("name")]
-        if not names:
-            return ""
-        close = difflib.get_close_matches(media_id, names, n=5, cutoff=0.3) or names[:8]
-        return (
-            f" The library's actual {media_type}s include: {', '.join(close)} — "
-            "retry play_music with one exact name."
-        )
 
     async def _resolve_player(self, spec, kind: str | None):
         """Pick a media player by name/entity_id fragment; default by kind."""

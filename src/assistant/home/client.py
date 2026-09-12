@@ -219,11 +219,9 @@ class HomeAssistantClient:
             # is stuck (provider rate-limited or mid-sync; Spotify penalties
             # ran ~1 hour and retries reset them — see FEATURES.md music row).
             raise HomeAssistantError(
-                "the music system did not confirm playback within 30s — the "
-                "music provider is likely rate-limited or busy syncing. DO NOT "
-                "retry immediately (retries can extend provider penalties). "
-                "Tell the owner honestly and suggest trying again in a few "
-                "minutes"
+                "the music service did not confirm the request within 30s. "
+                "Playback may still start. Do not retry immediately; check "
+                "the player or queue before sending another play command"
             ) from err
 
     _MEDIA_COMMANDS: typing.ClassVar[dict[str, str]] = {
@@ -339,6 +337,8 @@ class HomeAssistantClient:
             "media_type": i.get("media_type", media_type),
             "uri": i.get("uri", ""),
             "artists": [a.get("name") for a in i.get("artists", [])] or None,
+            "album": (i["album"].get("name") if isinstance(i.get("album"), dict)
+                      else i.get("album")),
         }
 
     async def _ensure_ma_entry(self) -> None:

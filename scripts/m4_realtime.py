@@ -399,6 +399,7 @@ def build_engine(fake: bool):
         voice=settings.realtime_voice,
         home=home,
         owner=settings.owner_name,
+        music_destinations=settings.music_destinations,
         name=settings.assistant_name,
         wake_phrase=settings.wake_phrase,
         idle_timeout_s=settings.realtime_idle_timeout_s,

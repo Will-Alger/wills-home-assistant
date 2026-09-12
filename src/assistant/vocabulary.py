@@ -17,6 +17,7 @@ from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
 from assistant.home.base import HomeApi, Light, MediaPlayer
+from assistant.music import catalog_for
 
 MAX_VOCABULARY_CHARS = 1000
 _MAX_NAME_CHARS = 60  # a sentence-long task title helps no transcriber
@@ -136,6 +137,7 @@ class MusicNames:
             items = await self._home.music_library(media_type=media_type, limit=self._limit)
         except Exception:  # noqa: BLE001 — no music library is not a session failure
             return []
+        catalog_for(self._home).observe(items or [])
         return [
             str(item.get("name", ""))
             for item in items or ()
