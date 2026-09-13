@@ -312,8 +312,10 @@ silence while she plays, with the wake word as the interrupt (`LIVE_ECHO_POLICY`
 
 **The dashboard** (`http://127.0.0.1:8765`, `DASHBOARD_PORT`, since
 2026-09-12 — see `docs/MEASURABLE-2026-09-12.md`) is where a session is judged:
-every conversation with its transcript and its decisions in seconds, a flag
-form with tags ("she cut me off", "too eager"), the feedback and needs boards,
+the Live tab shows the conversation as it happens, every past conversation has
+its transcript and decisions in seconds, and on either you click the first and
+the last line of the part you mean to flag it with a note and tags ("she cut
+me off", "too eager") — the excerpt is saved with it; the feedback and needs boards,
 the live log, and the week's numbers — cut-offs, silences, wake misses, acks,
 music start. By voice, "flag that: …" records feedback on the conversation
 it was said in. The Settings panel's Dashboard button opens it. Everything it

@@ -54,6 +54,10 @@ class Item:
     source: str = "dashboard"  # dashboard | voice
     unit: str = ""
     updated: float = 0.0
+    # The part of the conversation he meant: the lines he selected (first to
+    # last, everything between), and the timeline stamps that bound them.
+    excerpt: str = ""
+    range: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -112,7 +116,8 @@ class FeedbackStore:
     # ── items ──────────────────────────────────────────────────────────────
 
     def add(self, text: str, *, tags: Iterable[str] | None = None, sessions: Iterable[int] | None = None,
-            source: str = "dashboard", unit: str = "") -> Item | None:
+            source: str = "dashboard", unit: str = "", excerpt: str = "",
+            range: dict[str, Any] | None = None) -> Item | None:
         text = _clean(text)
         if not text:
             return None
@@ -121,6 +126,8 @@ class FeedbackStore:
                 id=self._next_item, created=self._now(), text=text, tags=_tags(tags),
                 sessions=sorted({int(s) for s in (sessions or ()) if str(s).lstrip("-").isdigit()}),
                 source=source, unit=unit, updated=self._now(),
+                excerpt=str(excerpt or "")[:2000],
+                range={k: v for k, v in (range or {}).items() if k in ("from_ts", "to_ts", "lines")},
             )
             self._next_item += 1
             self._items.append(item)

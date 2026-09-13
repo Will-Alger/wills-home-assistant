@@ -76,7 +76,8 @@ def rig(tmp_path):
 def test_the_routes_read_the_stores_and_write_feedback(tmp_path) -> None:
     dash, feedback, sid, promoted = rig(tmp_path)
     code, page, kind = dash.handle("GET", "/")
-    assert code == 200 and kind.startswith("text/html") and b"Flag this conversation" in page
+    assert code == 200 and kind.startswith("text/html")
+    assert b"Save feedback" in page and b'data-tab="live"' in page and b".hidden{display:none!important}" in page
     code, state, _ = dash.handle("GET", "/api/state")
     assert code == 200 and state["unit"] == "desktop" and state["mic"] == "Snowball" and "log" not in state
     code, listing, _ = dash.handle("GET", "/api/sessions?limit=5")
@@ -85,8 +86,15 @@ def test_the_routes_read_the_stores_and_write_feedback(tmp_path) -> None:
     assert code == 200 and one["session"]["transcript"] == [["you", "play back in black"], ["alexa", "On it."]]
     assert [e["kind"] for e in one["events"]] == ["session", "you_said", "session"] and one["turns"][0]["turn"] == 0
     assert dash.handle("GET", "/api/session/999")[0] == 404
-    code, item, _ = dash.handle("POST", "/api/feedback", json.dumps({"text": "she cut me off", "tags": ["cut-off"], "sessions": [sid]}).encode())
+    code, item, _ = dash.handle("POST", "/api/feedback", json.dumps({
+        "text": "she cut me off", "tags": ["cut-off"], "sessions": [sid],
+        "excerpt": "you: play back in black\nalexa: On it.", "range": {"from_ts": 501.0, "to_ts": 501.0, "junk": 1},
+    }).encode())
     assert code == 201 and item["status"] == "new" and item["sessions"] == [sid]
+    assert item["excerpt"].startswith("you: play") and item["range"] == {"from_ts": 501.0, "to_ts": 501.0}
+    code, rows, _ = dash.handle("GET", f"/api/timeline?session={sid}&limit=10")
+    assert code == 200 and [r["kind"] for r in rows["rows"]] == ["session", "you_said", "session"]
+    assert state.get("last_session") == sid or dash.handle("GET", "/api/state")[1]["last_session"] == sid
     assert dash.handle("POST", "/api/feedback", b'{"text": ""}')[0] == 400
     assert dash.handle("POST", "/api/feedback", b"not json")[0] == 400
     code, listing, _ = dash.handle("GET", "/api/sessions")
