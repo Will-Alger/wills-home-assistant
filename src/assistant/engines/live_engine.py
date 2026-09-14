@@ -137,8 +137,11 @@ What you know and what you do: you know nothing about the home, the lights, the 
 calendar, timers, reminders, his memory, his projects or the web, and you act on none of it \
 yourself. Anything that needs a fact, a lookup or an action goes to your backend AT ONCE, \
 before you speak — at most one short word while it works. When his command came in the same \
-breath as your name, a brief "Sure thing" or "On it" is the whole acknowledgment; when he says \
-only your name and waits, answer "Yes?" and wait. Say its answer once, in one breath, \
+breath as your name, a brief "Sure thing" or "On it" is the whole acknowledgment. The \
+conversation opens on your name: if the first thing you hear is only your name, answer with a \
+single "Yes?" or "Mm-hm?" and wait — no remark on how it was said, no question about what \
+happened, nothing more until he speaks. If you did not hear your name at all, or only a stray \
+word or a noise, say nothing and wait. Say its answer once, in one breath, \
 in your own words, never the mechanics ("done", not "I've called the tool"). Never claim \
 something is done, set or found before the backend says so; if it says pending, say it is \
 underway and carry on. A bit of chat, or a question the conversation itself answers, needs \
@@ -1230,7 +1233,12 @@ class _LiveSession:
 
 _WARM_MAX_AGE_S = 240.0  # a held socket is replaced after this long
 _WARM_RETRY_S = 5.0  # after a failed connect
-_WAKE_BACKLOG_S = 1.2  # how far before the wake the replayed microphone reaches ("Alexa" itself)
+_WAKE_BACKLOG_S = 0.9  # how far before the wake the replayed microphone reaches: "Alexa" itself, little before it
+# A wake the detector was less sure of than this gets the clip, not the model,
+# and nothing is replayed: a false trigger then costs one "Yes?" and a quiet
+# close, never a reply to whatever the room was saying (the first warm session
+# answered "oh shit", replayed from a 0.56 wake).
+CONFIDENT_WAKE = 0.6
 
 
 class WarmSocket:
@@ -1309,6 +1317,11 @@ class LiveEngine(RealtimeEngine):
         """A socket is held open: the model, not a clip, answers the wake."""
         warm = getattr(self, "_warm", None)
         return warm is not None and warm.ready
+
+    def answers_wake(self, score: float | None) -> bool:
+        """Whether the model answers this wake itself: a held socket, and a
+        detector sure enough of the word for its audio to be worth replaying."""
+        return self.warm_ready and (score is None or float(score) >= CONFIDENT_WAKE)
 
     # The runner answers a wake only after a beat of quiet: on full duplex a
     # command in the same breath as her name needs no "Yes?" (m4_realtime.acknowledge_later).
@@ -1443,7 +1456,8 @@ class LiveEngine(RealtimeEngine):
                     self, conn, mic, speaker, wake, ui, stats,
                     announce=announce, ptt=ptt, ptt_session=ptt_session,
                 )
-                session.warm = True
+                score = getattr(self._trace, "wake_score", None)
+                session.warm = not announce and (score is None or float(score) >= CONFIDENT_WAKE)
                 try:
                     await session.run(items)
                     return stats

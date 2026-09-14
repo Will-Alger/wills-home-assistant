@@ -142,6 +142,7 @@ async def test_the_session_she_starts_with() -> None:
     assert "set_lights" in names and "end_conversation" in names
     live, back = cfg["instructions"], backend["responses"]["instructions"]
     assert "stop mid-word" in live and 'Never say the word "alexa"' in live and "backend" in live
+    assert "say nothing and wait" in live and "no remark on how it was said" in live  # her name alone: one "Yes?"
     assert "Hallway" not in live  # the voice knows no devices: that is the backend's world
     assert back.startswith("You are the reasoning and tool backend of Alexa") and "Hallway" in back
     assert "the function call comes FIRST" in back  # today's tool rules, unchanged, on the backend
@@ -361,6 +362,7 @@ async def test_a_held_socket_carries_the_wake_and_is_replaced_afterwards(monkeyp
                 break
             await asyncio.sleep(0.01)
         assert warm.ready and engine.warm_ready and client.connects == 1
+        assert engine.answers_wake(0.98) and engine.answers_wake(None) and not engine.answers_wake(0.56)
         conn = client.connection
 
         async def owner() -> None:

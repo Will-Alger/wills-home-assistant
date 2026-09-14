@@ -944,9 +944,11 @@ async def one_cycle(
         # full-duplex engine waits a beat first, and answers only if he did
         # not just keep talking (acknowledge_later).
         acks = getattr(engine, "acks", None)
-        if trigger == "wake" and getattr(engine, "warm_ready", False):
-            # A socket is already open: the model hears his "Alexa" itself and
-            # answers it in its own voice within about a second — no clip.
+        answers = getattr(engine, "answers_wake", None)
+        if trigger == "wake" and answers is not None and answers(wake_score):
+            # A socket is already open and the detector was sure: the model
+            # hears his "Alexa" itself and answers in its own voice within
+            # about a second — no clip. A weaker wake gets the clip as before.
             cues.start(speaker, sound=False)
             trace.stamp("chime_enqueued")
             if tap is not None:

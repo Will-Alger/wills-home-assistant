@@ -115,6 +115,13 @@ class TurnTrace:
     def audio_delta(self) -> None:
         self.stamp("first_audio")
 
+    @property
+    def wake_score(self) -> float | None:
+        """How sure the detector was of the wake that opened this trace
+        (None: a push-to-talk or an announcement opened it, or a later turn)."""
+        score = self._row.get("wake_score") if self._row.get("turn") == 0 else None
+        return None if score is None else float(score)
+
     def first_call(self) -> None:
         """The backend's first tool call of the turn arrived — how long the
         model took to decide, before any tool ran."""
