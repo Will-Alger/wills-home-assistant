@@ -42,10 +42,14 @@ class FakeLiveConnection:
         self.reject_start: dict[str, str] | None = None  # {"message", "code", "param"} instead of started
         self.seconds = 0.0  # what session.closed reports
         self.on_response_create: Any = None  # called with the connection after each response.create
+        self.dead_once = False  # the next send fails as a dropped socket does (then it works again)
 
     # ── what the engine sends ──────────────────────────────────────────────
 
     async def send(self, event: dict[str, Any]) -> None:
+        if self.dead_once:
+            self.dead_once = False
+            raise ConnectionError("the socket was closed while it was held")
         self.sent.append(event)
         kind = event["type"]
         if kind == "session.start":

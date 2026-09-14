@@ -252,6 +252,11 @@ class Settings(BaseSettings):
     # The local Silero gate while she is silent (speech or clean silence to
     # the server, never the room). Off while she talks in duplex mode.
     live_speech_gate: bool = True
+    # A socket connected while she is idle (not billed until the wake starts
+    # it): the model answers its own name in about a second, in the tone it
+    # was said, instead of a clip. Replaced every live_warm_max_age_s.
+    live_warm_socket: bool = True
+    live_warm_max_age_s: float = 240.0
     live_store: bool = False  # keep the recording on OpenAI's side for 30 days (forking); off
 
     # What the wake word (and a push-to-talk press) is answered with, before

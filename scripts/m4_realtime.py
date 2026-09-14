@@ -44,7 +44,7 @@ from assistant.context import WorkingContext
 from assistant.dashboard import Dashboard
 from assistant.delivery import Courier, DeliveryPolicy, DeliverySettings
 from assistant.dispatch import Dispatcher, load_extra_routines, migrate_cloud_routines
-from assistant.engines.live_engine import LiveEngine
+from assistant.engines.live_engine import LiveEngine, WarmSocket
 from assistant.engines.realtime_engine import (
     FRAME_SAMPLES_24K,
     REALTIME_RATE,
@@ -523,6 +523,13 @@ def build_engine(fake: bool):
         if dashboard_url
         else None
     )
+    # GPT-Live: a socket held open while she is idle, so the wake word goes to
+    # the model at once and the model answers its own name (live_engine.WarmSocket).
+    engine._warm = (
+        WarmSocket(engine._client, max_age_s=settings.live_warm_max_age_s, log=lambda text: say(status, text, "yellow"))
+        if live and settings.live_warm_socket
+        else None
+    )
     engine.overrides = overrides
     engine.audio_reconfigure = False  # set when the mic/speaker choice changes
     pusher = None
@@ -685,6 +692,10 @@ async def voice(fake: bool) -> int:
             say(status, f"dashboard not started: {err}", "yellow")
     watcher = getattr(engine, "event_watcher", None)
     watcher_task = asyncio.create_task(watcher.run()) if watcher is not None else None
+    warm = getattr(engine, "_warm", None)
+    warm_task = asyncio.create_task(warm.run()) if warm is not None else None
+    if warm_task is not None:
+        say(status, "warm socket: on — the model answers the wake in its own voice; the clips stand by", "dim")
     scheduler = getattr(engine, "scheduler", None)
     scheduler_task = asyncio.create_task(scheduler.run()) if scheduler is not None else None
     courier = getattr(engine, "courier", None)
@@ -933,7 +944,14 @@ async def one_cycle(
         # full-duplex engine waits a beat first, and answers only if he did
         # not just keep talking (acknowledge_later).
         acks = getattr(engine, "acks", None)
-        if trigger == "wake" and getattr(engine, "defers_ack", False):
+        if trigger == "wake" and getattr(engine, "warm_ready", False):
+            # A socket is already open: the model hears his "Alexa" itself and
+            # answers it in its own voice within about a second — no clip.
+            cues.start(speaker, sound=False)
+            trace.stamp("chime_enqueued")
+            if tap is not None:
+                tap("ack_by_model")
+        elif trigger == "wake" and getattr(engine, "defers_ack", False):
             window = acks.beat_s if acks is not None else settings.wake_ack_beat_s
             asyncio.create_task(acknowledge_later(
                 cues, acks, speaker, mic, trace,

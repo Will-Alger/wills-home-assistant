@@ -308,6 +308,11 @@ microphone is learned during her first reply: small (headphones, wired) and
 it is true full duplex; loud (the Echo Dot beside the mic) and she feeds
 silence while she plays, with the wake word as the interrupt (`LIVE_ECHO_POLICY`).
 `scripts/live_probe.py` is a 25-second bare session for checking the room.
+Since 2026-09-13 a socket is kept connected while she is idle
+(`LIVE_WARM_SOCKET`, not billed until the wake starts it), so she answers her
+own name in about a second, in the tone you used; the rendered clips
+(`scripts/render_acks.py --live --delivery curious --takes 3`) are the fallback
+for the boot and for a socket the server dropped.
 `VOICE_ENGINE=realtime` brings the engine above back.
 
 **The dashboard** (`http://127.0.0.1:8765`, `DASHBOARD_PORT`, since

@@ -346,6 +346,71 @@ async def test_an_end_tool_with_no_goodbye_gets_asked_for_one_then_closes_anyway
     assert mod._GOODBYE_LINE in conn.commentary()  # she was asked; the close did not wait forever
 
 
+async def test_a_held_socket_carries_the_wake_and_is_replaced_afterwards(monkeypatch) -> None:
+    """The socket connected while she was idle is the one the conversation
+    starts on — no connect at the wake — and once it is over the holder has
+    the next one ready."""
+    quick(monkeypatch)
+    engine, client, ui = make()
+    warm = mod.WarmSocket(client, max_age_s=5)
+    engine._warm = warm
+    holder = asyncio.create_task(warm.run())
+    try:
+        for _ in range(100):
+            if warm.ready:
+                break
+            await asyncio.sleep(0.01)
+        assert warm.ready and engine.warm_ready and client.connects == 1
+        conn = client.connection
+
+        async def owner() -> None:
+            await asyncio.sleep(0.1)
+            conn.owner_says("that's all")
+
+        turn = asyncio.create_task(owner())
+        stats = await asyncio.wait_for(engine.run_conversation(NeverMic(), InstantSpeaker(), None, ui), 8)
+        await turn
+        assert stats.ended_by == "wrap-up"
+        assert client.connects == 1 and warm.uses == 1  # the held socket carried it
+        for _ in range(100):
+            if client.connects == 2 and warm.ready:
+                break
+            await asyncio.sleep(0.01)
+        assert client.connects == 2 and warm.ready  # the next wake has its socket already
+    finally:
+        holder.cancel()
+        await asyncio.gather(holder, return_exceptions=True)
+
+
+async def test_a_dead_held_socket_falls_back_to_connecting_cold(monkeypatch) -> None:
+    quick(monkeypatch)
+    engine, client, ui = make()
+    warm = mod.WarmSocket(client, max_age_s=5)
+    engine._warm = warm
+    holder = asyncio.create_task(warm.run())
+    try:
+        for _ in range(100):
+            if warm.ready:
+                break
+            await asyncio.sleep(0.01)
+        conn = client.connection
+        conn.dead_once = True  # the server dropped it quietly while it was held
+
+        async def owner() -> None:
+            await asyncio.sleep(0.15)
+            conn.owner_says("that's all")
+
+        turn = asyncio.create_task(owner())
+        stats = await asyncio.wait_for(engine.run_conversation(NeverMic(), InstantSpeaker(), None, ui), 8)
+        await turn
+        assert stats.ended_by == "wrap-up"
+        assert warm.uses == 1 and client.connects >= 2  # the cold connect carried it
+        assert any("connecting cold" in n for n in ui.notes)
+    finally:
+        holder.cancel()
+        await asyncio.gather(holder, return_exceptions=True)
+
+
 async def test_thats_all_closes_after_her_closing_word(monkeypatch) -> None:
     quick(monkeypatch)
     engine, client, ui = make()

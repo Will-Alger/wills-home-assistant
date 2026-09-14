@@ -232,6 +232,26 @@ def test_a_typo_in_the_setting_is_a_note_not_a_silent_wake() -> None:
     assert blank.note() == ""
 
 
+def test_several_takes_of_a_line_are_all_used_and_never_repeated_back_to_back(tmp_path) -> None:
+    """The same words said more than one way (yes.wav, yes-2.wav, yes-3.wav):
+    a wake gets one of them at random, never the take that answered the last."""
+    one = (ack_dir() / "yes.wav").read_bytes()
+    (tmp_path / "yes.wav").write_bytes(one)
+    (tmp_path / "yes-2.wav").write_bytes(one)
+    (tmp_path / "yes-3.wav").write_bytes(one)
+    (tmp_path / "yes-sir.wav").write_bytes((ack_dir() / "yes-sir.wav").read_bytes())  # not a take of "yes"
+    acks = WakeAcks(tmp_path, rng=random.Random(5))
+    assert acks.takes("yes") == 3 and acks.takes("yes-sir") == 1 and acks.takes("sir") == 0
+    assert len(acks.missing()) == len(PHRASES) - 2
+    speaker = FakeSpeaker()
+    takes = []
+    for _wake in range(30):
+        acks.acknowledge(speaker)
+        takes.append(acks.last_take)
+    assert {t for s, t in takes if s == "yes"} == {0, 1, 2}
+    assert all(a != b for a, b in pairwise(takes))
+
+
 def test_one_clip_left_on_disk_is_still_better_than_a_ding(tmp_path) -> None:
     (tmp_path / "yes.wav").write_bytes((ack_dir() / "yes.wav").read_bytes())
     acks = WakeAcks(tmp_path)
@@ -339,6 +359,24 @@ def test_recent_levels_hear_speech_only_above_the_room() -> None:
     early.push(wake - 0.5, 3000.0)
     early.push(wake - 0.4, 3000.0)
     assert not early.heard(wake + 0.1, before=wake)
+
+
+async def test_the_wake_word_the_idle_loop_ate_can_be_replayed_once(monkeypatch) -> None:
+    """A conversation on a held socket sends the model the frames that carried
+    his "Alexa": the ones already taken off the queue, never the ones still
+    queued for the session's own reader."""
+    mic = await open_mic(monkeypatch)
+    try:
+        before = time.monotonic()
+        await speak(mic, frames=3)
+        assert mic.replay_since(before) == []  # all three are still queued
+        async with asyncio.timeout(1):
+            await mic.get_frame()
+            await mic.get_frame()
+        assert len(mic.replay_since(before)) == 2  # the two the idle loop consumed
+        assert mic.replay_since(time.monotonic() + 1) == []
+    finally:
+        await mic.close()
 
 
 async def test_the_real_microphone_answers_from_its_own_ring(monkeypatch) -> None:

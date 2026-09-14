@@ -156,13 +156,16 @@ class WakeAcks:
         self._beat_s = max(0.0, float(beat_s))
         self._beat_jitter_s = max(0.0, float(beat_jitter_s))
         self.last_beat_s = 0.0  # the pause before the clip that answered the last wake
-        self._clips: dict[str, bytes] = {}
+        # slug -> its takes (slug.wav, slug-2.wav, …): the same words said
+        # more than one way, so twenty wakes a day do not all sound alike
+        self._clips: dict[str, list[bytes]] = {}
         self._gone: list[str] = []  # file names that would not load
         self._mode = (mode or "").strip().lower() or "voice"  # WAKE_ACK= is the default
         self._unknown = "" if self._mode in MODES else self._mode
         if self._unknown:
             self._mode = "voice"  # a typo must never cost him the acknowledgment
         self.last = ""  # the slug played last: never the same one twice in a row
+        self.last_take: tuple[str, int] = ("", -1)  # ...and never the same take of it either
         self.played: list[str] = []  # the last few slugs, newest last
         if self._mode == "voice":
             self._load()
@@ -178,14 +181,24 @@ class WakeAcks:
 
     def _load(self) -> None:
         for slug in PHRASES:
-            path = self._dir / f"{slug}.wav"
-            pcm = b""
-            with contextlib.suppress(Exception):  # a bad asset is a ding, not a crash
-                pcm = read_wav(path, self._rate)
-            if pcm:
-                self._clips[slug] = pcm
+            paths = [self._dir / f"{slug}.wav"]
+            with contextlib.suppress(OSError):
+                paths += sorted(self._dir.glob(f"{slug}-[0-9]*.wav"))
+            takes: list[bytes] = []
+            for path in paths:
+                pcm = b""
+                with contextlib.suppress(Exception):  # a bad asset is a ding, not a crash
+                    pcm = read_wav(path, self._rate)
+                if pcm:
+                    takes.append(pcm)
+            if takes:
+                self._clips[slug] = takes
             else:
-                self._gone.append(path.name)
+                self._gone.append(f"{slug}.wav")
+
+    def takes(self, slug: str) -> int:
+        """How many ways she can say this line."""
+        return len(self._clips.get(slug, ()))
 
     def missing(self) -> list[str]:
         """The clips that are not on disk, or would not read (an incomplete render)."""
@@ -237,7 +250,11 @@ class WakeAcks:
         slug = self.pick()
         if not slug:
             return 0.0
-        pcm = self._clips[slug]
+        takes = self._clips[slug]
+        index = self._rng.randrange(len(takes))
+        if len(takes) > 1 and (slug, index) == self.last_take:
+            index = (index + 1) % len(takes)  # the same take twice running is the old metronome
+        pcm = takes[index]
         beat_s = self._beat_s if beat_s is None else max(0.0, float(beat_s))
         beat_s = beat_s + (self._rng.random() * self._beat_jitter_s if beat_s else 0.0)
         beat = b"\x00\x00" * int(beat_s * self._rate)
@@ -248,6 +265,7 @@ class WakeAcks:
         except Exception:  # noqa: BLE001 — a speaker that won't take it falls back to the ding
             return 0.0
         self.last = slug
+        self.last_take = (slug, index)
         self.last_beat_s = len(beat) / 2 / self._rate
         self.played.append(slug)
         del self.played[:-20]  # a days-long process keeps a window, not a history

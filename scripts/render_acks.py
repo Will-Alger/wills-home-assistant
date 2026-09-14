@@ -56,11 +56,43 @@ SILENCE = 200  # int16 RMS below this, over 10 ms, is nothing
 PAD_S = 0.04  # kept either side of the words, so no consonant is clipped
 
 # She is answering her name from across the room, not opening a conversation.
-DELIVERY = (
-    "Warm, quiet and unhurried, at an ordinary indoor speaking pace, over in "
-    "half a second. You have just heard your name and you are answering it. "
-    "No brightness, no performance, no trailing words."
-)
+# How the line is said. Every one of these is the same character — a
+# composed, capable presence who calls him sir without ceremony (Will: "our
+# own female Jarvis, but we're sticking with Alexa") — at a different
+# temperature. `--delivery` picks one; `quiet` is what the clips were until
+# 2026-09-13.
+DELIVERIES: dict[str, str] = {
+    "quiet": (
+        "Warm, quiet and unhurried, at an ordinary indoor speaking pace, over in "
+        "half a second. You have just heard your name and you are answering it. "
+        "No brightness, no performance, no trailing words."
+    ),
+    "curious": (
+        "Light and curious, with a small lift at the end — as if something "
+        "interesting is about to be asked of you, the way a capable friend looks "
+        "up from what she was doing. You have just heard your name. Unhurried, an "
+        "ordinary indoor pace, over in half a second. No brightness, no performance, "
+        "nothing solemn, no trailing words."
+    ),
+    "dry": (
+        "Composed and faintly amused: the calm of a very capable aide who has seen "
+        "it all, a dry half-smile in the voice. Even pitch, understated, never "
+        "formal or military. You have just heard your name. Unhurried, over in half "
+        "a second. No performance, no trailing words."
+    ),
+    "warm": (
+        "Warm and easy, a genuine half-smile in the voice, relaxed and close, like "
+        "someone glad you asked. You have just heard your name. Soft, unhurried, "
+        "over in half a second. Nothing bright or perky, no performance, no trailing words."
+    ),
+    "crisp": (
+        "Alert, crisp and ready, a touch of eagerness — you are already leaning in. "
+        "You have just heard your name. Quick and clean, the shortest possible take, "
+        "precise consonants, but never stiff and never solemn. No performance, no "
+        "trailing words."
+    ),
+}
+DELIVERY = DELIVERIES["quiet"]
 
 
 def ask(line: str) -> str:
@@ -167,12 +199,14 @@ TAKE_S = 12.0  # a take that has not finished by then is abandoned
 QUIET_S = 0.8  # her voice gone for this long: the take is over
 
 
-async def take_live(client: AsyncOpenAI, model: str, voice: str, line: str, style: str, name: str) -> tuple[str, bytes, float]:
+async def take_live(
+    client: AsyncOpenAI, model: str, voice: str, line: str, style: str, name: str, delivery: str = DELIVERY
+) -> tuple[str, bytes, float]:
     """One clip through a Live session of its own: the line goes in as
     commentary (the one thing that makes her speak first), the stream is
     kept until her voice has been gone for a beat, then the session is
     closed. Returns the transcript, the raw audio, and the billed seconds."""
-    instructions = RECORDER.format(name=name, delivery=DELIVERY) + (f"\n\n{style}" if style else "")
+    instructions = RECORDER.format(name=name, delivery=delivery) + (f"\n\n{style}" if style else "")
     cfg = {
         "model": model,
         "instructions": instructions,
@@ -237,46 +271,57 @@ async def take_live(client: AsyncOpenAI, model: str, voice: str, line: str, styl
     return "".join(text), bytes(pcm), seconds
 
 
-async def render_live(out: Path, slugs: list[str], tries: int) -> int:
+async def render_live(
+    out: Path, slugs: list[str], tries: int, *, delivery: str = DELIVERY, takes: int = 1
+) -> int:
+    """`takes` clips per line — slug.wav, slug-2.wav, … — each through its own
+    session, so the same words never come out the same way twice (audio/acks.py
+    picks a take at random and never repeats the one before)."""
     settings = load_settings()
     settings.require("openai_api_key")
     voice = (settings.live_voice or "").strip().lower() or voice_for_live(settings.realtime_voice)
     style = settings.assistant_extra_instructions.strip()
     client = AsyncOpenAI(api_key=settings.openai_api_key)
     out.mkdir(parents=True, exist_ok=True)
-    print(f"rendering {len(slugs)} clips · {settings.live_model} · voice {voice}" + (" · with the style line" if style else ""))
+    print(
+        f"rendering {len(slugs)} lines × {takes} take(s) · {settings.live_model} · voice {voice}"
+        + (" · with the style line" if style else "")
+    )
     spent = 0.0
     failed: list[str] = []
     for slug in slugs:
         line = phrase(slug, settings.owner_name)
         max_s = CUE_MAX_S.get(slug, MAX_S)
-        keep, why = b"", "nothing was rendered"
-        for _attempt in range(tries):
-            try:
-                transcript, audio, seconds = await take_live(
-                    client, settings.live_model, voice, line, style, settings.assistant_name
-                )
-            except Exception as err:  # noqa: BLE001 — one bad take is not the end of the run
-                why = f"the session failed: {err}"
+        for take in range(1, max(1, takes) + 1):
+            keep, why = b"", "nothing was rendered"
+            for _attempt in range(tries):
+                try:
+                    transcript, audio, seconds = await take_live(
+                        client, settings.live_model, voice, line, style, settings.assistant_name, delivery
+                    )
+                except Exception as err:  # noqa: BLE001 — one bad take is not the end of the run
+                    why = f"the session failed: {err}"
+                    print(f"  retaking {slug}: {why}")
+                    continue
+                spent += seconds / 60 * LIVE_PRICE_PER_MIN
+                audio = trim(audio, RATE)
+                why = problem(line, transcript, audio, RATE, max_s)
+                if not why:
+                    keep = audio
+                    break
                 print(f"  retaking {slug}: {why}")
+                if not keep and audio and len(audio) / 2 / RATE <= max_s:
+                    keep = audio  # the right length, only the words looked wrong
+            name = f"{slug}.wav" if take == 1 else f"{slug}-{take}.wav"
+            if not keep:
+                failed.append(name)
+                print(f"  ✗ {name}: {why} — not written")
                 continue
-            spent += seconds / 60 * LIVE_PRICE_PER_MIN
-            audio = trim(audio, RATE)
-            why = problem(line, transcript, audio, RATE, max_s)
-            if not why:
-                keep = audio
-                break
-            print(f"  retaking {slug}: {why}")
-            if not keep and audio and len(audio) / 2 / RATE <= max_s:
-                keep = audio  # the right length, only the words looked wrong
-        if not keep:
-            failed.append(slug)
-            print(f"  ✗ {slug}: {why} — not written")
-            continue
-        path = out / f"{slug}.wav"
-        write_wav(path, keep, RATE)
-        print(f"  {path.name}  {len(keep) / 2 / RATE:.2f}s  “{line}”")
-    print(f"\n{len(slugs) - len(failed)} of {len(slugs)} clips in {out} · ${spent:.4f}")
+            path = out / name
+            write_wav(path, keep, RATE)
+            print(f"  {path.name}  {len(keep) / 2 / RATE:.2f}s  “{line}”")
+    total = len(slugs) * max(1, takes)
+    print(f"\n{total - len(failed)} of {total} clips in {out} · ${spent:.4f}")
     if failed:
         print(f"still missing: {', '.join(failed)} — run again for those")
     return 1 if failed else 0
@@ -290,7 +335,15 @@ def main() -> int:
     )
     parser.add_argument("--only", nargs="+", metavar="SLUG", help=f"a subset of {', '.join(PHRASES)}")
     parser.add_argument("--out", type=Path, default=None, help="where to write the WAVs")
-    parser.add_argument("--tries", type=int, default=TRIES, help=f"takes per clip (default {TRIES})")
+    parser.add_argument("--tries", type=int, default=TRIES, help=f"attempts per clip before giving up (default {TRIES})")
+    parser.add_argument(
+        "--delivery", choices=sorted(DELIVERIES), default="quiet",
+        help="how the line is said (--live only): " + ", ".join(sorted(DELIVERIES)),
+    )
+    parser.add_argument(
+        "--takes", type=int, default=1,
+        help="clips per line (--live only): slug.wav, slug-2.wav, … picked at random at each wake",
+    )
     parser.add_argument("--list", action="store_true", help="print the lines and stop")
     parser.add_argument(
         "--cues", action="store_true",
@@ -310,7 +363,9 @@ def main() -> int:
         return 2
     out = args.out or (cue_dir() if args.cues else ack_dir())
     if args.live:
-        return asyncio.run(render_live(out, slugs, max(1, args.tries)))
+        return asyncio.run(render_live(
+            out, slugs, max(1, args.tries), delivery=DELIVERIES[args.delivery], takes=max(1, min(args.takes, 6)),
+        ))
     return asyncio.run(render(out, slugs, max(1, args.tries)))
 
 

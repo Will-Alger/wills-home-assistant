@@ -104,6 +104,18 @@ and a dashboard on localhost shows the five numbers that decide whether a
 week was better than the last — cut-offs, silences, wake misses, acks, music
 start. Next: fewer clocks, judged by those numbers; then the pucks.
 
+## Her own "Yes?" (Sep 13)
+
+"Confirm with me again: the acknowledgment isn't something GPT-Live can
+handle? It feels janky to play a predefined clip when GPT-Live responds with
+a tone based on the way you ask." It could not — until a probe showed that a
+socket connected but not started costs nothing, for five minutes at least,
+and starts in a third of a second. So one is held open while she is idle, the
+wake starts it, the frames that carried his "Alexa" are replayed to the
+model, and she answers her name herself, in the tone he used, about a second
+later. The clips became the understudy: several takes per line, in a named
+delivery, for the boot and the dropped socket.
+
 ## Standing truths from the journey
 
 - Will's field reports drove a dozen fixes; testing-in-the-room beats

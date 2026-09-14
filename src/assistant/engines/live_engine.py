@@ -31,6 +31,7 @@ import base64
 import contextlib
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -263,6 +264,7 @@ class _LiveSession:
         self.user_grew_at = 0.0
         self.user_judged: set[str] = set()
         self.prewoke = False  # the TV was woken on a mid-sentence "play"
+        self.warm = False  # on a socket held open while idle: the wake word itself is replayed to the model
         self.speech_segments = 0
         self.user_turns = 0
         self.heard_speech = False
@@ -1157,6 +1159,17 @@ class _LiveSession:
                 raise LiveStartError("session.started never came") from exc
             if self.start_error is not None:
                 raise self.start_error
+            if self.warm:
+                # The idle loop consumed the frames that carried his "Alexa";
+                # the model hears them first, so a name and a pause get its own
+                # "Yes?" in the tone he used, and a command in one breath is
+                # heard whole.
+                replay = getattr(self.mic, "replay_since", None)
+                if replay is not None:
+                    frames = replay(engine._trace.t0 - _WAKE_BACKLOG_S)
+                    for frame in frames:
+                        await self._send_audio(frame)
+                    self._tap("wake_replayed", frames=len(frames))
             if engine.voice_note:
                 self._note(engine.voice_note)
                 engine.voice_note = None
@@ -1215,9 +1228,87 @@ class _LiveSession:
             )
 
 
+_WARM_MAX_AGE_S = 240.0  # a held socket is replaced after this long
+_WARM_RETRY_S = 5.0  # after a failed connect
+_WAKE_BACKLOG_S = 1.2  # how far before the wake the replayed microphone reaches ("Alexa" itself)
+
+
+class WarmSocket:
+    """A Live socket connected while she is idle, so the wake word reaches the
+    model at once and the model answers its own name — in the tone of how it
+    was said — instead of a clip off the disk.
+
+    Measured 2026-09-13: a connected, unstarted socket is not billed (26 s and
+    five minutes idle, 0 s of usage), `session.start` is acknowledged in
+    0.28 s and her first word follows 0.7 s later, against 1.5–2.5 s to
+    connect cold. The holder never reads the socket while it waits (one reader
+    at a time), so a socket the server dropped quietly is only found out at
+    the wake — the engine then connects cold, as it always did."""
+
+    def __init__(
+        self,
+        client: Any,
+        *,
+        max_age_s: float = _WARM_MAX_AGE_S,
+        retry_s: float = _WARM_RETRY_S,
+        log: Callable[[str], None] | None = None,
+    ) -> None:
+        self._client = client
+        self._max_age_s = max_age_s
+        self._retry_s = retry_s
+        self._log = log
+        self._conn: Any | None = None
+        self._taken = False
+        self._release = asyncio.Event()
+        self.connects = 0
+        self.uses = 0
+
+    @property
+    def ready(self) -> bool:
+        return self._conn is not None and not self._taken
+
+    def take(self) -> tuple[Any, Callable[[], None]] | None:
+        """The held connection and the call that gives it back once the
+        conversation on it is over (the holder then connects the next one)."""
+        if not self.ready:
+            return None
+        self._taken = True
+        self.uses += 1
+        return self._conn, self._release.set
+
+    async def run(self) -> None:
+        while True:
+            try:
+                async with self._client.live.connect() as conn:
+                    self.connects += 1
+                    self._conn, self._taken = conn, False
+                    self._release = asyncio.Event()
+                    try:
+                        await asyncio.wait_for(self._release.wait(), timeout=self._max_age_s)
+                    except TimeoutError:
+                        if self._taken:
+                            await self._release.wait()  # in use past its age: the conversation finishes first
+                    finally:
+                        self._conn = None
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # noqa: BLE001 — the network; she still wakes cold
+                self._conn = None
+                if self._log is not None:
+                    with contextlib.suppress(Exception):
+                        self._log(f"warm socket: {err} — retrying in {self._retry_s:.0f}s")
+                await asyncio.sleep(self._retry_s)
+
+
 class LiveEngine(RealtimeEngine):
     """The realtime engine's tools, prompts, memory and accounting on a
     GPT-Live session. Everything conversational is `_LiveSession`."""
+
+    @property
+    def warm_ready(self) -> bool:
+        """A socket is held open: the model, not a clip, answers the wake."""
+        warm = getattr(self, "_warm", None)
+        return warm is not None and warm.ready
 
     # The runner answers a wake only after a beat of quiet: on full duplex a
     # command in the same breath as her name needs no "Yes?" (m4_realtime.acknowledge_later).
@@ -1341,6 +1432,31 @@ class LiveEngine(RealtimeEngine):
             with contextlib.suppress(Exception):
                 self._presence.observe("home", source="voice")
         try:
+            warm = getattr(self, "_warm", None)
+            held = warm.take() if warm is not None else None
+            if held is not None:
+                # The socket was connected while she was idle: start it now, and
+                # only if it turns out dead (the server drops idle ones quietly)
+                # connect cold below — never re-run a conversation that began.
+                conn, release = held
+                session = _LiveSession(
+                    self, conn, mic, speaker, wake, ui, stats,
+                    announce=announce, ptt=ptt, ptt_session=ptt_session,
+                )
+                session.warm = True
+                try:
+                    await session.run(items)
+                    return stats
+                except Exception as err:  # a dead held socket is the one case we go around
+                    if session.started.is_set():
+                        raise
+                    note = getattr(ui, "note", None)
+                    if note is not None:
+                        with contextlib.suppress(Exception):
+                            note(f"the held socket was dead ({type(err).__name__}) — connecting cold")
+                    stats = SessionStats()
+                finally:
+                    release()
             for attempt in (1, 2):
                 try:
                     async with self._client.live.connect() as conn:

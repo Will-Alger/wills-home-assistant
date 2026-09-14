@@ -164,7 +164,7 @@ class FeedbackStore:
             rows = [i for i in rows if i.need == int(need)]
         if session is not None:
             rows = [i for i in rows if int(session) in i.sessions]
-        return sorted(rows, key=lambda i: i.created, reverse=True)
+        return sorted(rows, key=lambda i: (i.created, i.id), reverse=True)
 
     def tag_counts(self, *, open_only: bool = True) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -220,15 +220,15 @@ class FeedbackStore:
             rows = list(self._needs)
         if status:
             rows = [n for n in rows if n.status == status]
-        return sorted(rows, key=lambda n: n.created, reverse=True)
+        return sorted(rows, key=lambda n: (n.created, n.id), reverse=True)
 
     # ── for the dashboard and the prompt ───────────────────────────────────
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return {
-                "items": [asdict(i) for i in sorted(self._items, key=lambda i: i.created, reverse=True)],
-                "needs": [asdict(n) for n in sorted(self._needs, key=lambda n: n.created, reverse=True)],
+                "items": [asdict(i) for i in sorted(self._items, key=lambda i: (i.created, i.id), reverse=True)],
+                "needs": [asdict(n) for n in sorted(self._needs, key=lambda n: (n.created, n.id), reverse=True)],
                 "statuses": list(STATUSES), "need_statuses": list(NEED_STATUSES), "tags": list(TAGS),
             }
 

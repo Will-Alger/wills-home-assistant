@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from collections import deque
 from collections.abc import Callable
 from typing import Self
 
@@ -96,6 +97,11 @@ class Microphone:
         self._suspect_before = 0.0  # frames captured before this stamp may be her own voice
         self.last_suspect = False  # ...and the frame get_frame just returned was one of them
         self.levels = RecentLevels()  # the last seconds of the room, for questions about them
+        # The last two seconds of frames, so a conversation that opens on a
+        # held socket can replay the wake word the idle loop already consumed.
+        self.recent: deque[tuple[float, bytes, int]] = deque(maxlen=25)
+        self._seq = 0  # every frame numbered at capture: which ones a reader has already taken
+        self._delivered = 0  # the number of the last frame get_frame (or drain) handed out
         self._stream: sd.RawInputStream | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self.device_note: str | None = None  # set when a fallback device was used
@@ -202,8 +208,16 @@ class Microphone:
 
     def _offer(self, captured: float, data: bytes) -> None:
         self.levels.push(captured, rms(data))
+        self._seq += 1
+        self.recent.append((captured, data, self._seq))
         with contextlib.suppress(asyncio.QueueFull):
-            self._queue.put_nowait((captured, data))
+            self._queue.put_nowait((captured, data, self._seq))
+
+    def replay_since(self, since: float) -> list[bytes]:
+        """Frames captured after `since` that were already taken off the queue
+        (the idle loop's wake detection ate them). Frames still queued are left
+        to whoever reads next, so nothing is delivered twice."""
+        return [frame for captured, frame, seq in self.recent if captured >= since and seq <= self._delivered]
 
     def heard_since(self, since: float, until: float | None = None, *, before: float | None = None) -> bool:
         """Did the room carry speech after `since` (a `time.monotonic()`
@@ -227,7 +241,8 @@ class Microphone:
     async def get_frame(self) -> bytes:
         if self._stream is None:
             raise AudioSourceClosed
-        captured, frame = await self._queue.get()
+        captured, frame, seq = await self._queue.get()
+        self._delivered = seq
         self.last_suspect = captured < self._suspect_before
         if self.tap is not None:
             with contextlib.suppress(Exception):
@@ -236,4 +251,4 @@ class Microphone:
 
     def drain(self) -> None:
         while not self._queue.empty():
-            self._queue.get_nowait()
+            self._delivered = self._queue.get_nowait()[2]
