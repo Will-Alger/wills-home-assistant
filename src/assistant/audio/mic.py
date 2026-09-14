@@ -97,9 +97,10 @@ class Microphone:
         self._suspect_before = 0.0  # frames captured before this stamp may be her own voice
         self.last_suspect = False  # ...and the frame get_frame just returned was one of them
         self.levels = RecentLevels()  # the last seconds of the room, for questions about them
-        # The last two seconds of frames, so a conversation that opens on a
-        # held socket can replay the wake word the idle loop already consumed.
-        self.recent: deque[tuple[float, bytes, int]] = deque(maxlen=25)
+        # The last six seconds of frames, so a conversation that opens on a
+        # held socket can replay the wake word the idle loop already consumed —
+        # even after a slow start (a cold connect, a hub that had to time out).
+        self.recent: deque[tuple[float, bytes, int]] = deque(maxlen=75)
         self._seq = 0  # every frame numbered at capture: which ones a reader has already taken
         self._delivered = 0  # the number of the last frame get_frame (or drain) handed out
         self._stream: sd.RawInputStream | None = None

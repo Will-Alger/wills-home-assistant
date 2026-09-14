@@ -648,6 +648,10 @@ _NO_SPEECH_S = 8.0  # a wake with nobody heard by then — by the server or the 
 # back in through a loudspeaker (the Echo Dot: ~2200); quieter frames of that
 # moment are him, talking over her "Yes?" (recorded: 500–900), and go through.
 _SUSPECT_LEVEL = 1200.0
+# The session's prompt lists the lights and players: this long to get them
+# from the hub, then the last good list stands in (a hung hub once cost every
+# wake ten seconds, and with them the wake word the microphone had kept).
+_HOME_FETCH_S = 1.5
 
 # The local speech gate: the server hears speech or clean silence, never the room.
 # Without a VAD the level does the work. Recorded at the desk: the room floor
@@ -1906,15 +1910,20 @@ class RealtimeEngine:
                 f.id for f in self._followups.for_conversation() if f.created <= opened
             ]
         try:
-            lights = await self._home.get_lights()
-            players = await self._home.media_players()
+            lights, players = await asyncio.wait_for(
+                asyncio.gather(self._home.get_lights(), self._home.media_players()), _HOME_FETCH_S
+            )
             self._home_down = ""
+            self._home_cache = (list(lights), list(players))
         except Exception as err:  # noqa: BLE001 — a hub that is off must not cost him her voice
             # Every wake after a reboot used to die here while Home Assistant
-            # was still coming up ("recovered from: ConnectTimeout"). She
-            # opens the session anyway, knows the hub is out, and says so
-            # only if he asks for it.
-            lights, players = [], []
+            # was still coming up ("recovered from: ConnectTimeout") — and a
+            # hub that merely hangs held the session up for its whole ten-
+            # second timeout, long enough for the microphone to forget his
+            # "Alexa". Now the fetch gets a second and a half, the last good
+            # device list stands in, the session opens, and she says the home
+            # isn't answering only if he asks for it.
+            lights, players = getattr(self, "_home_cache", ([], []))
             self._home_down = type(err).__name__
             self._tap("home_down", error=str(err)[:120] or type(err).__name__)
         # Which memories are worth carrying into this stretch: the subjects of

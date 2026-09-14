@@ -9,6 +9,7 @@ import asyncio
 import numpy as np
 
 from assistant.engines import live_engine as mod
+from assistant.engines import realtime_engine as mod_rt
 from assistant.engines.live_engine import LiveEngine, backend_cost, voice_for_live
 from assistant.home.fake import FakeHome
 from tests.fake_live import FakeLiveClient, LevelSpeaker
@@ -165,6 +166,30 @@ async def test_a_hub_that_is_down_does_not_cost_him_her_voice() -> None:
                     name="Alexa", wake_phrase="alexa")
     cfg = await up._live_session_config()
     assert "not answering" not in cfg["delegation"]["responses"]["instructions"] and up._home_down == ""
+
+
+async def test_a_hub_that_hangs_gets_a_second_and_a_half_then_the_last_good_list(monkeypatch) -> None:
+    """A hub that neither answers nor refuses used to hold the session for
+    its whole ten-second timeout — long enough to lose his "Alexa"."""
+    monkeypatch.setattr(mod_rt, "_HOME_FETCH_S", 0.05)
+    hanging = asyncio.Event()
+
+    class SlowHome(FakeHome):
+        async def get_lights(self):
+            if hanging.is_set():
+                await asyncio.sleep(5)
+            return await super().get_lights()
+
+    engine = LiveEngine(api_key="k", model="gpt-live-1", voice="marin", home=SlowHome(), owner="Will",
+                        name="Alexa", wake_phrase="alexa")
+    _text, lights, _players = await engine._render_instructions()
+    assert lights and engine._home_down == ""
+    hanging.set()
+    start = asyncio.get_running_loop().time()
+    text, lights_again, _players = await asyncio.wait_for(engine._render_instructions(), 2)
+    assert asyncio.get_running_loop().time() - start < 1.0
+    assert engine._home_down == "TimeoutError" and lights_again == lights  # the last good list stood in
+    assert "the home hub is not answering" in text
 
 
 async def test_backend_web_search_can_stay_ours() -> None:
