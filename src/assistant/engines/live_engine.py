@@ -1462,8 +1462,8 @@ class LiveEngine(RealtimeEngine):
                     await session.run(items)
                     return stats
                 except Exception as err:  # a dead held socket is the one case we go around
-                    if session.started.is_set():
-                        raise
+                    if session.started.is_set() or not isinstance(err, (OSError, ConnectionError, LiveStartError)):
+                        raise  # a conversation that began, or a failure that is not the socket's
                     note = getattr(ui, "note", None)
                     if note is not None:
                         with contextlib.suppress(Exception):

@@ -125,8 +125,10 @@ class Dashboard:
         port: int = 8765,
         now: Callable[[], float] = time.time,
         promote: Callable[[Any], str] | None = None,
+        panel: Any | None = None,
     ) -> None:
         self._status = status
+        self._panel = panel  # the settings logic (panel.py) — the Tk window was only ever a view over it
         self._sessions_path = Path(sessions_path)
         self._turns_path = Path(turns_path)
         self._timeline = timeline
@@ -232,10 +234,63 @@ class Dashboard:
         if path == "/api/metrics":
             days = float(query.get("days", 7))
             return HTTPStatus.OK, self.metrics(days), json_t
+        if path == "/api/settings":
+            if self._panel is None:
+                return HTTPStatus.NOT_IMPLEMENTED, {"error": "no settings in this session"}, json_t
+            return HTTPStatus.OK, self.settings(), json_t
+        return HTTPStatus.NOT_FOUND, {"error": "not here"}, json_t
+
+    def settings(self) -> dict[str, Any]:
+        """What the Settings tab shows: what is saved, what can be chosen,
+        what she is actually on, and the recordings."""
+        panel = self._panel
+        snap = panel.snapshot()
+        return {
+            "saved": {
+                "voice": snap.get("saved_voice", ""), "wake_word": snap.get("saved_wake_word", ""),
+                "microphone": snap.get("saved_microphone", ""), "speaker": snap.get("saved_speaker", ""),
+            },
+            "live": {k: snap.get(k, "") for k in ("mic", "speaker", "voice", "wake_word", "hotkey", "state", "listening", "summary")},
+            "choices": {
+                "voices": panel.voice_choices(), "wake_words": list(panel.wake_choices()),
+                "microphones": panel.microphone_choices(), "speakers": panel.speaker_choices(),
+            },
+            "recording": {"active": bool(snap.get("recording")), "elapsed": snap.get("recording_elapsed", 0.0)},
+            "recordings": panel.recordings(),
+        }
+
+    def _settings_post(self, path: str, data: dict[str, Any]) -> tuple[int, Any, str]:
+        json_t = "application/json"
+        panel = self._panel
+        if panel is None:
+            return HTTPStatus.NOT_IMPLEMENTED, {"error": "no settings in this session"}, json_t
+        if path == "/api/settings":
+            message = panel.save(
+                voice=str(data.get("voice") or ""), wake_word=str(data.get("wake_word") or ""),
+                microphone=str(data.get("microphone") or ""), speaker=str(data.get("speaker") or ""),
+            )
+            ok = message.startswith("saved") or message == "nothing to save"
+            return (HTTPStatus.OK if ok else HTTPStatus.BAD_REQUEST), {"message": message}, json_t
+        if path == "/api/settings/refresh-devices":
+            return HTTPStatus.OK, {"message": panel.refresh_devices()}, json_t
+        if path == "/api/settings/restart":
+            return HTTPStatus.OK, {"message": panel.restart()}, json_t
+        if path == "/api/settings/recording":
+            return HTTPStatus.OK, {"message": panel.set_recording(bool(data.get("on")))}, json_t
+        if path.startswith("/api/settings/recordings/"):
+            _, _, _, _, name, verb = path.split("/", 5)
+            if verb == "delete":
+                return HTTPStatus.OK, {"message": panel.delete_recording(name)}, json_t
+            if verb == "open":
+                return HTTPStatus.OK, {"message": panel.open_recording(name)}, json_t
+            if verb == "note":
+                return HTTPStatus.OK, {"message": panel.recording_note(name, str(data.get("text") or ""))}, json_t
         return HTTPStatus.NOT_FOUND, {"error": "not here"}, json_t
 
     def _post(self, path: str, data: dict[str, Any]) -> tuple[int, Any, str]:
         json_t = "application/json"
+        if path.startswith("/api/settings"):
+            return self._settings_post(path, data)
         if path == "/api/feedback":
             item = self._feedback.add(
                 str(data.get("text", "")), tags=data.get("tags") or [], sessions=data.get("sessions") or [],
@@ -393,13 +448,16 @@ select,input[type=text]{font:inherit;padding:4px 6px;border:1px solid var(--line
 .muted{color:var(--mute)}.small{font-size:12px}h2{font-size:15px;margin:0 0 6px}details summary{cursor:pointer}a{color:var(--you)}
 </style></head><body>
 <header><h1 id="title">Alexa</h1><span class="small muted" id="state"><span class="dot"></span>…</span><div class="chips" id="metrics"></div></header>
-<nav><button data-tab="live" class="on">Live</button><button data-tab="sessions">Sessions</button><button data-tab="feedback">Feedback</button><button data-tab="needs">Needs</button><button data-tab="log">Log</button></nav>
+<nav><button data-tab="live" class="on">Live</button><button data-tab="sessions">Sessions</button><button data-tab="feedback">Feedback</button><button data-tab="needs">Needs</button><button data-tab="log">Log</button><button data-tab="settings">Settings</button></nav>
 <main>
 <section id="tab-live"><div class="card"><h2 id="live-title">Live</h2><p class="help">The conversation as it happens: your lines, hers, and her decisions between them (the wake, the acknowledgment, tools, why it closed). To flag a part of it, click its <b>first</b> line, then its <b>last</b> line — everything between is included — then say what felt wrong. One click and save flags a single line.</p><div class="conv" id="live-rows"></div><div class="flag hidden" id="live-flag"></div></div></section>
 <section id="tab-sessions" class="hidden"><div class="split"><div><p class="help">Every conversation, newest first. Flags show how many pieces of feedback point at it.</p><div class="list" id="sessions"></div></div><div id="session"><div class="card muted">Pick a conversation.</div></div></div></section>
 <section id="tab-feedback" class="hidden"><div class="card"><h2>Feedback</h2><p class="help">Everything flagged, newest first, with the part of the conversation it points at. Move the status here; group items into a need on the Needs tab.</p><table id="feedback"></table></div></section>
 <section id="tab-needs" class="hidden"><div class="card"><h2>New need</h2><p class="help">A need is what several pieces of feedback add up to — "wait until I'm done before acknowledging", "shorter replies". It is what gets built. Pick tags and the new items carrying them are grouped under it.</p><input type="text" id="need-title" placeholder="What he actually needs, in one line" style="width:100%"><div class="tags" id="need-tags"></div><textarea id="need-notes" placeholder="Notes (optional)"></textarea><div style="margin-top:8px"><button class="go" id="need-add">Add need</button></div></div><div class="card"><table id="needs"></table></div></section>
 <section id="tab-log" class="hidden"><div class="card"><h2>Live log</h2><p class="help">What the console prints, wrapped.</p><div class="log" id="log"></div></div><div class="card"><h2>Timeline (last 300 rows)</h2><div id="timeline"></div></div></section>
+<section id="tab-settings" class="hidden"><div class="card"><h2>Settings</h2><p class="help">Voice and wake word take effect on the next start (Restart below); microphone and speaker from the next conversation. Just paired something? Refresh devices.</p><table id="settings-form"></table><div style="margin-top:10px"><button class="go" id="settings-save">Save</button> <button class="go" id="settings-refresh" style="background:var(--mute)">Refresh devices</button> <button class="go" id="settings-restart" style="background:var(--bad)">Restart her</button> <span class="small muted" id="settings-note"></span></div></div>
+<div class="card"><h2>Right now</h2><div id="settings-live" class="small"></div></div>
+<div class="card"><h2>Recordings <span class="small muted">(both sides of the audio and every decision, for debugging)</span></h2><div style="margin-bottom:8px"><button class="go" id="rec-toggle">Start recording</button> <span class="small muted" id="rec-note"></span></div><table id="recordings"></table></div></section>
 </main>
 <script>
 const $=s=>document.querySelector(s);const api=(p,o)=>fetch(p,o).then(r=>r.json());
@@ -430,8 +488,20 @@ function renderFlag(name){const v=views[name];const f=$(v.form);if(!f)return;if(
   await post('/api/feedback',{text,tags:[...v.tags],sessions,range:{from_ts:bd[0],to_ts:bd[1],lines:rows.length},excerpt:rows.map(r=>(r.who?r.who+': ':'')+r.text).join('\n').slice(0,2000)});
   v.sel=null;v.tags=new Set();render(name);loadMetrics();if(name==='session'&&v.session!=null)openSession(v.session);};}
 function tagPicker(el,set){el.innerHTML=TAGS.map(t=>'<span class="tag'+(set.has(t)?' on':'')+'" data-t="'+t+'">'+t+'</span>').join('');el.querySelectorAll('.tag').forEach(x=>x.onclick=()=>{set.has(x.dataset.t)?set.delete(x.dataset.t):set.add(x.dataset.t);x.classList.toggle('on');});}
-function tab(name){activeTab=name;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.tab===name));['live','sessions','feedback','needs','log'].forEach(t=>$('#tab-'+t).classList.toggle('hidden',t!==name));
- if(name==='live')loadLive();if(name==='sessions')loadSessions();if(name==='feedback')loadFeedback();if(name==='needs')loadNeeds();if(name==='log')loadLog();}
+function tab(name){activeTab=name;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.tab===name));['live','sessions','feedback','needs','log','settings'].forEach(t=>$('#tab-'+t).classList.toggle('hidden',t!==name));
+ if(name==='live')loadLive();if(name==='sessions')loadSessions();if(name==='feedback')loadFeedback();if(name==='needs')loadNeeds();if(name==='log')loadLog();if(name==='settings')loadSettings();}
+const SETTINGS_FIELDS=[['voice','Voice','voices'],['wake_word','Wake word','wake_words'],['microphone','Microphone','microphones'],['speaker','Speaker','speakers']];
+async function loadSettings(){const s=await api('/api/settings');if(s.error){$('#settings-form').innerHTML='<tr><td class="muted">'+esc(s.error)+'</td></tr>';return;}
+ $('#settings-form').innerHTML=SETTINGS_FIELDS.map(([key,label,choice])=>{const saved=s.saved[key]||'';const opts=[''].concat(s.choices[choice]||[]);return '<tr><th style="width:120px">'+label+'</th><td><select data-key="'+key+'">'+opts.map(o=>'<option value="'+esc(o)+'"'+(o===saved?' selected':'')+'>'+(o?esc(o):'(as configured)')+'</option>').join('')+'</select></td></tr>';}).join('');
+ const l=s.live;$('#settings-live').innerHTML='mic <b>'+esc(l.mic)+'</b> · speaker <b>'+esc(l.speaker)+'</b> · voice <b>'+esc(l.voice)+'</b> · wake word <b>'+esc(l.wake_word)+'</b> · hotkey <b>'+esc(l.hotkey||'off')+'</b> · '+esc(l.summary||'');
+ $('#rec-toggle').textContent=s.recording.active?'End recording ('+Math.round(s.recording.elapsed)+' s)':'Start recording';$('#rec-toggle').dataset.on=s.recording.active?'1':'';
+ $('#recordings').innerHTML='<tr><th>recording</th><th>when</th><th>notes</th><th></th></tr>'+((s.recordings||[]).map(r=>'<tr><td>'+esc(r.name||'')+'</td><td class="small muted">'+esc(r.ended_by||'')+(r.sessions!=null?' · '+r.sessions+' conversation'+(r.sessions===1?'':'s'):'')+'</td><td class="small">'+esc(r.note||'')+'</td><td><button class="go" data-open="'+esc(r.name)+'" style="background:var(--mute)">Open folder</button> <button class="go" data-del="'+esc(r.name)+'" style="background:var(--bad)">Delete</button></td></tr>').join('')||'<tr><td colspan=4 class="muted">No recordings. Start one, talk to her, end it; the folder holds both sides of the audio and every decision.</td></tr>');
+ $('#recordings').querySelectorAll('button[data-open]').forEach(b=>b.onclick=async()=>{const r=await post('/api/settings/recordings/'+encodeURIComponent(b.dataset.open)+'/open',{});$('#rec-note').textContent=r.message||r.error||'';});
+ $('#recordings').querySelectorAll('button[data-del]').forEach(b=>b.onclick=async()=>{if(!confirm('Delete recording '+b.dataset.del+'?'))return;const r=await post('/api/settings/recordings/'+encodeURIComponent(b.dataset.del)+'/delete',{});$('#rec-note').textContent=r.message||r.error||'';loadSettings();});}
+$('#settings-save').onclick=async()=>{const body={};document.querySelectorAll('#settings-form select').forEach(sel=>{if(sel.value)body[sel.dataset.key]=sel.value;});const r=await post('/api/settings',body);$('#settings-note').textContent=r.message||r.error||'';loadSettings();};
+$('#settings-refresh').onclick=async()=>{const r=await post('/api/settings/refresh-devices',{});$('#settings-note').textContent=r.message||r.error||'';setTimeout(loadSettings,4000);};
+$('#settings-restart').onclick=async()=>{if(!confirm('Restart her now? She is back in about fifteen seconds.'))return;const r=await post('/api/settings/restart',{});$('#settings-note').textContent=r.message||r.error||'';};
+$('#rec-toggle').onclick=async()=>{const on=!$('#rec-toggle').dataset.on;const r=await post('/api/settings/recording',{on});$('#rec-note').textContent=r.message||r.error||'';loadSettings();};
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>tab(b.dataset.tab));
 async function loadState(){const s=await api('/api/state');lastState=s;$('#title').textContent='Alexa · '+(s.unit||'');$('#state').innerHTML='<span class="dot '+(s.listening?'on':'')+'"></span>'+esc(s.summary||s.state||'')+(s.current_session!=null?' · in conversation #'+s.current_session:'');}
 async function loadMetrics(){const m=await api('/api/metrics?days=7');const mus=m.music||{};const chip=(l,v,bad)=>'<span class="chip'+(bad&&v?' bad':'')+'">'+l+' <b>'+esc(v)+'</b></span>';
@@ -461,7 +531,8 @@ async function loadNeeds(){const f=await api('/api/feedback');tagPicker($('#need
  $('#needs').querySelectorAll('button[data-p]').forEach(b=>b.onclick=async()=>{b.disabled=true;const r=await post('/api/needs/'+b.dataset.p+'/promote',{});b.textContent=r.note||r.error||'queued';});
  $('#need-add').onclick=async()=>{const title=$('#need-title').value.trim();if(!title)return;const items=f.items.filter(i=>i.status==='new'&&[...needTags].some(t=>(i.tags||[]).includes(t))).map(i=>i.id);await post('/api/needs',{title,tags:[...needTags],items,notes:$('#need-notes').value});$('#need-title').value='';$('#need-notes').value='';needTags=new Set();loadNeeds();loadMetrics();};}
 async function loadLog(){const l=await api('/api/log?limit=400');$('#log').innerHTML=l.lines.map(x=>'<div>'+esc(x)+'</div>').join('');const t=await api('/api/timeline?limit=300');$('#timeline').innerHTML=t.rows.map(e=>'<div class="ev">'+new Date(e.ts*1000).toLocaleTimeString()+' '+(e.session!=null?'#'+e.session:'  ')+' '+esc(describe(e))+'</div>').join('');const el=$('#log');el.scrollTop=el.scrollHeight;}
-(async()=>{const f=await api('/api/feedback');TAGS=f.tags;await loadState();await loadMetrics();await loadLive();
+(async()=>{const f=await api('/api/feedback');TAGS=f.tags;await loadState();await loadMetrics();if(location.hash==='#settings'){tab('settings');}else{await loadLive();}
+ window.addEventListener('hashchange',()=>{if(location.hash==='#settings')tab('settings');});
  setInterval(async()=>{await loadState();if(activeTab==='live')loadLive();},3000);setInterval(()=>{if(activeTab==='log')loadLog();if(activeTab==='sessions')loadSessions();},12000);})();
 </script></body></html>
 """

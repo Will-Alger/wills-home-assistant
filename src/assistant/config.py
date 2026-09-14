@@ -82,6 +82,9 @@ class Settings(BaseSettings):
     dashboard_enabled: bool = True
     dashboard_port: int = 8765
     unit_name: str = "desktop"
+    # A tray icon (bottom right): her state as a colour, a click opens the
+    # dashboard, the menu has the Settings panel, Restart and Quit.
+    tray_icon: bool = True
 
     # Background Claude jobs (reflection, later dispatch) run through the
     # Claude Code CLI = billed to the Max SUBSCRIPTION, not API tokens.

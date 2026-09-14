@@ -134,6 +134,41 @@ def test_flag_that_by_voice_lands_on_the_current_conversation(tmp_path) -> None:
     assert "flag_conversation" not in [t.get("name") for t in plain._tools()]
 
 
+def test_the_settings_tab_is_the_panel_without_the_window(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from assistant.panel import PanelOverrides, SettingsPanel
+
+    devices = SimpleNamespace(
+        DEFAULT="System default",
+        names=lambda kind: ["System default", "Snowball" if kind == "input" else "Echo Dot"],
+        is_default=lambda spec: spec == "System default",
+        find=lambda spec, kind: 0 if spec in ("Snowball", "Echo Dot") else None,
+    )
+    flags: list[str] = []
+    status = AssistantStatus(mic="Snowball", voice="marin", wake_word="alexa")
+    panel = SettingsPanel(status, PanelOverrides(tmp_path / "panel.json"), view_factory=lambda p: None,
+                          devices=devices, restart=lambda: flags.append("restart"),
+                          on_refresh_devices=lambda: flags.append("rescan"))
+    dash = Dashboard(status=status, sessions_path=tmp_path / "s.json", turns_path=tmp_path / "t.jsonl",
+                     timeline=Timeline(tmp_path / "tl.jsonl"), feedback=FeedbackStore(tmp_path / "f.json"), panel=panel, port=0)
+    code, settings, _ = dash.handle("GET", "/api/settings")
+    assert code == 200 and settings["saved"]["voice"] == "" and "marin" in settings["choices"]["voices"]
+    assert settings["choices"]["microphones"] == ["System default", "Snowball"] and settings["live"]["mic"] == "Snowball"
+    assert settings["recording"] == {"active": False, "elapsed": 0.0} and settings["recordings"] == []
+    code, saved, _ = dash.handle("POST", "/api/settings", json.dumps({"voice": "marin", "speaker": "Echo Dot"}).encode())
+    assert code == 200 and "voice marin" in saved["message"] and "speaker Echo Dot" in saved["message"]
+    assert dash.handle("GET", "/api/settings")[1]["saved"] == {"voice": "marin", "wake_word": "", "microphone": "", "speaker": "Echo Dot"}
+    code, bad, _ = dash.handle("POST", "/api/settings", b'{"voice": "not-a-voice"}')
+    assert code == 400 and "isn't one of her voices" in bad["message"]
+    assert dash.handle("POST", "/api/settings/refresh-devices", b"")[1]["message"].startswith("re-scanning")
+    assert dash.handle("POST", "/api/settings/restart", b"")[0] == 200 and flags == ["rescan", "restart"]
+    assert "isn't wired up" in dash.handle("POST", "/api/settings/recording", b'{"on": true}')[1]["message"]
+    none = Dashboard(status=status, sessions_path=tmp_path / "s.json", turns_path=tmp_path / "t.jsonl",
+                     timeline=Timeline(tmp_path / "tl.jsonl"), feedback=FeedbackStore(tmp_path / "f.json"), port=0)
+    assert none.handle("GET", "/api/settings")[0] == 501
+
+
 def test_the_server_answers_on_a_real_socket(tmp_path) -> None:
     dash, _feedback, sid, _p = rig(tmp_path)
     url = dash.start()

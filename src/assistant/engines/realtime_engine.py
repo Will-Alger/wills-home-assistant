@@ -1905,8 +1905,18 @@ class RealtimeEngine:
             self._pending_followups = [
                 f.id for f in self._followups.for_conversation() if f.created <= opened
             ]
-        lights = await self._home.get_lights()
-        players = await self._home.media_players()
+        try:
+            lights = await self._home.get_lights()
+            players = await self._home.media_players()
+            self._home_down = ""
+        except Exception as err:  # noqa: BLE001 — a hub that is off must not cost him her voice
+            # Every wake after a reboot used to die here while Home Assistant
+            # was still coming up ("recovered from: ConnectTimeout"). She
+            # opens the session anyway, knows the hub is out, and says so
+            # only if he asks for it.
+            lights, players = [], []
+            self._home_down = type(err).__name__
+            self._tap("home_down", error=str(err)[:120] or type(err).__name__)
         # Which memories are worth carrying into this stretch: the subjects of
         # the tools just used and the entities they touched. Everything else
         # stays in the store, one list_memories away.
@@ -1920,8 +1930,14 @@ class RealtimeEngine:
             name=self._name,
             owner=self._owner,
             wake_phrase=self._wake_phrase,
-            devices=device_table(lights),
-            media=media_table(players),
+            devices=(
+                "(the home hub is not answering right now — if he asks for lights, media or "
+                "anything in the house, say the home isn't answering and that you'll have it "
+                "back when it is; everything else works as usual)"
+                if getattr(self, "_home_down", "")
+                else device_table(lights)
+            ),
+            media="(unavailable: the home hub is not answering)" if getattr(self, "_home_down", "") else media_table(players),
             preferences=(
                 self._memory.preferences_text(subjects) if self._memory else "(memory not enabled)"
             ),

@@ -74,6 +74,7 @@ from assistant.status import AssistantStatus
 from assistant.tasks import TaskBoard
 from assistant.thoughts import ThoughtBook
 from assistant.timeline import Timeline
+from assistant.tray import TrayIcon
 from assistant.wake.detector import WakeDetector
 from assistant.web import WebSearch
 
@@ -519,6 +520,7 @@ def build_engine(fake: bool):
         Dashboard(
             status=status, sessions_path=root / "data" / "sessions.json", turns_path=root / "logs" / "turns.jsonl",
             timeline=timeline, feedback=feedback, unit=settings.unit_name, port=settings.dashboard_port,
+            panel=panel,  # the settings, on the dashboard's Settings tab
         )
         if dashboard_url
         else None
@@ -528,6 +530,22 @@ def build_engine(fake: bool):
     engine._warm = (
         WarmSocket(engine._client, max_age_s=settings.live_warm_max_age_s, log=lambda text: say(status, text, "yellow"))
         if live and settings.live_warm_socket
+        else None
+    )
+
+    def request_quit() -> None:
+        # the stop flag keeps the watchdog from relaunching; the runner exits on the flag below
+        with contextlib.suppress(Exception):
+            (root / "data" / "stop.flag").touch()
+        engine.restart_requested = True
+
+    # The tray icon (tray.py): her state as a colour, a click away from the dashboard.
+    engine.tray = (
+        TrayIcon(
+            status, name=settings.assistant_name, dashboard_url=dashboard_url,
+            open_settings=None if dashboard_url else panel.open, restart=request_restart, quit=request_quit,
+        )
+        if settings.tray_icon
         else None
     )
     engine.overrides = overrides
@@ -696,6 +714,12 @@ async def voice(fake: bool) -> int:
     warm_task = asyncio.create_task(warm.run()) if warm is not None else None
     if warm_task is not None:
         say(status, "warm socket: on — the model answers the wake in its own voice; the clips stand by", "dim")
+    tray = getattr(engine, "tray", None)
+    if tray is not None:
+        if tray.start():
+            say(status, "tray icon: on — click it for the dashboard; right-click for the panel, restart and quit", "dim")
+        else:
+            say(status, tray.note, "yellow")
     scheduler = getattr(engine, "scheduler", None)
     scheduler_task = asyncio.create_task(scheduler.run()) if scheduler is not None else None
     courier = getattr(engine, "courier", None)

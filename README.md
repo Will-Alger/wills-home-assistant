@@ -323,9 +323,11 @@ the last line of the part you mean to flag it with a note and tags ("she cut
 me off", "too eager") — the excerpt is saved with it; the feedback and needs boards,
 the live log, and the week's numbers — cut-offs, silences, wake misses, acks,
 music start. By voice, "flag that: …" records feedback on the conversation
-it was said in. The Settings panel's Dashboard button opens it. Everything it
-shows comes from `logs/timeline.jsonl` (always on), `data/sessions.json`,
-`logs/turns.jsonl` and `data/feedback.json`.
+it was said in. The Settings panel's Dashboard button opens it, and so does a
+click on the tray icon at the bottom right (`TRAY_ICON`): grey idle, green
+listening, amber working, red on an error; right-click for the panel, Restart
+and Quit. Everything it shows comes from `logs/timeline.jsonl` (always on),
+`data/sessions.json`, `logs/turns.jsonl` and `data/feedback.json`.
 
 **Push to talk** (`PTT_HOTKEY`, default `ctrl+alt`) is the second way in:
 hold the hotkey anywhere on the desktop and speak. Your hold IS the turn —

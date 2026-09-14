@@ -116,6 +116,14 @@ model, and she answers her name herself, in the tone he used, about a second
 later. The clips became the understudy: several takes per line, in a named
 delivery, for the boot and the dropped socket.
 
+The next morning: "does she start on her own? not sure if she's running."
+She was — the Startup shortcut had launched her at logon — but Home
+Assistant's VM had not come up, and every wake died fetching the lights for
+her prompt. So a hub that is down no longer costs him her voice (she opens the
+session, and says the home isn't answering only if he asks for it), and a
+tray icon at the bottom right says at a glance that she is there: grey,
+green while she listens, a click away from the dashboard.
+
 ## Standing truths from the journey
 
 - Will's field reports drove a dozen fixes; testing-in-the-room beats

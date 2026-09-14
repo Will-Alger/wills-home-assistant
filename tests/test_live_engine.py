@@ -148,6 +148,25 @@ async def test_the_session_she_starts_with() -> None:
     assert "the function call comes FIRST" in back  # today's tool rules, unchanged, on the backend
 
 
+async def test_a_hub_that_is_down_does_not_cost_him_her_voice() -> None:
+    """Every wake after a reboot used to die rendering the session while Home
+    Assistant was still coming up. Now the session opens with the hub marked
+    out, and the prompt says what to tell him."""
+    class DownHome(FakeHome):
+        async def get_lights(self):
+            raise ConnectionError("timed out")
+
+    engine = LiveEngine(api_key="k", model="gpt-live-1", voice="marin", home=DownHome(), owner="Will",
+                        name="Alexa", wake_phrase="alexa")
+    cfg = await engine._live_session_config()
+    backend = cfg["delegation"]["responses"]["instructions"]
+    assert "the home hub is not answering" in backend and engine._home_down == "ConnectionError"
+    up = LiveEngine(api_key="k", model="gpt-live-1", voice="marin", home=FakeHome(), owner="Will",
+                    name="Alexa", wake_phrase="alexa")
+    cfg = await up._live_session_config()
+    assert "not answering" not in cfg["delegation"]["responses"]["instructions"] and up._home_down == ""
+
+
 async def test_backend_web_search_can_stay_ours() -> None:
     engine, _c, _u = make(backend_web_search=False)
     tools = engine._backend_tools()
