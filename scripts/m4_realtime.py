@@ -174,6 +174,46 @@ async def acknowledge_later(
     return spoken
 
 
+_HUB_CHECK_S = 120.0  # while the hub does not answer: how often to look for it elsewhere
+
+
+async def hub_watch(engine, settings, status) -> None:
+    """The hub's VM can come back from a reboot on a new DHCP lease (it did:
+    four days of "the home isn't answering"). While `HA_URL` does not answer,
+    look every couple of minutes for a Hyper-V address that takes our token
+    (home/discover.py) and move the client and the event watcher there for
+    the rest of the run — and say so, since `.env` is his to fix."""
+    from assistant.home.discover import find_moved_hub
+
+    home = getattr(engine, "home", None)
+    alive = getattr(home, "api_alive", None)
+    if home is None or alive is None:
+        return
+    current = settings.ha_url
+    while True:
+        try:
+            if not await alive():
+                found = await find_moved_hub(current, settings.ha_token)
+                if found:
+                    home.rebase(found)
+                    watcher = getattr(engine, "event_watcher", None)
+                    if watcher is not None and hasattr(watcher, "rebase"):
+                        watcher.rebase(found)
+                    engine._home_down = ""
+                    with contextlib.suppress(Exception):
+                        status.configure(home=found)
+                    say(
+                        status,
+                        f"the home hub answers at {found} now, not {current} — using it from here on; "
+                        "set HA_URL in .env (or give the VM a DHCP reservation) so the next start finds it",
+                        "yellow",
+                    )
+                    current = found
+        except Exception as err:  # noqa: BLE001 — a lookup must never take the loop down
+            say(status, f"hub watch: {err}", "yellow")
+        await asyncio.sleep(_HUB_CHECK_S)
+
+
 def say(status, text: str, style: str = "") -> None:
     """Print a line AND put it in the panel's live feed (plain, no markup)."""
     console.print(f"[{style}]{text}[/{style}]" if style else text, highlight=False)
@@ -712,6 +752,7 @@ async def voice(fake: bool) -> int:
     watcher_task = asyncio.create_task(watcher.run()) if watcher is not None else None
     warm = getattr(engine, "_warm", None)
     warm_task = asyncio.create_task(warm.run()) if warm is not None else None
+    hub_task = asyncio.create_task(hub_watch(engine, settings, status))  # returns at once on the fake house
     if warm_task is not None:
         say(status, "warm socket: on — the model answers the wake in its own voice; the clips stand by", "dim")
     tray = getattr(engine, "tray", None)
@@ -799,7 +840,7 @@ async def voice(fake: bool) -> int:
                         await audio.close()
                 _leave_soon(0)  # and if it still hangs, the hard way
                 return 0  # the always-on service relaunches us in seconds
-    for background in (watcher_task, scheduler_task, courier_task, music_task, hotkey_task):
+    for background in (watcher_task, scheduler_task, courier_task, music_task, hotkey_task, warm_task, hub_task):
         if background is not None:
             background.cancel()
     console.print(f"\n[dim]total: ${total_cost:.4f}[/dim]")

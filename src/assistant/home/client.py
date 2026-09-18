@@ -8,6 +8,8 @@ and service data (entity_id + fields like brightness_pct) goes flat in one JSON 
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import typing
 from dataclasses import dataclass
 from typing import Any, Self
@@ -64,6 +66,20 @@ class HomeAssistantClient:
 
     async def close(self) -> None:
         await self._http.aclose()
+
+    @property
+    def base_url(self) -> str:
+        return str(self._http.base_url).rstrip("/")
+
+    def rebase(self, url: str) -> None:
+        """The hub answers somewhere else now (its VM got a new lease): every
+        request from here on goes there. The old client is left to close in
+        the background; the Music Assistant entry id is looked up again."""
+        old = self._http
+        self._http = httpx.AsyncClient(base_url=url.rstrip("/"), headers=dict(old.headers), timeout=old.timeout)
+        self._ma_entry_id = None
+        with contextlib.suppress(Exception):
+            asyncio.get_running_loop().create_task(old.aclose())
 
     async def api_alive(self) -> bool:
         """False only when HA is unreachable; a bad token raises its own clear error."""

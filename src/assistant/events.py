@@ -233,6 +233,10 @@ class EventWatcher:
     def stop(self) -> None:
         self._stop.set()
 
+    def rebase(self, url: str) -> None:
+        """The hub answers somewhere else now: the next (re)connect goes there."""
+        self._url = url.rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
+
     async def run(self) -> None:
         backoff = 5.0
         while not self._stop.is_set():

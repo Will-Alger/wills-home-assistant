@@ -1941,8 +1941,8 @@ class RealtimeEngine:
             wake_phrase=self._wake_phrase,
             devices=(
                 "(the home hub is not answering right now — if he asks for lights, media or "
-                "anything in the house, say the home isn't answering and that you'll have it "
-                "back when it is; everything else works as usual)"
+                "anything in the house, say the home isn't answering and leave it there: never "
+                "promise to do it later, nothing is queued; everything else works as usual)"
                 if getattr(self, "_home_down", "")
                 else device_table(lights)
             ),

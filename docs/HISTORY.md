@@ -124,6 +124,12 @@ session, and says the home isn't answering only if he asks for it), and a
 tray icon at the bottom right says at a glance that she is there: grey,
 green while she listens, a click away from the dashboard.
 
+Four days later the lights still would not change colour, and the reason was
+one number: the hub's VM had come back from that reboot on a new DHCP lease.
+She had been telling the truth — the home wasn't answering — at the wrong
+address. Now she looks for the hub herself (a Hyper-V MAC in the ARP table,
+an `/api/` that takes her token) and moves there, saying so out loud.
+
 ## Standing truths from the journey
 
 - Will's field reports drove a dozen fixes; testing-in-the-room beats
