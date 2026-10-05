@@ -3,7 +3,7 @@
 ## Goal
 One consistent contract for what a capability reports. Today home actions, calendar writes, scheduling,
 memory and background jobs each return free-text strings the model reads as control flow. See
-wills-home-assistant-audit.md finding 9 and docs/PLAN-VOICE-2026-09-05.md phase 7.
+docs/AUDIT-2026-09-05.md finding 9 and docs/PLAN-VOICE-2026-09-05.md phase 7.
 
 ## Behavior
 - A ToolOutcome dataclass in src/assistant/brain/outcome.py: status (success | partial | pending |

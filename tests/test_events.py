@@ -97,14 +97,14 @@ async def test_watcher_authenticates_subscribes_and_announces(tmp_path: Path) ->
 
     @asynccontextmanager
     async def connector(url: str):
-        assert url == "ws://192.168.1.114/api/websocket"
+        assert url == "ws://192.168.1.50/api/websocket"
         incoming.put_nowait(json.dumps({"type": "auth_required"}))
         yield FakeWs()
 
     store = WatchStore(tmp_path / "watches.json")
     store.add(entity_id="front_door", message="Heads up: the {entity} is {state}.", to_state="on", priority="urgent")
     announcer = Announcer(tmp_path / "a.json", quiet_hours="00:00-23:59")
-    watcher = EventWatcher("http://192.168.1.114", "tok", store, announcer, connector=connector)
+    watcher = EventWatcher("http://192.168.1.50", "tok", store, announcer, connector=connector)
     task = asyncio.create_task(watcher.run())
     async with asyncio.timeout(5):
         while not announcer.pending():
@@ -138,7 +138,7 @@ async def test_watcher_feeds_hooks_and_subscribes_custom_events(tmp_path: Path) 
             if msg["type"] == "subscribe_events":
                 incoming.put_nowait(json.dumps({"id": msg["id"], "type": "result", "success": True}))
                 if msg["id"] == 1:
-                    incoming.put_nowait(event("person.will", "not_home", "home"))
+                    incoming.put_nowait(event("person.owner", "not_home", "home"))
                 else:
                     incoming.put_nowait(
                         json.dumps(
@@ -161,7 +161,7 @@ async def test_watcher_feeds_hooks_and_subscribes_custom_events(tmp_path: Path) 
         connects.append(1)
 
     watcher = EventWatcher(
-        "http://192.168.1.114", "tok", WatchStore(tmp_path / "w.json"), Announcer(tmp_path / "a.json"),
+        "http://192.168.1.50", "tok", WatchStore(tmp_path / "w.json"), Announcer(tmp_path / "a.json"),
         connector=connector,
         on_state=lambda entity, old, new: states.append((entity, old, new)),
         on_event={"mobile_app_notification_action": taps.append},
@@ -175,7 +175,7 @@ async def test_watcher_feeds_hooks_and_subscribes_custom_events(tmp_path: Path) 
     task.cancel()
     assert sent[1]["event_type"] == "state_changed"
     assert sent[2] == {"id": 2, "type": "subscribe_events", "event_type": "mobile_app_notification_action"}
-    assert states == [("person.will", "not_home", "home")]
+    assert states == [("person.owner", "not_home", "home")]
     assert taps[0]["action"] == "alexa:read:1" and connects == [1]
     assert watcher.events_seen == 2
 

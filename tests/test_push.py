@@ -20,13 +20,13 @@ def notify_calls(home: FakeHome) -> list[dict]:
 
 async def test_payload_shape_actions_levels_and_clear(tmp_path: Path) -> None:
     home = FakeHome()
-    pusher = PhonePusher(home, "notify.mobile_app_wills_iphone", name="Alexa")
-    assert pusher.service == "mobile_app_wills_iphone"
+    pusher = PhonePusher(home, "notify.mobile_app_my_phone", name="Alexa")
+    assert pusher.service == "mobile_app_my_phone"
     a = Announcer(tmp_path / "a.json")
     built = a.enqueue("Task 7 is built.", kind="task", context={"task_id": 7}, actions=["approve", "later"])
     await pusher.push(built)
     (domain, service, data) = home.generic_calls[0]
-    assert (domain, service) == ("notify", "mobile_app_wills_iphone")
+    assert (domain, service) == ("notify", "mobile_app_my_phone")
     assert data["title"] == "Alexa: Task" and data["message"] == "Task 7 is built."
     assert data["data"]["tag"] == "alexa-1" and data["data"]["group"] == "alexa"
     assert [x["action"] for x in data["data"]["actions"]] == ["alexa:approve:1", "alexa:later:1"]
@@ -73,7 +73,7 @@ async def test_phone_approve_merges_resolves_and_asks_for_restart(tmp_path: Path
     home = FakeHome()
     restarts: list[int] = []
     actions = PhoneActions(
-        announcer, board=board, pusher=PhonePusher(home, "mobile_app_wills_iphone"),
+        announcer, board=board, pusher=PhonePusher(home, "mobile_app_my_phone"),
         request_restart=lambda: restarts.append(1),
     )
     actions.handle_event({"action": action_id("approve", built.id)})
