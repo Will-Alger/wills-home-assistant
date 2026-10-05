@@ -3,7 +3,7 @@
 ## Goal
 Memory should be evidence with scope, not a growing list injected whole. Today items have only id, kind,
 text and date; all preferences are injected; lessons are picked by recency; preference replacement is a
-two-step forget-then-remember the model can leave half done. See wills-home-assistant-audit.md finding 8
+two-step forget-then-remember the model can leave half done. See docs/AUDIT-2026-09-05.md finding 8
 and docs/PLAN-VOICE-2026-09-05.md phase 7.
 
 ## Behavior

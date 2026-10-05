@@ -3,7 +3,7 @@
 ## Goal
 The deeper mind should belong to the current topic. Today a `think` question runs in the background with no
 id, no status, no cancellation and no freshness check, and its answer comes back as an urgent thought even
-if the owner changed the premise meanwhile. See wills-home-assistant-audit.md finding 7 and
+if the owner changed the premise meanwhile. See docs/AUDIT-2026-09-05.md finding 7 and
 docs/PLAN-VOICE-2026-09-05.md phase 7.
 
 ## Behavior

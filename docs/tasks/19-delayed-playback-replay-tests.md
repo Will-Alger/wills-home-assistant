@@ -3,7 +3,7 @@
 ## Goal
 Tests only. The engine's lifecycle rules are locked in with scripted sessions, but the fake speaker plays
 instantly and every transcript arrives on time, so "generated versus heard" bugs cannot show up. Build a
-replay suite with real delays. See docs/PLAN-VOICE-2026-09-05.md phase 1 and wills-home-assistant-audit.md
+replay suite with real delays. See docs/PLAN-VOICE-2026-09-05.md phase 1 and docs/AUDIT-2026-09-05.md
 finding 11.
 
 ## Behavior
