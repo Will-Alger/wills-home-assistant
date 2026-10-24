@@ -17,7 +17,7 @@
 
 Board order from here, one build at a time (2026-09-06 morning): 23 (resumed after the usage cap) → 24 → 25 → **10 revised** ("main moved: persistent AudioIO, supervised receiver, tentative talk-over — merge main into the branch, resolve, tests green"; eleven files overlap, so its agent rebases rather than a blind hand merge) → 13 spoken fallbacks → 11 working cue → 15 level meter; task 16 folds into 25; 17, 18 deferred. Will's voice tests remain the acceptance gate for 10.
 
-2026-09-05, 12:46. Inputs reconciled: `wills-home-assistant-audit.md` (ChatGPT Astra, 11
+2026-09-05, 12:46. Inputs reconciled: `docs/AUDIT-2026-09-05.md` (ChatGPT Astra, 11
 findings + a 7-step delivery order + an 18-item voice acceptance script),
 `docs/VOICE-UX-RESEARCH-2026-09-05.md` (my research, 9 ranked changes), her task board
 (9 and 10 built, 11–18 drafted), and the uncommitted work in the tree. Plan only — no code.

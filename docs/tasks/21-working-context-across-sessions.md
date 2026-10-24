@@ -2,7 +2,7 @@
 
 ## Goal
 After a session closes, "a little dimmer" or "let's do the second option" has nothing to bind to. Keep a
-small working context across sessions so references resolve. See wills-home-assistant-audit.md finding 4
+small working context across sessions so references resolve. See docs/AUDIT-2026-09-05.md finding 4
 and docs/PLAN-VOICE-2026-09-05.md phase 6.
 
 ## Behavior

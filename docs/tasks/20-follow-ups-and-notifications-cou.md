@@ -3,7 +3,7 @@
 ## Goal
 A promise is kept only when it was actually spoken. Today every pending conversation follow-up is marked
 raised at session end if the owner said anything at all, and list_notifications marks items read before
-the response reading them has played. See wills-home-assistant-audit.md findings 2 and 3 and
+the response reading them has played. See docs/AUDIT-2026-09-05.md findings 2 and 3 and
 docs/PLAN-VOICE-2026-09-05.md phase 3.
 
 ## Behavior

@@ -35,14 +35,14 @@ def item(kind: str = "task", priority: str = "normal", mode: str = "speak") -> A
 
 
 def away_presence(tmp_path: Path, clock: Clock) -> Presence:
-    presence = Presence(tmp_path / "p.json", "person.will", owner="Will", now=clock)
+    presence = Presence(tmp_path / "p.json", "person.owner", owner="Will", now=clock)
     presence.state, presence.since = "away", clock.at
     return presence
 
 
 def test_policy_by_presence_and_priority(tmp_path: Path) -> None:
     clock = Clock(at(12))
-    presence = Presence(tmp_path / "p.json", "person.will", now=clock)
+    presence = Presence(tmp_path / "p.json", "person.owner", now=clock)
     policy = DeliveryPolicy(quiet=lambda _now: False, presence=presence)
     now = clock.at
     assert policy.decide(item(), now) == "speak"  # unknown whereabouts = treat as home

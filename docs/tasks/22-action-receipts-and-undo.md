@@ -2,7 +2,7 @@
 
 ## Goal
 "Done" is only true when it is. Lighting execution applies per-entity commands and answers "Done" even
-when one failed, and there is no undo. See wills-home-assistant-audit.md finding 5 and
+when one failed, and there is no undo. See docs/AUDIT-2026-09-05.md finding 5 and
 docs/PLAN-VOICE-2026-09-05.md phase 6.
 
 ## Behavior

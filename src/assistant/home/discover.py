@@ -1,6 +1,6 @@
 """Where did the hub go? Home Assistant runs in a Hyper-V VM on this machine,
 and a reboot can hand the VM a new DHCP lease: on 2026-09-14 it came back at
-.116 while `.env` said .114, and for four days every wake found "the home
+a new address while `.env` still had the old one, and for four days every wake found "the home
 isn't answering". The VM's MAC does not change — Hyper-V's start with
 00-15-5d — so the ARP table names the candidates, and the one whose `/api/`
 accepts our token is the hub. Nothing is written back; the app uses the found

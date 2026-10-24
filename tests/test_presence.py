@@ -26,7 +26,7 @@ def at(hour: int, minute: int = 0) -> float:
 
 def test_debounce_flapping_and_transitions(tmp_path: Path) -> None:
     clock = Clock(at(8))
-    p = Presence(tmp_path / "presence.json", "person.will", owner="Will", now=clock)
+    p = Presence(tmp_path / "presence.json", "person.owner", owner="Will", now=clock)
     seen: list = []
     p.on_transition.append(seen.append)
     assert p.state == "unknown" and p.settled()  # unknown counts as home for delivery
@@ -60,13 +60,13 @@ def test_debounce_flapping_and_transitions(tmp_path: Path) -> None:
     assert [t.kind for t in seen] == ["left", "arrived"]
     assert p.observe("unavailable") is None and p.tick() is None  # a phone that stopped reporting
 
-    again = Presence(tmp_path / "presence.json", "person.will", now=clock)
+    again = Presence(tmp_path / "presence.json", "person.owner", now=clock)
     assert again.state == "home" and again.since == p.since  # survives a restart
 
 
 def test_voice_is_proof_of_home(tmp_path: Path) -> None:
     clock = Clock(at(9))
-    p = Presence(tmp_path / "presence.json", "person.will", now=clock)
+    p = Presence(tmp_path / "presence.json", "person.owner", now=clock)
     p.observe("not_home")
     clock.at += 301
     p.tick()
@@ -84,11 +84,11 @@ async def test_sync_reads_the_entity_and_tolerates_missing(tmp_path: Path) -> No
     home = FakeHome()
     home.extra_entities.append(
         {
-            "entity_id": "person.will", "name": "Will", "state": "not_home", "domain": "person",
+            "entity_id": "person.owner", "name": "Will", "state": "not_home", "domain": "person",
             "attributes": {}, "last_changed": "2026-09-02T07:00:00-04:00",
         }
     )
-    p = Presence(tmp_path / "p.json", "person.will", now=clock)
+    p = Presence(tmp_path / "p.json", "person.owner", now=clock)
     await p.sync(home, boot=True)
     assert p.state == "away"
     assert p.since == datetime.fromisoformat("2026-09-02T07:00:00-04:00").timestamp()

@@ -111,7 +111,7 @@ class Settings(BaseSettings):
     # after this many days.
     journal_keep_days: int = 90
     # Presence: the Home Assistant person entity that says whether the owner
-    # is home (the companion app's GPS), e.g. person.will. Empty = untracked
+    # is home (the companion app's GPS), e.g. person.owner. Empty = untracked
     # (she then assumes he is home). Debounce and settle grace in seconds.
     presence_entity: str = ""
     presence_arrive_s: float = 60.0
@@ -121,7 +121,7 @@ class Settings(BaseSettings):
     # (urgent ones always do); the rest wait for the arrival welcome.
     push_while_away_kinds: str = "task,question,watch,thought,system,followup"
     # The phone: a Home Assistant companion-app notify service name WITHOUT the
-    # domain, e.g. mobile_app_wills_iphone. Empty = no phone channel.
+    # domain, e.g. mobile_app_my_phone. Empty = no phone channel.
     phone_notify_service: str = ""
     # Delivery polish: spoken-but-unread items go to the phone (silently)
     # after this many hours; unread items expire after this many days; a
